@@ -1,0 +1,291 @@
+# cell allocation and a mark/sweep collector with an explicit root stack
+
+use std.collections.vector;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_equals;
+use std.types.string.str_len;
+
+use A: std.allocator;
+use util: qark.util;
+use v: qark.vm.value;
+
+fun blank() v.Cell {
+    var c: v.Cell;
+    ret c;
+}
+
+# an empty machine with a permanent nil cell at index 0
+pub fun init(a: *A.Allocator) res[v.Vm, A.Error] {
+    var vm: v.Vm;
+    vm.a = a;
+    vm.cells = vector.init[v.Cell](a);
+    vm.free = vector.init[u32](a);
+    vm.strs = vector.init[v.StrObj](a);
+    vm.syms = vector.init[v.Sym](a);
+    vm.roots = vector.init[u32](a);
+    val pushed: res[usize, A.Error] = vector.push[v.Cell](?vm.cells, blank());
+    if (sel pushed.err) { ret res[v.Vm, A.Error].err{pushed.err}; }
+    vm.live = 1;
+    ret res[v.Vm, A.Error].ok{vm};
+}
+
+# release every owned byte; cells die with their vectors
+pub fun dnit(vm: *v.Vm) {
+    var i: usize = 0;
+    for (i < vm.strs.len) {
+        val g: opt[*v.StrObj] = vector.get[v.StrObj](?vm.strs, i);
+        if (sel g.some) {
+            if (g.some.data != nil) {
+                A.deallocate[u8](vm.a, g.some.data, g.some.len + 1);
+            }
+        }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < vm.syms.len) {
+        val g: opt[*v.Sym] = vector.get[v.Sym](?vm.syms, i);
+        if (sel g.some) { util.free(vm.a, g.some.name); }
+        i = i + 1;
+    }
+    util.free(vm.a, vm.err);
+    vector.dnit[v.Cell](?vm.cells);
+    vector.dnit[u32](?vm.free);
+    vector.dnit[v.StrObj](?vm.strs);
+    vector.dnit[v.Sym](?vm.syms);
+    vector.dnit[u32](?vm.roots);
+}
+
+# push a root; allocations may collect after this
+pub fun root(vm: *v.Vm, idx: u32) err[A.Error] {
+    val pushed: res[usize, A.Error] = vector.push[u32](?vm.roots, idx);
+    if (sel pushed.err) { ret err[A.Error].err{pushed.err}; }
+    ret err[A.Error].ok{};
+}
+
+# pop one root
+pub fun unroot(vm: *v.Vm) {
+    vector.pop[u32](?vm.roots);
+}
+
+pub fun cell(vm: *v.Vm, idx: u32) *v.Cell {
+    var at: usize = idx::usize;
+    if (at >= vm.cells.len) { at = 0; }
+    val g: opt[*v.Cell] = vector.get[v.Cell](?vm.cells, at);
+    if (sel g.some) { ret g.some; }
+    val z: opt[*v.Cell] = vector.get[v.Cell](?vm.cells, 0);
+    if (sel z.some) { ret z.some; }
+    ret nil;
+}
+
+# allocate a cell, sweeping first when many cells have been born
+pub fun alloc(vm: *v.Vm, kind: u8) res[u32, A.Error] {
+    var idx: u32 = 0;
+    if (vm.free.len > 0) {
+        val popped: opt[u32] = vector.pop[u32](?vm.free);
+        if (sel popped.some) { idx = popped.some; }
+    }
+    or {
+        idx = vm.cells.len::u32;
+        val pushed: res[usize, A.Error] = vector.push[v.Cell](?vm.cells, blank());
+        if (sel pushed.err) { ret res[u32, A.Error].err{pushed.err}; }
+    }
+    val c: *v.Cell = cell(vm, idx);
+    c.kind = kind;
+    c.marked = 0;
+    c.a = 0;
+    c.b = 0;
+    c.c = 0;
+    c.n = 0;
+    vm.since_gc = vm.since_gc + 1;
+    vm.live = vm.live + 1;
+    ret res[u32, A.Error].ok{idx};
+}
+
+pub fun make_int(vm: *v.Vm, n: i64) res[u32, A.Error] {
+    val i: res[u32, A.Error] = alloc(vm, v.K_INT);
+    if (sel i.err) { ret i; }
+    cell(vm, i.ok).n = n;
+    ret i;
+}
+
+pub fun make_bool(vm: *v.Vm, b: bool) res[u32, A.Error] {
+    val i: res[u32, A.Error] = alloc(vm, v.K_BOOL);
+    if (sel i.err) { ret i; }
+    if (b) { cell(vm, i.ok).n = 1; }
+    ret i;
+}
+
+pub fun cons(vm: *v.Vm, car: u32, cdr: u32) res[u32, A.Error] {
+    val i: res[u32, A.Error] = alloc(vm, v.K_PAIR);
+    if (sel i.err) { ret i; }
+    val c: *v.Cell = cell(vm, i.ok);
+    c.a = car;
+    c.b = cdr;
+    ret i;
+}
+
+pub fun make_str(vm: *v.Vm, src: *u8, n: usize) res[u32, A.Error] {
+    val copied: res[str, A.Error] = util.dup_n(vm.a, src, n);
+    if (sel copied.err) { ret res[u32, A.Error].err{copied.err}; }
+    var obj: v.StrObj;
+    obj.data = copied.ok;
+    obj.len = n;
+    obj.live = 1;
+    val si: u32 = vm.strs.len::u32;
+    val pushed: res[usize, A.Error] = vector.push[v.StrObj](?vm.strs, obj);
+    if (sel pushed.err) {
+        util.free(vm.a, copied.ok);
+        ret res[u32, A.Error].err{pushed.err};
+    }
+    val i: res[u32, A.Error] = alloc(vm, v.K_STR);
+    if (sel i.err) { ret i; }
+    cell(vm, i.ok).a = si;
+    ret i;
+}
+
+# intern a symbol; the cell is permanent
+pub fun intern(vm: *v.Vm, name: str) res[u32, A.Error] {
+    var i: usize = 0;
+    for (i < vm.syms.len) {
+        val g: opt[*v.Sym] = vector.get[v.Sym](?vm.syms, i);
+        if (sel g.some) {
+            if (str_equals(g.some.name, name)) { ret res[u32, A.Error].ok{g.some.cell}; }
+        }
+        i = i + 1;
+    }
+    val copied: res[str, A.Error] = util.dup(vm.a, name);
+    if (sel copied.err) { ret res[u32, A.Error].err{copied.err}; }
+    val cell_i: res[u32, A.Error] = alloc(vm, v.K_SYM);
+    if (sel cell_i.err) {
+        util.free(vm.a, copied.ok);
+        ret cell_i;
+    }
+    var sym: v.Sym;
+    sym.name = copied.ok;
+    sym.cell = cell_i.ok;
+    val pushed: res[usize, A.Error] = vector.push[v.Sym](?vm.syms, sym);
+    if (sel pushed.err) { ret res[u32, A.Error].err{pushed.err}; }
+    ret cell_i;
+}
+
+pub fun sym_name(vm: *v.Vm, idx: u32) str {
+    val c: *v.Cell = cell(vm, idx);
+    if (c.kind != v.K_SYM) { ret ""; }
+    var i: usize = 0;
+    for (i < vm.syms.len) {
+        val g: opt[*v.Sym] = vector.get[v.Sym](?vm.syms, i);
+        if (sel g.some) {
+            if (g.some.cell == idx) { ret g.some.name; }
+        }
+        i = i + 1;
+    }
+    ret "";
+}
+
+pub fun str_data(vm: *v.Vm, idx: u32, len: *usize) *u8 {
+    val c: *v.Cell = cell(vm, idx);
+    if (c.kind != v.K_STR) {
+        @len = 0;
+        ret nil;
+    }
+    val g: opt[*v.StrObj] = vector.get[v.StrObj](?vm.strs, c.a::usize);
+    if (!sel g.some) {
+        @len = 0;
+        ret nil;
+    }
+    @len = g.some.len;
+    ret g.some.data;
+}
+
+pub fun truth(vm: *v.Vm, idx: u32) bool {
+    if (idx == v.NIL) { ret false; }
+    val c: *v.Cell = cell(vm, idx);
+    if (c.kind == v.K_BOOL && c.n == 0) { ret false; }
+    ret true;
+}
+
+fun mark_cell(vm: *v.Vm, idx: u32) {
+    if (idx == 0 || idx::usize >= vm.cells.len) { ret; }
+    val c: *v.Cell = cell(vm, idx);
+    if (c.marked != 0) { ret; }
+    c.marked = 1;
+    if (c.kind == v.K_STR) {
+        val g: opt[*v.StrObj] = vector.get[v.StrObj](?vm.strs, c.a::usize);
+        if (sel g.some) { g.some.marked = 1; }
+    }
+    if (c.kind == v.K_PAIR || c.kind == v.K_CLOSURE || c.kind == v.K_MACRO) {
+        mark_cell(vm, c.a);
+        mark_cell(vm, c.b);
+        mark_cell(vm, c.c);
+    }
+}
+
+# mark from roots and interned symbols, then reclaim unmarked cells
+pub fun gc(vm: *v.Vm) {
+    var i: usize = 0;
+    for (i < vm.cells.len) {
+        val g: opt[*v.Cell] = vector.get[v.Cell](?vm.cells, i);
+        if (sel g.some) { g.some.marked = 0; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < vm.strs.len) {
+        val g: opt[*v.StrObj] = vector.get[v.StrObj](?vm.strs, i);
+        if (sel g.some) { g.some.marked = 0; }
+        i = i + 1;
+    }
+    cell(vm, 0).marked = 1;
+    i = 0;
+    for (i < vm.syms.len) {
+        val g: opt[*v.Sym] = vector.get[v.Sym](?vm.syms, i);
+        if (sel g.some) { mark_cell(vm, g.some.cell); }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < vm.roots.len) {
+        val g: opt[*u32] = vector.get[u32](?vm.roots, i);
+        if (sel g.some) { mark_cell(vm, @g.some); }
+        i = i + 1;
+    }
+    mark_cell(vm, vm.global);
+    vector.clear[u32](?vm.free);
+    var live: i64 = 0;
+    i = 0;
+    for (i < vm.cells.len) {
+        val g: opt[*v.Cell] = vector.get[v.Cell](?vm.cells, i);
+        if (sel g.some) {
+            if (g.some.marked == 0 && i != 0) {
+                g.some.kind = v.K_NIL;
+                vector.push[u32](?vm.free, i::u32);
+            }
+            or { live = live + 1; }
+        }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < vm.strs.len) {
+        val g: opt[*v.StrObj] = vector.get[v.StrObj](?vm.strs, i);
+        if (sel g.some) {
+            if (g.some.live != 0 && g.some.marked == 0) {
+                if (g.some.data != nil) { A.deallocate[u8](vm.a, g.some.data, g.some.len + 1); }
+                g.some.data = nil;
+                g.some.live = 0;
+            }
+        }
+        i = i + 1;
+    }
+    vm.live = live;
+    vm.since_gc = 0;
+}
+
+# how many cells are live, for the collector test
+pub fun live_count(vm: *v.Vm) i64 {
+    ret vm.live;
+}

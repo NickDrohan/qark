@@ -1,0 +1,148 @@
+# inverse line-range edits stored as newline-joined blobs
+
+use std.collections.vector;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+
+use A: std.allocator;
+use text: qark.core.text;
+use util: qark.util;
+
+# the lines an edit replaced, joined by newlines without a trailing newline
+# ---
+# data:   owned bytes, nil when empty
+# len:    byte count
+# nlines: how many lines the blob expands to
+pub rec Blob {
+    data:   *u8;
+    len:    usize;
+    nlines: i64;
+}
+
+# one undo record
+# ---
+# start:      first line the edit touched
+# old:        the lines that were there
+# new_nlines: how many lines replaced them
+pub rec Rec {
+    start:      i64;
+    old:        Blob;
+    new_nlines: i64;
+}
+
+# capture lines [start, end) into a blob
+# ---
+# start: first line
+# end:   exclusive end
+# ret:   owned blob, or the allocator's refusal
+pub fun capture(t: *text.Text, start: i64, end: i64) res[Blob, A.Error] {
+    var hi: i64 = end;
+    if (hi < 0) { hi = text.line_count(t); }
+    if (start < 0 || hi < start) { ret res[Blob, A.Error].err{A.Error.invalid{}}; }
+    var buf: *u8 = nil;
+    var len: usize = 0;
+    var cap: usize = 0;
+    var i: i64 = start;
+    var nlines: i64 = 0;
+    for (i < hi) {
+        if (nlines > 0) {
+            val nl: err[A.Error] = util.append_byte(t.a, ?buf, ?len, ?cap, '\n');
+            if (sel nl.err) { ret res[Blob, A.Error].err{nl.err}; }
+        }
+        val g: opt[*text.Line] = text.line_at(t, i);
+        if (sel g.some) {
+            if (g.some.len > 0) {
+                val ap: err[A.Error] = util.append(t.a, ?buf, ?len, ?cap, g.some.data, g.some.len);
+                if (sel ap.err) { ret res[Blob, A.Error].err{ap.err}; }
+            }
+        }
+        nlines = nlines + 1;
+        i = i + 1;
+    }
+    ret res[Blob, A.Error].ok{Blob{data: buf, len: len, nlines: nlines}};
+}
+
+# release a blob
+pub fun free_blob(a: *A.Allocator, b: *Blob) {
+    if (b.data != nil) {
+        A.deallocate[u8](a, b.data, b.len + 1);
+        b.data = nil;
+        b.len = 0;
+    }
+}
+
+# split a blob into line pointer/length arrays owned as one buffer of copies
+#
+# the caller frees each srcs[i] with the allocator. count is blob.nlines.
+# ---
+# out_srcs: receives the pointer array (owned)
+# out_lens: receives the length array (owned)
+# ret: ok, or the allocator's refusal
+pub fun split(a: *A.Allocator, b: *Blob, out_srcs: ***u8, out_lens: **usize) err[A.Error] {
+    val n: i64 = b.nlines;
+    if (n <= 0) {
+        @out_srcs = nil;
+        @out_lens = nil;
+        ret err[A.Error].ok{};
+    }
+    val ps: res[**u8, A.Error] = A.allocate[*u8](a, n::usize);
+    if (sel ps.err) { ret err[A.Error].err{ps.err}; }
+    val ls: res[*usize, A.Error] = A.allocate[usize](a, n::usize);
+    if (sel ls.err) {
+        A.deallocate[*u8](a, ps.ok, n::usize);
+        ret err[A.Error].err{ls.err};
+    }
+    var i: i64 = 0;
+    var off: usize = 0;
+    for (i < n) {
+        var start: usize = off;
+        for (off < b.len && b.data[off] != '\n') { off = off + 1; }
+        val ln: usize = off - start;
+        var p: *u8 = nil;
+        if (ln > 0) { p = (b.data::usize + start)::*u8; }
+        val copied: res[str, A.Error] = util.dup_n(a, p, ln);
+        if (sel copied.err) {
+            var k: i64 = 0;
+            for (k < i) {
+                util.free(a, ps.ok[k::usize]);
+                k = k + 1;
+            }
+            A.deallocate[*u8](a, ps.ok, n::usize);
+            A.deallocate[usize](a, ls.ok, n::usize);
+            ret err[A.Error].err{copied.err};
+        }
+        ps.ok[i::usize] = copied.ok;
+        ls.ok[i::usize] = ln;
+        if (off < b.len && b.data[off] == '\n') { off = off + 1; }
+        i = i + 1;
+    }
+    @out_srcs = ps.ok;
+    @out_lens = ls.ok;
+    ret err[A.Error].ok{};
+}
+
+# free arrays from split
+pub fun free_split(a: *A.Allocator, srcs: **u8, lens: *usize, n: i64) {
+    if (n <= 0) { ret; }
+    var i: i64 = 0;
+    for (i < n) {
+        if (srcs != nil) { util.free(a, srcs[i::usize]); }
+        i = i + 1;
+    }
+    if (srcs != nil) { A.deallocate[*u8](a, srcs, n::usize); }
+    if (lens != nil) { A.deallocate[usize](a, lens, n::usize); }
+}
+
+# drop a stack of records
+pub fun dnit_stack(a: *A.Allocator, s: *vector.Vector[Rec]) {
+    var i: usize = 0;
+    for (i < s.len) {
+        val g: opt[*Rec] = vector.get[Rec](s, i);
+        if (sel g.some) { free_blob(a, ?g.some.old); }
+        i = i + 1;
+    }
+    vector.dnit[Rec](s);
+}

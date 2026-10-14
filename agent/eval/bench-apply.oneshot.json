@@ -1,0 +1,90 @@
+[
+    {
+        "case":  "create 1 text file",
+        "n":  30,
+        "wall_p50":  6.09,
+        "wall_p95":  7.05,
+        "check_p50":  0.73,
+        "commit_p50":  5.14
+    },
+    {
+        "case":  "same apply again (unchanged)",
+        "n":  30,
+        "wall_p50":  1.4,
+        "wall_p95":  1.51,
+        "check_p50":  1.18,
+        "commit_p50":  0.01
+    },
+    {
+        "case":  "create 1 python file, checked",
+        "n":  20,
+        "wall_p50":  200.49,
+        "wall_p95":  214.84,
+        "check_p50":  195.59,
+        "commit_p50":  5.05
+    },
+    {
+        "case":  "create 1 node file, checked",
+        "n":  10,
+        "wall_p50":  154.46,
+        "wall_p95":  156.34,
+        "check_p50":  149.56,
+        "commit_p50":  5.03
+    },
+    {
+        "case":  "create 1 powershell file, checked",
+        "n":  5,
+        "wall_p50":  3034.27,
+        "wall_p95":  3040.71,
+        "check_p50":  3028.02,
+        "commit_p50":  5.41
+    },
+    {
+        "case":  "create 10 python files in one apply",
+        "n":  10,
+        "wall_p50":  230.88,
+        "wall_p95":  234.45,
+        "check_p50":  195.92,
+        "commit_p50":  34.88
+    },
+    {
+        "case":  "fan 1 template to 50 python files",
+        "n":  5,
+        "wall_p50":  384.92,
+        "wall_p95":  386.95,
+        "check_p50":  218.96,
+        "commit_p50":  166.82
+    },
+    {
+        "case":  "fan to 50 files, check off",
+        "n":  5,
+        "wall_p50":  175.08,
+        "wall_p95":  187.99,
+        "check_p50":  0,
+        "commit_p50":  173.82
+    },
+    {
+        "case":  "find/replace edit, checked",
+        "n":  20,
+        "wall_p50":  215.51,
+        "wall_p95":  229.22,
+        "check_p50":  199.38,
+        "commit_p50":  5.7
+    },
+    {
+        "case":  "read 1 file with sha256",
+        "n":  30,
+        "wall_p50":  1.05,
+        "wall_p95":  1.31,
+        "check_p50":  0,
+        "commit_p50":  0
+    },
+    {
+        "case":  "create 117 KB file, check off",
+        "n":  5,
+        "wall_p50":  11.12,
+        "wall_p95":  11.92,
+        "check_p50":  0,
+        "commit_p50":  6.29
+    }
+]

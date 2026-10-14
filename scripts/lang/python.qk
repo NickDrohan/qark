@@ -1,0 +1,6 @@
+;; python profile: comment, indent, and a function template
+
+(def lang-python "python")
+(def python-comment "#")
+(def python-indent 4)
+(def python-function "def NAME(PARAMS):\n    BODY\n")

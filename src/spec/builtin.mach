@@ -1,0 +1,56 @@
+# templates compiled into qark, so every workspace starts with useful scaffolds
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.size.usize;
+use std.types.string.str;
+
+use spec: qark.spec.spec;
+use util: qark.util;
+
+#[embed("../../templates/py/script.tmpl")]
+val PY_SCRIPT: [_]u8;
+#[embed("../../templates/py/pytest.tmpl")]
+val PY_PYTEST: [_]u8;
+#[embed("../../templates/js/script.tmpl")]
+val JS_SCRIPT: [_]u8;
+#[embed("../../templates/ps1/script.tmpl")]
+val PS1_SCRIPT: [_]u8;
+#[embed("../../templates/sh/script.tmpl")]
+val SH_SCRIPT: [_]u8;
+
+pub val COUNT: usize = 5;
+
+fun fill(out: *spec.Tpl, name: str, lang: str, body: *u8, n: usize) bool {
+    out.name = name;
+    out.lang = lang;
+    out.body = body;
+    out.len = n;
+    out.src = "builtin";
+    out.desc = nil;
+    ret true;
+}
+
+# the i-th builtin template, for listings
+pub fun at(i: usize, out: *spec.Tpl) bool {
+    if (i == 0) { ret fill(out, "py/script", "python", ?PY_SCRIPT[0], $length_of(PY_SCRIPT)); }
+    if (i == 1) { ret fill(out, "py/pytest", "python", ?PY_PYTEST[0], $length_of(PY_PYTEST)); }
+    if (i == 2) { ret fill(out, "js/script", "node", ?JS_SCRIPT[0], $length_of(JS_SCRIPT)); }
+    if (i == 3) { ret fill(out, "ps1/script", "powershell", ?PS1_SCRIPT[0], $length_of(PS1_SCRIPT)); }
+    if (i == 4) { ret fill(out, "sh/script", "bash", ?SH_SCRIPT[0], $length_of(SH_SCRIPT)); }
+    ret false;
+}
+
+pub fun find(name: str, out: *spec.Tpl) bool {
+    var i: usize = 0;
+    for (i < COUNT) {
+        var t: spec.Tpl;
+        if (at(i, ?t) && util.eq(t.name, name)) {
+            @out = t;
+            ret true;
+        }
+        i = i + 1;
+    }
+    ret false;
+}

@@ -1,0 +1,18 @@
+{{!-- a powershell script: a typed param block, strict mode, and stop-on-error.
+vars: description; params [{name, type, default, mandatory}]; body --}}
+<#
+.SYNOPSIS
+{{description}}
+#>
+[CmdletBinding()]
+param(
+{{#if params}}
+{{#each params}}
+    {{#if mandatory}}[Parameter(Mandatory = $true)]{{/if}}[{{type|default:string}}]${{name|pascal}}{{#if default}} = {{default|ps}}{{/if}}{{#unless @last}},{{/unless}}
+{{/each}}
+{{/if}}
+)
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+
+{{body|default:"Write-Output 'ok'"}}

@@ -1,0 +1,224 @@
+# lisp reader: lists, quotes, strings, numbers, symbols
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_equals;
+use std.types.string.str_len;
+
+use A: std.allocator;
+use h: qark.vm.heap;
+use v: qark.vm.value;
+
+fun is_space(c: u8) bool {
+    ret c == ' ' || c == '\t' || c == '\n' || c == '\r';
+}
+
+fun is_delim(c: u8) bool {
+    ret is_space(c) || c == '(' || c == ')' || c == '"' || c == ';' || c == 0;
+}
+
+fun skip(src: str, n: usize, i: *usize) {
+    for (@i < n) {
+        if (is_space(src[@i])) { @i = @i + 1; }
+        or (src[@i] == ';') {
+            for (@i < n && src[@i] != '\n') { @i = @i + 1; }
+        }
+        or { ret; }
+    }
+}
+
+var read_fn: fun(*v.Vm, str, usize, *usize) res[u32, v.VmError] = nil;
+
+fun read_list(vm: *v.Vm, src: str, n: usize, i: *usize) res[u32, v.VmError] {
+    var head: u32 = v.NIL;
+    var tail: u32 = v.NIL;
+    val rooted: err[A.Error] = h.root(vm, head);
+    if (sel rooted.err) { ret res[u32, v.VmError].err{v.VmError.oom{}}; }
+    for {
+        skip(src, n, i);
+        if (@i >= n) {
+            h.unroot(vm);
+            ret res[u32, v.VmError].err{v.VmError.syntax{}};
+        }
+        if (src[@i] == ')') {
+            @i = @i + 1;
+            h.unroot(vm);
+            ret res[u32, v.VmError].ok{head};
+        }
+        val item: res[u32, v.VmError] = read_fn(vm, src, n, i);
+        if (sel item.err) {
+            h.unroot(vm);
+            ret item;
+        }
+        if (h.cell(vm, item.ok).kind == v.K_SYM && str_equals(h.sym_name(vm, item.ok), ".")) {
+            val final: res[u32, v.VmError] = read_fn(vm, src, n, i);
+            if (sel final.err) {
+                h.unroot(vm);
+                ret final;
+            }
+            skip(src, n, i);
+            if (@i < n && src[@i] == ')') { @i = @i + 1; }
+            if (tail == v.NIL) { head = final.ok; }
+            or { h.cell(vm, tail).b = final.ok; }
+            h.unroot(vm);
+            ret res[u32, v.VmError].ok{head};
+        }
+        val cell: res[u32, A.Error] = h.cons(vm, item.ok, v.NIL);
+        if (sel cell.err) {
+            h.unroot(vm);
+            ret res[u32, v.VmError].err{v.VmError.oom{}};
+        }
+        if (head == v.NIL) { head = cell.ok; }
+        or { h.cell(vm, tail).b = cell.ok; }
+        tail = cell.ok;
+        # the root stack holds the old head index; replace it
+        h.unroot(vm);
+        val again: err[A.Error] = h.root(vm, head);
+        if (sel again.err) { ret res[u32, v.VmError].err{v.VmError.oom{}}; }
+    }
+    h.unroot(vm);
+    ret res[u32, v.VmError].ok{head};
+}
+
+fun wrap(vm: *v.Vm, name: str, inner: u32) res[u32, v.VmError] {
+    val sym: res[u32, A.Error] = h.intern(vm, name);
+    if (sel sym.err) { ret res[u32, v.VmError].err{v.VmError.oom{}}; }
+    val tail: res[u32, A.Error] = h.cons(vm, inner, v.NIL);
+    if (sel tail.err) { ret res[u32, v.VmError].err{v.VmError.oom{}}; }
+    val form: res[u32, A.Error] = h.cons(vm, sym.ok, tail.ok);
+    if (sel form.err) { ret res[u32, v.VmError].err{v.VmError.oom{}}; }
+    ret res[u32, v.VmError].ok{form.ok};
+}
+
+fun read_string(vm: *v.Vm, src: str, n: usize, i: *usize) res[u32, v.VmError] {
+    var buf: [1024]u8;
+    var len: usize = 0;
+    for (@i < n && src[@i] != '"') {
+        var ch: u8 = src[@i];
+        @i = @i + 1;
+        if (ch == '\\' && @i < n) {
+            val e: u8 = src[@i];
+            @i = @i + 1;
+            if (e == 'n') { ch = '\n'; }
+            or (e == 't') { ch = '\t'; }
+            or (e == 'r') { ch = '\r'; }
+            or { ch = e; }
+        }
+        if (len + 1 < 1024) {
+            buf[len] = ch;
+            len = len + 1;
+        }
+    }
+    if (@i < n && src[@i] == '"') { @i = @i + 1; }
+    val made: res[u32, A.Error] = h.make_str(vm, ?buf[0], len);
+    if (sel made.err) { ret res[u32, v.VmError].err{v.VmError.oom{}}; }
+    ret res[u32, v.VmError].ok{made.ok};
+}
+
+fun read_atom(vm: *v.Vm, src: str, n: usize, i: *usize) res[u32, v.VmError] {
+    val start: usize = @i;
+    if (src[@i] == '#') { @i = @i + 1; }
+    for (@i < n && !is_delim(src[@i])) { @i = @i + 1; }
+    val len: usize = @i - start;
+    if (len == 2 && src[start] == '#' && (src[start + 1] == 't' || src[start + 1] == 'T')) {
+        val b: res[u32, A.Error] = h.make_bool(vm, true);
+        if (sel b.err) { ret res[u32, v.VmError].err{v.VmError.oom{}}; }
+        ret res[u32, v.VmError].ok{b.ok};
+    }
+    if (len == 2 && src[start] == '#' && (src[start + 1] == 'f' || src[start + 1] == 'F')) {
+        val b: res[u32, A.Error] = h.make_bool(vm, false);
+        if (sel b.err) { ret res[u32, v.VmError].err{v.VmError.oom{}}; }
+        ret res[u32, v.VmError].ok{b.ok};
+    }
+    var num: bool = true;
+    var k: usize = start;
+    if (src[k] == '-' && len > 1) { k = k + 1; }
+    for (k < @i) {
+        if (src[k] < '0' || src[k] > '9') { num = false; }
+        k = k + 1;
+    }
+    if (num && len > 0 && !(len == 1 && src[start] == '-')) {
+        var vnum: i64 = 0;
+        var neg: bool = false;
+        var p: usize = start;
+        if (src[p] == '-') {
+            neg = true;
+            p = p + 1;
+        }
+        for (p < @i) {
+            vnum = vnum * 10 + (src[p] - '0')::i64;
+            p = p + 1;
+        }
+        if (neg) { vnum = 0 - vnum; }
+        val made: res[u32, A.Error] = h.make_int(vm, vnum);
+        if (sel made.err) { ret res[u32, v.VmError].err{v.VmError.oom{}}; }
+        ret res[u32, v.VmError].ok{made.ok};
+    }
+    var tmp: [256]u8;
+    var copy_n: usize = len;
+    if (copy_n > 255) { copy_n = 255; }
+    var c: usize = 0;
+    for (c < copy_n) {
+        tmp[c] = src[start + c];
+        c = c + 1;
+    }
+    tmp[copy_n] = 0;
+    if (len == 3 && tmp[0] == 'n' && tmp[1] == 'i' && tmp[2] == 'l') {
+        ret res[u32, v.VmError].ok{v.NIL};
+    }
+    val sym: res[u32, A.Error] = h.intern(vm, ?tmp[0]);
+    if (sel sym.err) { ret res[u32, v.VmError].err{v.VmError.oom{}}; }
+    ret res[u32, v.VmError].ok{sym.ok};
+}
+
+fun read_form(vm: *v.Vm, src: str, n: usize, i: *usize) res[u32, v.VmError] {
+    read_fn = read_form;
+    skip(src, n, i);
+    if (@i >= n) { ret res[u32, v.VmError].err{v.VmError.syntax{}}; }
+    val ch: u8 = src[@i];
+    if (ch == '(') {
+        @i = @i + 1;
+        ret read_list(vm, src, n, i);
+    }
+    if (ch == '\'') {
+        @i = @i + 1;
+        val inner: res[u32, v.VmError] = read_form(vm, src, n, i);
+        if (sel inner.err) { ret inner; }
+        ret wrap(vm, "quote", inner.ok);
+    }
+    if (ch == '`') {
+        @i = @i + 1;
+        val inner: res[u32, v.VmError] = read_form(vm, src, n, i);
+        if (sel inner.err) { ret inner; }
+        ret wrap(vm, "quasiquote", inner.ok);
+    }
+    if (ch == ',') {
+        @i = @i + 1;
+        var splice: bool = false;
+        if (@i < n && src[@i] == '@') {
+            splice = true;
+            @i = @i + 1;
+        }
+        val inner: res[u32, v.VmError] = read_form(vm, src, n, i);
+        if (sel inner.err) { ret inner; }
+        if (splice) { ret wrap(vm, "unquote-splicing", inner.ok); }
+        ret wrap(vm, "unquote", inner.ok);
+    }
+    if (ch == '"') {
+        @i = @i + 1;
+        ret read_string(vm, src, n, i);
+    }
+    ret read_atom(vm, src, n, i);
+}
+
+# read the first form in src
+pub fun read(vm: *v.Vm, src: str) res[u32, v.VmError] {
+    if (src == nil) { ret res[u32, v.VmError].err{v.VmError.syntax{}}; }
+    var i: usize = 0;
+    ret read_form(vm, src, str_len(src), ?i);
+}

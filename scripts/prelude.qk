@@ -1,0 +1,18 @@
+;; qark lisp prelude, one begin so a single read evaluates every binding
+
+(begin
+  (defmacro when (c . body)
+    `(if ,c (begin ,@body) nil))
+
+  (defmacro unless (c . body)
+    `(if ,c nil (begin ,@body)))
+
+  (defmacro defun (sig . body)
+    `(def ,(car sig) (lambda ,(cdr sig) ,@body)))
+
+  (defun for-each (xs f)
+    (if (null? xs)
+      nil
+      (begin
+        (f (car xs))
+        (for-each (cdr xs) f)))))

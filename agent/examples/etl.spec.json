@@ -1,0 +1,45 @@
+{
+  "job": "etl-demo",
+  "tag": "example",
+  "vars": {
+    "tables": [
+      { "table": "users", "key": "id", "columns": ["id", "name", "email"] },
+      { "table": "orders", "key": "order_id", "columns": ["order_id", "user_id", "total"] },
+      { "table": "events", "key": "event_id", "columns": ["event_id", "kind", "at"] }
+    ]
+  },
+  "templates": {
+    "loader": {
+      "lang": "python",
+      "lines": [
+        "\"\"\"Load {{table}} rows from CSV into a list of dicts keyed by {{key}}.\"\"\"",
+        "import csv",
+        "import sys",
+        "",
+        "COLUMNS = {{columns|py}}",
+        "",
+        "",
+        "def load(path):",
+        "    with open(path, newline=\"\") as f:",
+        "        rows = list(csv.DictReader(f))",
+        "    missing = [c for c in COLUMNS if rows and c not in rows[0]]",
+        "    if missing:",
+        "        raise SystemExit(\"{{table}}: missing columns \" + \", \".join(missing))",
+        "    return {row[{{key|py}}]: row for row in rows}",
+        "",
+        "",
+        "if __name__ == \"__main__\":",
+        "    print(len(load(sys.argv[1])) if len(sys.argv) > 1 else {{@index}})"
+      ]
+    }
+  },
+  "files": [
+    { "each": "tables", "path": "load_{{table}}.py", "template": "loader" },
+    {
+      "path": "run_all.ps1",
+      "tmpl": "$ErrorActionPreference = 'Stop'\n{{#each tables}}\npython (Join-Path $PSScriptRoot 'load_{{table}}.py')\n{{/each}}\n"
+    },
+    { "path": "tables.json", "json": { "tables": ["users", "orders", "events"], "version": 1 } }
+  ],
+  "run": { "argv": ["powershell", "-NoProfile", "-File", "run_all.ps1"], "timeout_ms": 30000 }
+}

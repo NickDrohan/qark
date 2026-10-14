@@ -1,0 +1,4 @@
+;; python snippets. $1 and ${1:default} are tabstops; $$ is a dollar.
+
+(def snip-fn "def ${1:name}(${2:args}):\n    ${3:pass}\n")
+(def snip-class "class ${1:Name}:\n    def __init__(self):\n        pass\n")

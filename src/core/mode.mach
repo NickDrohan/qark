@@ -1,0 +1,43 @@
+# editor modes and operator identities
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+
+pub val NORMAL:  u8 = 0;
+pub val INSERT:  u8 = 1;
+pub val VISUAL:  u8 = 2;
+pub val VLINE:   u8 = 3;
+pub val VBLOCK:  u8 = 4;
+pub val COMMAND: u8 = 5;
+pub val REPLACE: u8 = 6;
+pub val OP_PEND: u8 = 7;
+
+pub val OP_NONE:   u8 = 0;
+pub val OP_DELETE: u8 = 1;
+pub val OP_CHANGE: u8 = 2;
+pub val OP_YANK:   u8 = 3;
+pub val OP_INDENT: u8 = 4;
+pub val OP_DEDENT: u8 = 5;
+pub val OP_LOWER:  u8 = 6;
+pub val OP_UPPER:  u8 = 7;
+pub val OP_TOGGLE: u8 = 8;
+pub val OP_FORMAT: u8 = 9;
+
+# a human name for the mode byte
+pub fun name(mode: u8) *u8 {
+    if (mode == INSERT)  { ret "insert"; }
+    if (mode == VISUAL)  { ret "visual"; }
+    if (mode == VLINE)   { ret "visual-line"; }
+    if (mode == VBLOCK)  { ret "visual-block"; }
+    if (mode == COMMAND) { ret "command"; }
+    if (mode == REPLACE) { ret "replace"; }
+    if (mode == OP_PEND) { ret "operator"; }
+    ret "normal";
+}
+
+# true for the three visual modes
+pub fun is_visual(mode: u8) bool {
+    if (mode == VISUAL || mode == VLINE || mode == VBLOCK) { ret true; }
+    ret false;
+}

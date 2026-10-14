@@ -1,0 +1,9 @@
+{
+  "id": "mach-add",
+  "language": "mach",
+  "prompt": "Generate a Mach function add(a, b) that returns a + b, with an explicit i64 type on every binding.",
+  "script": "(+ 2 3)",
+  "validators": ["mach"],
+  "expect_ident": "add",
+  "forbid_overwrite": true
+}

@@ -1,0 +1,9 @@
+out/
+jobs/
+.qark/
+agent/eval/svr-*.txt
+*.exe
+*.o
+*.pdb
+agent/eval/results/
+agent/reference/*.md

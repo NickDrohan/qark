@@ -1,0 +1,37 @@
+# keystroke macros live in registers as notation text
+
+use std.allocator;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.size.usize;
+
+use A: std.allocator;
+use keys: qark.core.keys;
+use regs: qark.core.registers;
+
+# true when a register holds something that can be replayed
+pub fun has(rs: *regs.Registers, name: u8) bool {
+    var n: usize = 0;
+    val p: *u8 = regs.get(rs, name, ?n);
+    ret p != nil && n > 0;
+}
+
+# the last register recorded or yanked by name, or 0
+pub fun last(rs: *regs.Registers) u8 {
+    ret rs.last;
+}
+
+# append one key's notation to the recording register
+pub fun note(a_rs: *regs.Registers, k: keys.Key) bool {
+    if (!regs.is_recording(a_rs)) { ret false; }
+    var buf: *u8 = nil;
+    var len: usize = 0;
+    var cap: usize = 0;
+    val enc: err[A.Error] = keys.encode(a_rs.a, ?buf, ?len, ?cap, k);
+    if (sel enc.err) { ret false; }
+    val ap: err[A.Error] = regs.record_bytes(a_rs, buf, len);
+    if (buf != nil) { A.deallocate[u8](a_rs.a, buf, cap + 1); }
+    ret !sel ap.err;
+}

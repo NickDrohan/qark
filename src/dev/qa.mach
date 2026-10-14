@@ -1,0 +1,661 @@
+# dev driver: run this build's qark.exe against its own repo, from anywhere
+#
+#   qa apply <spec.json>            apply a spec file ('-' reads stdin)
+#   qa -e dst -f find -r repl       edit dst inline, no spec file needed
+#     -f find   literal find      -F re      regex find
+#     -r repl   replacement       -s txt     within scope
+#     -o n      occurrence        -a all     -n n count
+#     -B anchor insert before     -A anchor  insert after  (payload -W)
+#     --expect sha --no-check --dry --diff   text args: @file or - (stdin);
+#     argv text expands \n \r \t \\ escapes
+#   qa -w dst=src [-w ...]          write repo-relative dst from a local file
+#   qa -m upsert -w dst=src         pick the mode (default create)
+#   qa read <path> [first last]     one-shot ndjson read
+#   qa op '<json>'                  one ndjson line, as given
+#   qa <anything else>              passed to qark verbatim
+#
+# qark.exe is found beside qa.exe (same bin directory), and the workspace
+# root is four levels up from it: out/<target>/<profile>/bin. Pass --root to
+# use a different workspace.
+
+use std.collections.vector;
+use std.runtime;
+use std.filesystem;
+use std.print;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+
+use A: std.allocator;
+use heap: std.allocator.heap;
+use io_error: std.io.error;
+use exec: std.process.exec;
+use jw: qark.rpc.jw;
+use runner: qark.run.runner;
+use util: qark.util;
+
+# copy a NUL-terminated string into a fixed buffer; returns its length
+fun copy(out: *u8, cap: usize, s: str) usize {
+    var i: usize = 0;
+    for (i + 1 < cap && s[i] != 0) {
+        out[i] = s[i];
+        i = i + 1;
+    }
+    out[i] = 0;
+    ret i;
+}
+
+# the index just past the last path separator, or 0
+fun last_sep(p: str) usize {
+    var at: usize = 0;
+    var i: usize = 0;
+    for (p[i] != 0) {
+        if (p[i] == '/' || p[i] == '\\') { at = i + 1; }
+        i = i + 1;
+    }
+    ret at;
+}
+
+# drop the last path component, keeping one trailing separator
+fun updir(buf: *u8) {
+    var n: usize = 0;
+    for (buf[n] != 0) { n = n + 1; }
+    var e: usize = n;
+    for (e > 0 && (buf[e - 1] == '/' || buf[e - 1] == '\\')) { e = e - 1; }
+    var i: usize = e;
+    for (i > 0 && buf[i - 1] != '/' && buf[i - 1] != '\\') { i = i - 1; }
+    buf[i] = 0;
+}
+
+# qark.exe next to this program's own exe, from argv[0] or PATH
+fun sibling_qark(a: *A.Allocator, argv0: str, out: *u8, cap: usize) {
+    var n: usize = copy(out, cap, argv0);
+    if (last_sep(out) == 0) {
+        val found: res[str, exec.Error] = runner.which(a, out);
+        if (sel found.ok) { n = copy(out, cap, found.ok); }
+    }
+    updir(out);
+    n = str_len(out);
+    var i: usize = 0;
+    for ("qark.exe"[i] != 0 && n + i + 1 < cap) {
+        out[n + i] = "qark.exe"[i];
+        i = i + 1;
+    }
+    out[n + i] = 0;
+    val ex: res[bool, io_error.Error] = filesystem.exists(out);
+    if (sel ex.ok && !ex.ok && n + 5 < cap) {
+        out[n + 4] = 0;
+    }
+}
+
+# the workspace root is four directories above .../<target>/<profile>/bin
+fun root_of(qark: str, out: *u8, cap: usize) {
+    copy(out, cap, qark);
+    var i: usize = 0;
+    for (i < 5) {
+        updir(out);
+        i = i + 1;
+    }
+    var n: usize = str_len(out);
+    for (n > 0 && (out[n - 1] == '/' || out[n - 1] == '\\')) {
+        out[n - 1] = 0;
+        n = n - 1;
+    }
+}
+
+fun usage() i64 {
+    print.println("qa - drive this build's qark.exe against its own repo");
+    print.println("  qa apply <spec.json>          apply a spec file ('-' reads stdin)");
+    print.println("  qa -e dst -f find -r repl     edit dst inline; -e/-f repeat");
+    print.println("    -F re regex, -s within, -o n occurrence, -a all, -n count");
+    print.println("    -B/-A anchor insert + -W payload, --expect, --no-check");
+    print.println("    --dry, --diff; text args may be @file or - for stdin");
+    print.println("    argv text expands \\n \\r \\t \\\\ escapes");
+    print.println("  qa -w dst=src [-w ...]        write repo dst from a local file");
+    print.println("  qa -m upsert -w dst=src       pick the mode (default create)");
+    print.println("  qa read <path> [first last]   one-shot ndjson read");
+    print.println("  qa op '<json>'                one ndjson line, as given");
+    print.println("  qa op -                       ndjson from stdin (shell-safe)");
+    print.println("  note: git bash mangles json in args; pipe it to qa op -");
+    print.println("  qa <qark args...>             passed through verbatim");
+    print.println("  --root DIR                    workspace (default: this build's repo)");
+    ret 2;
+}
+
+fun write_all(f: filesystem.File, data: *u8, n: usize) bool {
+    var off: usize = 0;
+    for (off < n) {
+        val wr: res[usize, io_error.Error] = filesystem.write(f, (data::usize + off)::*u8, n - off);
+        if (sel wr.err) { ret false; }
+        if (wr.ok == 0) { ret false; }
+        off = off + wr.ok;
+    }
+    ret true;
+}
+
+# run qark with argv and optional stdin, print what it printed, exit as it did
+fun run_qark(a: *A.Allocator, argv: **u8, input: *u8, in_n: usize) i64 {
+    var job: runner.Job;
+    val started: err[exec.Error] = runner.start(a, argv, nil, input, in_n, 120000, ?job);
+    if (sel started.err) {
+        print.eprintln("qa: qark.exe could not be started");
+        ret 2;
+    }
+    val done: res[runner.RunResult, exec.Error] = runner.finish(a, ?job);
+    if (sel done.err) {
+        print.eprintln("qa: qark.exe failed to run");
+        ret 2;
+    }
+    var r: runner.RunResult = done.ok;
+    if (r.stdout != nil) { print.println(r.stdout); }
+    if (r.stderr != nil && r.stderr[0] != 0) { print.eprintln(r.stderr); }
+    val code: i64 = r.exit;
+    runner.dnit(a, ?r);
+    ret code;
+}
+
+# ndjson through the headless worker: one line on stdin, one reply on stdout
+fun ndjson(a: *A.Allocator, qark: *u8, root: *u8, line: *u8, n: usize) i64 {
+    var cargv: [8]*u8;
+    cargv[0] = qark;
+    cargv[1] = "--headless";
+    cargv[2] = "--stdio";
+    cargv[3] = "--root";
+    cargv[4] = root;
+    cargv[5] = nil;
+    var input: vector.Vector[u8] = vector.init[u8](a);
+    var i: usize = 0;
+    for (i < n) {
+        vector.push[u8](?input, line[i]);
+        i = i + 1;
+    }
+    vector.push[u8](?input, '\n');
+    ret run_qark(a, ?cargv[0], input.data, input.len);
+}
+
+fun read_stdin(a: *A.Allocator, out: **u8, n: *usize) bool {
+    var buf: *u8 = nil;
+    var len: usize = 0;
+    var cap: usize = 0;
+    var chunk: [65536]u8;
+    for {
+        val rd: res[usize, io_error.Error] = filesystem.read(filesystem.STDIN, ?chunk[0], 65536);
+        if (sel rd.err) { brk; }
+        if (rd.ok == 0) { brk; }
+        val ap: err[A.Error] = util.append(a, ?buf, ?len, ?cap, ?chunk[0], rd.ok);
+        if (sel ap.err) { ret false; }
+    }
+    if (buf == nil) { ret false; }
+    @out = buf;
+    @n = len;
+    ret true;
+}
+
+val K_FIND: u8 = 0;
+val K_RE: u8 = 1;
+val K_BEFORE: u8 = 2;
+val K_AFTER: u8 = 3;
+
+rec EEdit {
+    kind:    u8;
+    find:    str;
+    repl:    str;
+    within:  str;
+    with_s:  str;
+    occ:     i64;
+    has_occ: bool;
+    all:     bool;
+    cnt:     i64;
+}
+
+rec EFile {
+    path:     str;
+    expect:   str;
+    no_check: bool;
+    edits:    vector.Vector[EEdit];
+}
+
+# parse a small signed integer; false on anything non-numeric
+fun to_i64(s: str, out: *i64) bool {
+    var i: usize = 0;
+    var neg: bool = false;
+    if (s[0] == '-') { neg = true; i = 1; }
+    if (s[i] == 0) { ret false; }
+    var v: i64 = 0;
+    for (s[i] != 0) {
+        if (s[i] < '0' || s[i] > '9') { ret false; }
+        v = v * 10 + (s[i] - '0')::i64;
+        i = i + 1;
+    }
+    if (neg) { v = -v; }
+    @out = v;
+    ret true;
+}
+
+# expand \n \r \t \\ escapes in an argv string; other \x pass through
+fun unesc(a: *A.Allocator, s: str) str {
+    var has: bool = false;
+    var n: usize = 0;
+    for (s[n] != 0) {
+        if (s[n] == '\\' && s[n + 1] != 0) { has = true; brk; }
+        n = n + 1;
+    }
+    if (!has) { ret s; }
+    var out: vector.Vector[u8] = vector.init[u8](a);
+    var i: usize = 0;
+    for (s[i] != 0) {
+        if (s[i] == '\\' && s[i + 1] != 0) {
+            val c: u8 = s[i + 1];
+            if (c == 'n') { vector.push[u8](?out, '\n'); }
+            or (c == 'r') { vector.push[u8](?out, '\r'); }
+            or (c == 't') { vector.push[u8](?out, '\t'); }
+            or (c == '\\') { vector.push[u8](?out, '\\'); }
+            or {
+                vector.push[u8](?out, '\\');
+                vector.push[u8](?out, c);
+            }
+            i = i + 2;
+            cnt;
+        }
+        vector.push[u8](?out, s[i]);
+        i = i + 1;
+    }
+    vector.push[u8](?out, 0);
+    ret out.data;
+}
+
+# resolve a -e text argument: "-" is stdin once, "@path" reads a file
+fun arg_text(a: *A.Allocator, s: str, stdin_used: *bool) str {
+    if (util.eq(s, "-")) {
+        if (@stdin_used) { print.eprintln("qa: only one -e argument can read stdin"); ret nil; }
+        @stdin_used = true;
+        var b: *u8 = nil;
+        var n: usize = 0;
+        if (!read_stdin(a, ?b, ?n)) { print.eprintln("qa: no input on stdin"); ret nil; }
+        val d: res[str, A.Error] = util.dup_n(a, b, n);
+        if (sel d.err) { ret nil; }
+        ret d.ok;
+    }
+    if (s[0] == '@') {
+        val t: res[str, filesystem.FsError] = filesystem.read_string(a, (s::usize + 1)::*u8);
+        if (sel t.err) { print.eprintln("qa: could not read the file named by @"); print.eprintln((s::usize + 1)::*u8); ret nil; }
+        ret t.ok;
+    }
+    ret unesc(a, s);
+}
+
+fun jw_i64(w: *jw.Jw, n: i64) {
+    var num: [24]u8;
+    val m: usize = util.fmt_i64(?num[0], 24, n);
+    jw.bytes(w, ?num[0], m);
+}
+
+# the current file group / edit being built, or a usage error
+fun cur_edit(efiles: *vector.Vector[EFile], cur_f: i64, cur_e: i64) *EEdit {
+    ret ?efiles.data[cur_f::usize].edits.data[cur_e::usize];
+}
+
+# qa -e: turn shorthand flags into an apply spec fed to qark on stdin
+fun do_edits(a: *A.Allocator, qark: *u8, root: *u8, efiles: *vector.Vector[EFile], dry: bool, show_diff: bool) i64 {
+    var w: jw.Jw = jw.init(a);
+    jw.raw(?w, "{\"files\":[");
+    var i: usize = 0;
+    for (i < efiles.len) {
+        val f: *EFile = ?efiles.data[i];
+        if (f.edits.len == 0) { print.eprintln("qa: -e needs at least one -f, -F, -B, or -A"); ret 2; }
+        if (i > 0) { jw.byte(?w, ','); }
+        jw.raw(?w, "{\"path\":");
+        jw.str_v(?w, f.path);
+        jw.raw(?w, ",\"edits\":[");
+        var k: usize = 0;
+        for (k < f.edits.len) {
+            val ed: *EEdit = ?f.edits.data[k];
+            if (k > 0) { jw.byte(?w, ','); }
+            jw.byte(?w, '{');
+            if (ed.kind == K_BEFORE || ed.kind == K_AFTER) {
+                if (ed.with_s == nil) { print.eprintln("qa: -B/-A need -W payload text"); ret 2; }
+                if (ed.kind == K_BEFORE) { jw.raw(?w, "\"insert_before\":"); }
+                or { jw.raw(?w, "\"insert_after\":"); }
+                if (ed.has_occ) {
+                    jw.raw(?w, "{\"find\":");
+                    jw.str_v(?w, ed.find);
+                    jw.raw(?w, ",\"occurrence\":");
+                    jw_i64(?w, ed.occ);
+                    jw.byte(?w, '}');
+                }
+                or { jw.str_v(?w, ed.find); }
+                jw.raw(?w, ",\"with\":");
+                jw.str_v(?w, ed.with_s);
+            }
+            or {
+                if (ed.kind == K_FIND) { jw.raw(?w, "\"find\":"); }
+                or { jw.raw(?w, "\"find_re\":"); }
+                jw.str_v(?w, ed.find);
+                jw.raw(?w, ",\"replace\":");
+                if (ed.repl == nil) { jw.str_v(?w, ""); }
+                or { jw.str_v(?w, ed.repl); }
+                if (ed.within != nil) { jw.raw(?w, ",\"within\":"); jw.str_v(?w, ed.within); }
+                if (ed.has_occ) { jw.raw(?w, ",\"occurrence\":"); jw_i64(?w, ed.occ); }
+                if (ed.all) { jw.raw(?w, ",\"all\":true"); }
+                if (ed.cnt != 0) { jw.raw(?w, ",\"count\":"); jw_i64(?w, ed.cnt); }
+            }
+            jw.byte(?w, '}');
+            k = k + 1;
+        }
+        jw.byte(?w, ']');
+        if (f.expect != nil) { jw.raw(?w, ",\"expect\":"); jw.str_v(?w, f.expect); }
+        if (f.no_check) { jw.raw(?w, ",\"check\":false"); }
+        jw.byte(?w, '}');
+        i = i + 1;
+    }
+    jw.byte(?w, ']');
+    if (dry) { jw.raw(?w, ",\"dry_run\":true"); }
+    if (show_diff) { jw.raw(?w, ",\"diff\":true"); }
+    jw.byte(?w, '}');
+    if (w.failed) {
+        print.eprintln("qa: out of memory while building the spec");
+        ret 2;
+    }
+    var cargv: [8]*u8;
+    cargv[0] = qark;
+    cargv[1] = "apply";
+    cargv[2] = "-";
+    cargv[3] = "--root";
+    cargv[4] = root;
+    cargv[5] = nil;
+    ret run_qark(a, ?cargv[0], w.buf, w.len);
+}
+
+# qa read <path> [first last]
+fun do_read(a: *A.Allocator, qark: *u8, root: *u8, rest: *vector.Vector[*u8]) i64 {
+    var w: jw.Jw = jw.init(a);
+    jw.raw(?w, "{\"id\":1,\"op\":\"read\",\"args\":{\"path\":");
+    jw.str_v(?w, rest.data[1]);
+    if (rest.len >= 4) {
+        jw.raw(?w, ",\"lines\":[");
+        jw.raw(?w, rest.data[2]);
+        jw.raw(?w, ",");
+        jw.raw(?w, rest.data[3]);
+        jw.byte(?w, ']');
+    }
+    jw.raw(?w, "}}");
+    ret ndjson(a, qark, root, w.buf, w.len);
+}
+
+# qa -w dst=src [-w ...] [-m mode]: stage local files into a spec and apply it
+fun do_writes(a: *A.Allocator, qark: *u8, root: *u8, mode: str, wfiles: *vector.Vector[*u8]) i64 {
+    var w: jw.Jw = jw.init(a);
+    jw.raw(?w, "{\"files\":[");
+    var i: usize = 0;
+    for (i < wfiles.len) {
+        val pair: str = wfiles.data[i];
+        val eq: opt[usize] = util.index_byte(pair, str_len(pair), '=');
+        if (!sel eq.some) {
+            print.eprintln("qa: -w takes dst=src");
+            ret 2;
+        }
+        if (eq.some == 0) {
+            print.eprintln("qa: -w takes dst=src");
+            ret 2;
+        }
+        var dst: [512]u8;
+        var d: usize = 0;
+        for (d < eq.some && d + 1 < 512) {
+            dst[d] = pair[d];
+            d = d + 1;
+        }
+        dst[d] = 0;
+        val src: str = (pair::usize + eq.some + 1)::*u8;
+        val text: res[str, filesystem.FsError] = filesystem.read_string(a, src);
+        if (sel text.err) {
+            print.eprintln("qa: could not read the local file");
+            print.eprintln(src);
+            ret 2;
+        }
+        if (i > 0) { jw.byte(?w, ','); }
+        jw.raw(?w, "{\"path\":");
+        jw.str_n(?w, ?dst[0], d);
+        jw.raw(?w, ",\"text\":");
+        jw.str_n(?w, text.ok, str_len(text.ok));
+        jw.raw(?w, ",\"mode\":");
+        jw.str_v(?w, mode);
+        jw.byte(?w, '}');
+        i = i + 1;
+    }
+    jw.raw(?w, "]}");
+    if (w.failed) {
+        print.eprintln("qa: out of memory while building the spec");
+        ret 2;
+    }
+    val tf: res[filesystem.TempFile, filesystem.FsError] = filesystem.temp_create(a, "qaspec");
+    if (sel tf.err) {
+        print.eprintln("qa: could not make a temp file for the spec");
+        ret 2;
+    }
+    var t: filesystem.TempFile = tf.ok;
+    if (!write_all(t.file, w.buf, w.len)) {
+        filesystem.temp_close_and_remove(?t);
+        print.eprintln("qa: could not write the spec");
+        ret 2;
+    }
+    filesystem.temp_close(?t);
+    var cargv: [8]*u8;
+    cargv[0] = qark;
+    cargv[1] = "apply";
+    cargv[2] = filesystem.temp_path(?t);
+    cargv[3] = "--root";
+    cargv[4] = root;
+    cargv[5] = nil;
+    val code: i64 = run_qark(a, ?cargv[0], nil, 0);
+    filesystem.temp_remove(?t);
+    ret code;
+}
+
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 {
+    var src: heap.Source;
+    var hp: heap.Heap;
+    var a: A.Allocator;
+    heap.native_source(?src);
+    val hinit: err[A.Error] = heap.init(?hp, ?src, 67108864);
+    if (sel hinit.err) { ret 1; }
+    val made: err[A.Error] = heap.make(?a, ?hp);
+    if (sel made.err) { ret 1; }
+    if (argc < 2) { ret usage(); }
+
+    var qark: [1024]u8;
+    sibling_qark(?a, argv[0], ?qark[0], 1024);
+    var root: [1024]u8;
+    root_of(?qark[0], ?root[0], 1024);
+
+    var mode: str = "create";
+    var wfiles: vector.Vector[*u8] = vector.init[*u8](?a);
+    var rest: vector.Vector[*u8] = vector.init[*u8](?a);
+    var efiles: vector.Vector[EFile] = vector.init[EFile](?a);
+    var cur_f: i64 = -1;
+    var cur_e: i64 = -1;
+    var dry: bool = false;
+    var show_diff: bool = false;
+    var stdin_used: bool = false;
+    var i: i64 = 1;
+    for (i < argc) {
+        val arg: str = argv[i::usize];
+        if (util.eq(arg, "--root") && i + 1 < argc) {
+            copy(?root[0], 1024, argv[(i + 1)::usize]);
+            i = i + 2;
+        }
+        or (util.eq(arg, "-m") && i + 1 < argc) {
+            mode = argv[(i + 1)::usize];
+            i = i + 2;
+        }
+        or (util.eq(arg, "-w") && i + 1 < argc) {
+            vector.push[*u8](?wfiles, argv[(i + 1)::usize]);
+            i = i + 2;
+        }
+        or (util.eq(arg, "-e") && i + 1 < argc) {
+            val p: str = arg_text(?a, argv[(i + 1)::usize], ?stdin_used);
+            if (p == nil) { ret 2; }
+            var f: EFile;
+            f.path = p;
+            f.expect = nil;
+            f.no_check = false;
+            f.edits = vector.init[EEdit](?a);
+            vector.push[EFile](?efiles, f);
+            cur_f = efiles.len::i64 - 1;
+            cur_e = -1;
+            i = i + 2;
+        }
+        or ((util.eq(arg, "-f") || util.eq(arg, "-F")) && i + 1 < argc) {
+            if (cur_f < 0) { print.eprintln("qa: -f needs -e dst first"); ret 2; }
+            val p: str = arg_text(?a, argv[(i + 1)::usize], ?stdin_used);
+            if (p == nil) { ret 2; }
+            var ed: EEdit;
+            ed.kind = K_FIND;
+            if (util.eq(arg, "-F")) { ed.kind = K_RE; }
+            ed.find = p;
+            ed.repl = nil;
+            ed.within = nil;
+            ed.with_s = nil;
+            ed.occ = 0;
+            ed.has_occ = false;
+            ed.all = false;
+            ed.cnt = 0;
+            val fp: *EFile = ?efiles.data[cur_f::usize];
+            vector.push[EEdit](?fp.edits, ed);
+            cur_e = fp.edits.len::i64 - 1;
+            i = i + 2;
+        }
+        or ((util.eq(arg, "-B") || util.eq(arg, "-A")) && i + 1 < argc) {
+            if (cur_f < 0) { print.eprintln("qa: -B/-A need -e dst first"); ret 2; }
+            val p: str = arg_text(?a, argv[(i + 1)::usize], ?stdin_used);
+            if (p == nil) { ret 2; }
+            var ed: EEdit;
+            ed.kind = K_BEFORE;
+            if (util.eq(arg, "-A")) { ed.kind = K_AFTER; }
+            ed.find = p;
+            ed.repl = nil;
+            ed.within = nil;
+            ed.with_s = nil;
+            ed.occ = 0;
+            ed.has_occ = false;
+            ed.all = false;
+            ed.cnt = 0;
+            val fp: *EFile = ?efiles.data[cur_f::usize];
+            vector.push[EEdit](?fp.edits, ed);
+            cur_e = fp.edits.len::i64 - 1;
+            i = i + 2;
+        }
+        or (util.eq(arg, "-r") && i + 1 < argc) {
+            if (cur_e < 0) { print.eprintln("qa: -r needs -f or -F first"); ret 2; }
+            val p: str = arg_text(?a, argv[(i + 1)::usize], ?stdin_used);
+            if (p == nil) { ret 2; }
+            val ep: *EEdit = cur_edit(?efiles, cur_f, cur_e);
+            if (ep.kind != K_FIND && ep.kind != K_RE) { print.eprintln("qa: inserts take -W, not -r"); ret 2; }
+            ep.repl = p;
+            i = i + 2;
+        }
+        or (util.eq(arg, "-s") && i + 1 < argc) {
+            if (cur_e < 0) { print.eprintln("qa: -s needs -f or -F first"); ret 2; }
+            val p: str = arg_text(?a, argv[(i + 1)::usize], ?stdin_used);
+            if (p == nil) { ret 2; }
+            val ep: *EEdit = cur_edit(?efiles, cur_f, cur_e);
+            if (ep.kind != K_FIND && ep.kind != K_RE) { print.eprintln("qa: -s scopes a find edit"); ret 2; }
+            ep.within = p;
+            i = i + 2;
+        }
+        or (util.eq(arg, "-W") && i + 1 < argc) {
+            if (cur_e < 0) { print.eprintln("qa: -W needs -B or -A first"); ret 2; }
+            val p: str = arg_text(?a, argv[(i + 1)::usize], ?stdin_used);
+            if (p == nil) { ret 2; }
+            val ep: *EEdit = cur_edit(?efiles, cur_f, cur_e);
+            if (ep.kind != K_BEFORE && ep.kind != K_AFTER) { print.eprintln("qa: -W is the payload for -B/-A"); ret 2; }
+            ep.with_s = p;
+            i = i + 2;
+        }
+        or (util.eq(arg, "-o") && i + 1 < argc) {
+            if (cur_e < 0) { print.eprintln("qa: -o needs -f, -F, -B, or -A first"); ret 2; }
+            var v: i64 = 0;
+            if (!to_i64(argv[(i + 1)::usize], ?v)) { print.eprintln("qa: -o takes an integer"); ret 2; }
+            val ep: *EEdit = cur_edit(?efiles, cur_f, cur_e);
+            ep.has_occ = true;
+            ep.occ = v;
+            i = i + 2;
+        }
+        or (util.eq(arg, "-a")) {
+            if (cur_e < 0) { print.eprintln("qa: -a needs -f or -F first"); ret 2; }
+            val ep: *EEdit = cur_edit(?efiles, cur_f, cur_e);
+            if (ep.kind != K_FIND && ep.kind != K_RE) { print.eprintln("qa: -a needs -f or -F"); ret 2; }
+            ep.all = true;
+            i = i + 1;
+        }
+        or (util.eq(arg, "-n") && i + 1 < argc) {
+            if (cur_e < 0) { print.eprintln("qa: -n needs -f or -F first"); ret 2; }
+            var v: i64 = 0;
+            if (!to_i64(argv[(i + 1)::usize], ?v) || v <= 0) { print.eprintln("qa: -n takes a positive integer"); ret 2; }
+            val ep: *EEdit = cur_edit(?efiles, cur_f, cur_e);
+            if (ep.kind != K_FIND && ep.kind != K_RE) { print.eprintln("qa: -n needs -f or -F"); ret 2; }
+            ep.cnt = v;
+            i = i + 2;
+        }
+        or (util.eq(arg, "--expect") && i + 1 < argc) {
+            if (cur_f < 0) { print.eprintln("qa: --expect needs -e dst first"); ret 2; }
+            val fp: *EFile = ?efiles.data[cur_f::usize];
+            fp.expect = argv[(i + 1)::usize];
+            i = i + 2;
+        }
+        or (util.eq(arg, "--no-check")) {
+            if (cur_f < 0) { print.eprintln("qa: --no-check needs -e dst first"); ret 2; }
+            val fp: *EFile = ?efiles.data[cur_f::usize];
+            fp.no_check = true;
+            i = i + 1;
+        }
+        or (util.eq(arg, "--dry")) { dry = true; i = i + 1; }
+        or (util.eq(arg, "--diff")) { show_diff = true; i = i + 1; }
+        or {
+            vector.push[*u8](?rest, arg);
+            i = i + 1;
+        }
+    }
+    if (wfiles.len > 0) { ret do_writes(?a, ?qark[0], ?root[0], mode, ?wfiles); }
+    if (efiles.len > 0) { ret do_edits(?a, ?qark[0], ?root[0], ?efiles, dry, show_diff); }
+    if (rest.len == 0) { ret usage(); }
+    val cmd: str = rest.data[0];
+    if (util.eq(cmd, "read")) {
+        if (rest.len < 2) { ret usage(); }
+        ret do_read(?a, ?qark[0], ?root[0], ?rest);
+    }
+    if (util.eq(cmd, "op")) {
+        if (rest.len < 2) { ret usage(); }
+        if (util.eq(rest.data[1], "-")) {
+            var inb: *u8 = nil;
+            var inbn: usize = 0;
+            if (!read_stdin(?a, ?inb, ?inbn)) {
+                print.eprintln("qa: no input on stdin");
+                ret 2;
+            }
+            ret ndjson(?a, ?qark[0], ?root[0], inb, inbn);
+        }
+        ret ndjson(?a, ?qark[0], ?root[0], rest.data[1], str_len(rest.data[1]));
+    }
+
+    # anything else is passed to qark verbatim
+    var cargv: [32]*u8;
+    cargv[0] = ?qark[0];
+    var ci: usize = 1;
+    var k: usize = 0;
+    for (k < rest.len && ci < 28) {
+        cargv[ci] = rest.data[k];
+        ci = ci + 1;
+        k = k + 1;
+    }
+    cargv[ci] = "--root";
+    cargv[ci + 1] = ?root[0];
+    cargv[ci + 2] = nil;
+    ret run_qark(?a, ?cargv[0], nil, 0);
+}

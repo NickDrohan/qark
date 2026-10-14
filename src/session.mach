@@ -1,0 +1,172 @@
+# one editor plus one lisp machine, shared by the ui and the rpc worker
+
+use std.collections.vector;
+use std.filesystem;
+use io_error: std.io.error;
+use std.process.env;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.OwnedString;
+use std.types.string.str;
+
+use A: std.allocator;
+use arena: std.allocator.arena;
+use path: std.types.path;
+use check: qark.gen.check;
+use spec: qark.spec.spec;
+use eng: qark.core.engine;
+use buffer: qark.core.buffer;
+use text: qark.core.text;
+use ev: qark.vm.eval;
+use h: qark.vm.heap;
+use load: qark.vm.load;
+use v: qark.vm.value;
+
+# a running qark session
+# ---
+# root:    absolute workspace root; every agent path is relative to it
+# arena:   storage for one request, released when the next begins
+# ra:      allocator over arena
+# tools:   checker programs, found once
+# tpls:    templates defined with template.define, owned by a
+# lock_ms: how long a commit waits for another qark writing the same root
+pub rec Session {
+    a:       *A.Allocator;
+    eng:     eng.Engine;
+    vm:      v.Vm;
+    jobs:    i64;
+    root:    str;
+    arena:   arena.Arena;
+    ra:      A.Allocator;
+    tools:   check.Tools;
+    tpls:    vector.Vector[spec.Tpl];
+    lock_ms: i64;
+    applies: i64;
+    written: i64;
+    force_dry: bool;
+}
+
+fun api_cur(ctx: *u8) i64 {
+    val e: *eng.Engine = ctx::*eng.Engine;
+    val b: opt[*buffer.Buffer] = buffer.current(?e.bufs);
+    if (!sel b.some) { ret 0; }
+    ret b.some.id;
+}
+
+fun api_count(ctx: *u8, id: i64) i64 {
+    val e: *eng.Engine = ctx::*eng.Engine;
+    val b: opt[*buffer.Buffer] = buffer.get(?e.bufs, id);
+    if (!sel b.some) { ret 0; }
+    ret text.line_count(?b.some.text);
+}
+
+fun api_line(ctx: *u8, id: i64, row: i64, len: *usize) *u8 {
+    val e: *eng.Engine = ctx::*eng.Engine;
+    val b: opt[*buffer.Buffer] = buffer.get(?e.bufs, id);
+    if (!sel b.some) {
+        @len = 0;
+        ret nil;
+    }
+    val line: opt[*text.Line] = text.line_at(?b.some.text, row);
+    if (!sel line.some) {
+        @len = 0;
+        ret nil;
+    }
+    @len = line.some.len;
+    ret line.some.data;
+}
+
+fun api_ft(ctx: *u8, id: i64) str {
+    val e: *eng.Engine = ctx::*eng.Engine;
+    val b: opt[*buffer.Buffer] = buffer.get(?e.bufs, id);
+    if (!sel b.some) { ret ""; }
+    ret b.some.ft;
+}
+
+fun api_cmd(ctx: *u8, line: str) i64 {
+    val e: *eng.Engine = ctx::*eng.Engine;
+    val ran: err[A.Error] = eng.command(e, line);
+    if (sel ran.err) { ret 1; }
+    ret 0;
+}
+
+fun api_normal(ctx: *u8, keys: str) i64 {
+    val e: *eng.Engine = ctx::*eng.Engine;
+    val ran: err[A.Error] = eng.feed(e, keys);
+    if (sel ran.err) { ret 1; }
+    ret 0;
+}
+
+# open a session and evaluate the embedded prelude
+pub fun open(a: *A.Allocator) res[Session, A.Error] {
+    val engine: res[eng.Engine, A.Error] = eng.init(a);
+    if (sel engine.err) { ret res[Session, A.Error].err{engine.err}; }
+    val machine: res[v.Vm, A.Error] = h.init(a);
+    if (sel machine.err) { ret res[Session, A.Error].err{machine.err}; }
+    var s: Session;
+    s.a = a;
+    s.eng = engine.ok;
+    s.vm = machine.ok;
+    s.tpls = vector.init[spec.Tpl](a);
+    s.lock_ms = 10000;
+    arena.init(?s.arena, a, 0);
+    val here: res[OwnedString, env.EnvError] = env.current_dir(a);
+    if (sel here.ok) { s.root = here.ok.data; }
+    or { s.root = "."; }
+    s.vm.api.cur_buf = api_cur;
+    s.vm.api.line_count = api_count;
+    s.vm.api.line_at = api_line;
+    s.vm.api.filetype = api_ft;
+    s.vm.api.command = api_cmd;
+    s.vm.api.normal = api_normal;
+    val booted: err[A.Error] = ev.boot(?s.vm);
+    if (sel booted.err) { ret res[Session, A.Error].err{booted.err}; }
+    load.prelude(?s.vm);
+    ret res[Session, A.Error].ok{s};
+}
+
+# point lisp callbacks and the request arena at this session; call after the session stops moving
+pub fun bind(s: *Session) {
+    s.vm.api.ctx = ((?s.eng)::usize)::*u8;
+    arena.make(?s.ra, ?s.arena);
+}
+
+# start a request: everything the last one put in the request arena is released
+pub fun begin_request(s: *Session) {
+    bind(s);
+    arena.reset(?s.arena);
+}
+
+# serve agents: ex commands stay inside buffers, and paths resolve under root
+pub fun headless(s: *Session) {
+    s.eng.sandbox = true;
+}
+
+# make root the workspace every path is relative to; false when it is not a directory
+pub fun set_root(s: *Session, root: str) bool {
+    var abs: str = root;
+    if (!path.is_abs(root)) {
+        val joined: res[str, A.Error] = path.join(s.a, s.root, root);
+        if (sel joined.err) { ret false; }
+        abs = joined.ok;
+    }
+    val cleaned: res[str, A.Error] = path.clean(s.a, abs);
+    if (sel cleaned.err) { ret false; }
+    val is_dir: res[bool, io_error.Error] = filesystem.is_dir(cleaned.ok);
+    if (!(sel is_dir.ok && is_dir.ok)) { ret false; }
+    s.root = cleaned.ok;
+    ret true;
+}
+
+# release both halves and stop the warm checkers
+pub fun close(s: *Session) {
+    check.shutdown(?s.tools);
+    h.dnit(?s.vm);
+    eng.dnit(?s.eng);
+    arena.dnit(?s.arena);
+}

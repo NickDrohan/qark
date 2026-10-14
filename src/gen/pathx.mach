@@ -1,0 +1,237 @@
+# portable relative paths: what an agent may name under the workspace root
+#
+# a path is refused rather than rewritten. '/' and '\' both separate segments,
+# and the canonical spelling uses '/'. names windows treats specially (devices,
+# drive prefixes, stream colons, trailing dots and spaces) are refused on every
+# host so a change set means the same thing everywhere it is applied.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+
+use A: std.allocator;
+use path: std.types.path;
+use util: qark.util;
+
+pub val P_OK:            i64 = 0;
+pub val P_EMPTY:         i64 = 1;
+pub val P_ABSOLUTE:      i64 = 2;
+pub val P_DOTS:          i64 = 3;
+pub val P_EMPTY_SEGMENT: i64 = 4;
+pub val P_CHAR:          i64 = 5;
+pub val P_RESERVED:      i64 = 6;
+pub val P_TRAILING:      i64 = 7;
+pub val P_LONG:          i64 = 8;
+pub val P_INTERNAL:      i64 = 9;
+
+pub val MAX_PATH_BYTES:    usize = 1024;
+pub val MAX_SEGMENT_BYTES: usize = 255;
+
+fun lower(c: u8) u8 {
+    if (c >= 'A' && c <= 'Z') { ret c + 32; }
+    ret c;
+}
+
+fun seg_is(p: *u8, n: usize, t: str) bool {
+    if (n != str_len(t)) { ret false; }
+    var i: usize = 0;
+    for (i < n) {
+        if (lower(p[i]) != t[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun seg_starts(p: *u8, n: usize, t: str) bool {
+    val tn: usize = str_len(t);
+    if (n < tn) { ret false; }
+    var i: usize = 0;
+    for (i < tn) {
+        if (lower(p[i]) != t[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# windows device names stay devices whatever extension follows them
+fun reserved(p: *u8, n: usize) bool {
+    var stem: usize = 0;
+    for (stem < n && p[stem] != '.') { stem = stem + 1; }
+    if (seg_is(p, stem, "con") || seg_is(p, stem, "prn") || seg_is(p, stem, "aux") || seg_is(p, stem, "nul")) { ret true; }
+    if (seg_is(p, stem, "conin$") || seg_is(p, stem, "conout$")) { ret true; }
+    if (stem == 4 && p[3] >= '0' && p[3] <= '9') {
+        if (seg_starts(p, 3, "com") || seg_starts(p, 3, "lpt")) { ret true; }
+    }
+    ret false;
+}
+
+# qark's own state, git internals, and transaction residue are not agent paths
+fun internal(p: *u8, n: usize) bool {
+    if (seg_is(p, n, ".qark") || seg_is(p, n, ".git")) { ret true; }
+    if (seg_starts(p, n, ".machtxn") || seg_starts(p, n, ".mach-txn") || seg_starts(p, n, ".qark-")) { ret true; }
+    ret false;
+}
+
+fun check_segment(p: *u8, n: usize) i64 {
+    if (n == 0) { ret P_EMPTY_SEGMENT; }
+    if (n > MAX_SEGMENT_BYTES) { ret P_LONG; }
+    if (n == 1 && p[0] == '.') { ret P_DOTS; }
+    if (n == 2 && p[0] == '.' && p[1] == '.') { ret P_DOTS; }
+    var i: usize = 0;
+    for (i < n) {
+        val c: u8 = p[i];
+        if (c < 0x20 || c == 0x7f) { ret P_CHAR; }
+        if (c == '<' || c == '>' || c == ':' || c == '"' || c == '|' || c == '?' || c == '*') { ret P_CHAR; }
+        i = i + 1;
+    }
+    if (p[n - 1] == '.' || p[n - 1] == ' ') { ret P_TRAILING; }
+    if (reserved(p, n)) { ret P_RESERVED; }
+    if (internal(p, n)) { ret P_INTERNAL; }
+    ret P_OK;
+}
+
+# P_OK when rel is a safe relative path, otherwise why it is refused
+pub fun check(rel: str) i64 {
+    if (rel == nil || rel[0] == 0) { ret P_EMPTY; }
+    val n: usize = str_len(rel);
+    if (n > MAX_PATH_BYTES) { ret P_LONG; }
+    if (rel[0] == '/' || rel[0] == '\\') { ret P_ABSOLUTE; }
+    if (n >= 2 && rel[1] == ':') { ret P_ABSOLUTE; }
+    var start: usize = 0;
+    var i: usize = 0;
+    for (i <= n) {
+        if (i == n || rel[i] == '/' || rel[i] == '\\') {
+            val r: i64 = check_segment((rel::usize + start)::*u8, i - start);
+            if (r != P_OK) { ret r; }
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    ret P_OK;
+}
+
+# the refusal code an agent sees
+pub fun code(r: i64) str {
+    if (r == P_EMPTY) { ret "path_empty"; }
+    if (r == P_ABSOLUTE) { ret "path_absolute"; }
+    if (r == P_DOTS) { ret "path_dots"; }
+    if (r == P_EMPTY_SEGMENT) { ret "path_empty_segment"; }
+    if (r == P_CHAR) { ret "path_char"; }
+    if (r == P_RESERVED) { ret "path_reserved"; }
+    if (r == P_TRAILING) { ret "path_trailing"; }
+    if (r == P_LONG) { ret "path_long"; }
+    if (r == P_INTERNAL) { ret "path_internal"; }
+    ret "path_ok";
+}
+
+pub fun message(r: i64) str {
+    if (r == P_EMPTY) { ret "path is empty"; }
+    if (r == P_ABSOLUTE) { ret "path must be relative to the workspace root; no leading slash or drive letter"; }
+    if (r == P_DOTS) { ret "path must not contain . or .. segments"; }
+    if (r == P_EMPTY_SEGMENT) { ret "path has an empty segment (doubled or trailing slash)"; }
+    if (r == P_CHAR) { ret "path contains a control character or one of < > : \" | ? *"; }
+    if (r == P_RESERVED) { ret "path uses a reserved device name such as CON, NUL, COM1, or LPT1"; }
+    if (r == P_TRAILING) { ret "a path segment ends with a dot or a space"; }
+    if (r == P_LONG) { ret "path is longer than 1024 bytes or has a segment over 255 bytes"; }
+    if (r == P_INTERNAL) { ret "path names .qark, .git, or transaction residue, which agents may not write"; }
+    ret "ok";
+}
+
+# a copy with every '\' turned into '/'
+pub fun canonical(a: *A.Allocator, rel: str) res[str, A.Error] {
+    val d: res[str, A.Error] = util.dup(a, rel);
+    if (sel d.err) { ret d; }
+    val p: *u8 = d.ok;
+    var i: usize = 0;
+    for (p[i] != 0) {
+        if (p[i] == '\\') { p[i] = '/'; }
+        i = i + 1;
+    }
+    ret d;
+}
+
+# a lowercase copy, for case-insensitive duplicate detection
+pub fun folded(a: *A.Allocator, rel: str) res[str, A.Error] {
+    val d: res[str, A.Error] = util.dup(a, rel);
+    if (sel d.err) { ret d; }
+    val p: *u8 = d.ok;
+    var i: usize = 0;
+    for (p[i] != 0) {
+        p[i] = lower(p[i]);
+        i = i + 1;
+    }
+    ret d;
+}
+
+# root joined with a canonical rel, using the host separator
+pub fun native(a: *A.Allocator, root: str, rel: str) res[str, A.Error] {
+    val joined: res[str, A.Error] = path.join(a, root, rel);
+    if (sel joined.err) { ret joined; }
+    $if ($mach.build.os == $mach.os.windows) {
+        val p: *u8 = joined.ok;
+        var i: usize = 0;
+        for (p[i] != 0) {
+            if (p[i] == '/') { p[i] = '\\'; }
+            i = i + 1;
+        }
+    }
+    ret joined;
+}
+
+# a/b joined as "a/b"; either side may be empty or "."
+pub fun join(a: *A.Allocator, left: str, right: str) res[str, A.Error] {
+    var buf: *u8 = nil;
+    var len: usize = 0;
+    var cap: usize = 0;
+    val lempty: bool = left == nil || left[0] == 0 || util.eq(left, ".");
+    val rempty: bool = right == nil || right[0] == 0 || util.eq(right, ".");
+    if (!lempty) {
+        val l: err[A.Error] = util.append_str(a, ?buf, ?len, ?cap, left);
+        if (sel l.err) { ret res[str, A.Error].err{l.err}; }
+    }
+    if (!lempty && !rempty) {
+        val s: err[A.Error] = util.append_byte(a, ?buf, ?len, ?cap, '/');
+        if (sel s.err) { ret res[str, A.Error].err{s.err}; }
+    }
+    if (!rempty) {
+        val r: err[A.Error] = util.append_str(a, ?buf, ?len, ?cap, right);
+        if (sel r.err) { ret res[str, A.Error].err{r.err}; }
+    }
+    if (buf == nil) { ret util.dup(a, ""); }
+    ret res[str, A.Error].ok{buf};
+}
+
+use std.system.capability;
+
+$if (capability.HOSTED) {
+    test check__refuses_escapes_devices_and_internals {
+        if (check("src/app/main.py") != P_OK) { ret 1; }
+        if (check("a\\b.txt") != P_OK) { ret 2; }
+        if (check("../x") != P_DOTS) { ret 3; }
+        if (check("a/./b") != P_DOTS) { ret 4; }
+        if (check("/etc/passwd") != P_ABSOLUTE) { ret 5; }
+        if (check("C:\\Windows\\x") != P_ABSOLUTE) { ret 6; }
+        if (check("C:x") != P_ABSOLUTE) { ret 7; }
+        if (check("a/b:stream") != P_CHAR) { ret 8; }
+        if (check("NUL") != P_RESERVED) { ret 9; }
+        if (check("logs/con.txt") != P_RESERVED) { ret 10; }
+        if (check("COM1.log") != P_RESERVED) { ret 11; }
+        if (check("x/name.") != P_TRAILING) { ret 12; }
+        if (check("x/name ") != P_TRAILING) { ret 13; }
+        if (check("a//b") != P_EMPTY_SEGMENT) { ret 14; }
+        if (check("a/") != P_EMPTY_SEGMENT) { ret 15; }
+        if (check(".git/hooks/pre-commit") != P_INTERNAL) { ret 16; }
+        if (check(".qark/lock") != P_INTERNAL) { ret 17; }
+        if (check("x/.qark-12.tmp") != P_INTERNAL) { ret 18; }
+        if (check("") != P_EMPTY) { ret 19; }
+        if (check(".gitignore") != P_OK) { ret 20; }
+        if (check("console.log") != P_OK) { ret 21; }
+        if (check("com10.txt") != P_OK) { ret 22; }
+        ret 0;
+    }
+}

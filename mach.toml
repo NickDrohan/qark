@@ -1,0 +1,75 @@
+[project]
+id = "qark"
+version = "0.2.0"
+mach = "^6.0"
+src = "src"
+out = "out/{target.name}/{profile.name}"
+
+[target.linux-x86_64]
+isa = "x86_64"
+os  = "linux"
+abi = "sysv64"
+
+[target.windows-x86_64]
+isa = "x86_64"
+os  = "windows"
+abi = "win64"
+stack_reserve = 67108864
+stack_commit = 65536
+
+[target.darwin-x86_64]
+isa = "x86_64"
+os  = "darwin"
+abi = "sysv64"
+
+[artifact.qark]
+kind = "bin"
+default = true
+entry = "main.mach"
+out = "bin/qark{artifact.suffix}"
+targets = ["*"]
+link = ["kernel32"]
+need = []
+
+[artifact.qa]
+kind = "bin"
+entry = "dev/qa.mach"
+out = "bin/qa{artifact.suffix}"
+targets = ["*"]
+link = ["kernel32"]
+need = []
+
+[artifact.tests]
+kind = "static"
+entry = "test/all.mach"
+out = "lib/tests{artifact.suffix}"
+targets = ["*"]
+link = ["kernel32"]
+need = []
+
+[link.kernel32]
+source = "system"
+name = "kernel32.dll"
+os = ["windows"]
+isa = ["*"]
+abi = ["*"]
+export = false
+
+[profile.debug]
+default = true
+opt = 0
+debug = true
+simd = "scalarize"
+vectorize = false
+float_reassoc = false
+
+[profile.release]
+opt = 2
+debug = false
+simd = "scalarize"
+vectorize = true
+float_reassoc = false
+
+[dep.std]
+git = "https://github.com/briar-systems/mach-std"
+version = "^9.5.0"

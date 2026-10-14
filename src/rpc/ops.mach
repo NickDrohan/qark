@@ -1,0 +1,664 @@
+# ndjson operations: the write layer, plus buffers, keys, lisp, and validation
+
+use std.data.json;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+
+use A: std.allocator;
+use buffer: qark.core.buffer;
+use eng: qark.core.engine;
+use text: qark.core.text;
+use commit: qark.gen.commit;
+use pathx: qark.gen.pathx;
+use jw: qark.rpc.jw;
+use write: qark.rpc.write;
+use ident: qark.gen.validate;
+use ev: qark.vm.eval;
+use h: qark.vm.heap;
+use pr: qark.vm.printer;
+use v: qark.vm.value;
+use session: qark.session;
+use util: qark.util;
+
+# decoded string fields, one line of a set_lines array, and that array's length
+pub val MAX_FIELD: usize = 262144;
+pub val MAX_LINE:  usize = 65536;
+pub val MAX_LINES: usize = 4096;
+
+# 0 absent or not a string, 1 owned copy in out, 2 over the cap, 3 out of memory
+fun decode_string(a: *A.Allocator, v: *json.Value, max: usize, out: *str) i64 {
+    var raw_len: usize = 0;
+    val raw: *u8 = json.value_string(v, ?raw_len);
+    if (raw == nil && raw_len > 0) { ret 3; }
+    if (raw_len > max) { ret 2; }
+    val scratch: res[*u8, A.Error] = A.allocate[u8](a, raw_len + 1);
+    if (sel scratch.err) { ret 3; }
+    val dec: res[usize, json.JsonError] = json.value_string_decode(v, scratch.ok, raw_len + 1);
+    if (sel dec.err) {
+        A.deallocate[u8](a, scratch.ok, raw_len + 1);
+        ret 3;
+    }
+    if (dec.ok > raw_len || dec.ok > max) {
+        A.deallocate[u8](a, scratch.ok, raw_len + 1);
+        ret 2;
+    }
+    val copied: res[str, A.Error] = util.dup_n(a, scratch.ok, dec.ok);
+    A.deallocate[u8](a, scratch.ok, raw_len + 1);
+    if (sel copied.err) { ret 3; }
+    @out = copied.ok;
+    ret 1;
+}
+
+fun field_str(a: *A.Allocator, obj: *json.Value, key: str, out: *str) i64 {
+    val found: opt[*json.Value] = json.value_find(obj, key);
+    if (!sel found.some) { ret 0; }
+    if (!json.value_is_string(found.some)) { ret 0; }
+    ret decode_string(a, found.some, MAX_FIELD, out);
+}
+
+fun field_i64(obj: *json.Value, key: str, fallback: i64) i64 {
+    val found: opt[*json.Value] = json.value_find(obj, key);
+    if (!sel found.some) { ret fallback; }
+    if (!json.value_is_number(found.some)) { ret fallback; }
+    ret json.value_number(found.some);
+}
+
+fun reply(a: *A.Allocator, id: i64, ok: bool, body: str) res[str, A.Error] {
+    var buf: *u8 = nil;
+    var len: usize = 0;
+    var cap: usize = 0;
+    val p1: err[A.Error] = util.append_str(a, ?buf, ?len, ?cap, "{\"id\":");
+    if (sel p1.err) { ret res[str, A.Error].err{p1.err}; }
+    var num: [32]u8;
+    val nn: usize = util.fmt_i64(?num[0], 32, id);
+    val p2: err[A.Error] = util.append(a, ?buf, ?len, ?cap, ?num[0], nn);
+    if (sel p2.err) { ret res[str, A.Error].err{p2.err}; }
+    if (ok) {
+        val p3: err[A.Error] = util.append_str(a, ?buf, ?len, ?cap, ",\"ok\":true,\"result\":");
+        if (sel p3.err) { ret res[str, A.Error].err{p3.err}; }
+    }
+    or {
+        val p3: err[A.Error] = util.append_str(a, ?buf, ?len, ?cap, ",\"ok\":false,\"error\":");
+        if (sel p3.err) { ret res[str, A.Error].err{p3.err}; }
+    }
+    if (body != nil) {
+        val p4: err[A.Error] = util.append_str(a, ?buf, ?len, ?cap, body);
+        if (sel p4.err) { ret res[str, A.Error].err{p4.err}; }
+    }
+    or {
+        val p4: err[A.Error] = util.append_str(a, ?buf, ?len, ?cap, "null");
+        if (sel p4.err) { ret res[str, A.Error].err{p4.err}; }
+    }
+    val p5: err[A.Error] = util.append_str(a, ?buf, ?len, ?cap, "}\n");
+    if (sel p5.err) { ret res[str, A.Error].err{p5.err}; }
+    val exact: res[str, A.Error] = util.dup_n(a, buf, len);
+    if (buf != nil) { A.deallocate[u8](a, buf, cap + 1); }
+    ret exact;
+}
+
+fun append_json_str(a: *A.Allocator, buf: **u8, len: *usize, cap: *usize, s: str) err[A.Error] {
+    val open: err[A.Error] = util.append_byte(a, buf, len, cap, '"');
+    if (sel open.err) { ret open; }
+    if (s != nil) {
+        var i: usize = 0;
+        val n: usize = str_len(s);
+        for (i < n) {
+            val c: u8 = s[i];
+            if (c == '"' || c == '\\') {
+                val slash: err[A.Error] = util.append_byte(a, buf, len, cap, '\\');
+                if (sel slash.err) { ret slash; }
+                val ch: err[A.Error] = util.append_byte(a, buf, len, cap, c);
+                if (sel ch.err) { ret ch; }
+            }
+            or (c == '\n') {
+                val slash: err[A.Error] = util.append_byte(a, buf, len, cap, '\\');
+                if (sel slash.err) { ret slash; }
+                val ch: err[A.Error] = util.append_byte(a, buf, len, cap, 'n');
+                if (sel ch.err) { ret ch; }
+            }
+            or (c == '\r') {
+                val slash: err[A.Error] = util.append_byte(a, buf, len, cap, '\\');
+                if (sel slash.err) { ret slash; }
+                val ch: err[A.Error] = util.append_byte(a, buf, len, cap, 'r');
+                if (sel ch.err) { ret ch; }
+            }
+            or {
+                val ch: err[A.Error] = util.append_byte(a, buf, len, cap, c);
+                if (sel ch.err) { ret ch; }
+            }
+            i = i + 1;
+        }
+    }
+    ret util.append_byte(a, buf, len, cap, '"');
+}
+
+fun error_object(a: *A.Allocator, code: str, message: str) res[str, A.Error] {
+    var buf: *u8 = nil;
+    var len: usize = 0;
+    var cap: usize = 0;
+    val a1: err[A.Error] = util.append_str(a, ?buf, ?len, ?cap, "{\"code\":");
+    if (sel a1.err) { ret res[str, A.Error].err{a1.err}; }
+    val a2: err[A.Error] = append_json_str(a, ?buf, ?len, ?cap, code);
+    if (sel a2.err) { ret res[str, A.Error].err{a2.err}; }
+    val a3: err[A.Error] = util.append_str(a, ?buf, ?len, ?cap, ",\"message\":");
+    if (sel a3.err) { ret res[str, A.Error].err{a3.err}; }
+    val a4: err[A.Error] = append_json_str(a, ?buf, ?len, ?cap, message);
+    if (sel a4.err) { ret res[str, A.Error].err{a4.err}; }
+    val a5: err[A.Error] = util.append_byte(a, ?buf, ?len, ?cap, '}');
+    if (sel a5.err) { ret res[str, A.Error].err{a5.err}; }
+    val exact: res[str, A.Error] = util.dup_n(a, buf, len);
+    if (buf != nil) { A.deallocate[u8](a, buf, cap + 1); }
+    ret exact;
+}
+
+fun fail(a: *A.Allocator, id: i64, code: str, message: str) res[str, A.Error] {
+    val body: res[str, A.Error] = error_object(a, code, message);
+    if (sel body.err) { ret body; }
+    val out: res[str, A.Error] = reply(a, id, false, body.ok);
+    util.free(a, body.ok);
+    ret out;
+}
+
+fun str_fail(a: *A.Allocator, id: i64, status: i64) res[str, A.Error] {
+    if (status == 2) { ret fail(a, id, "too_long", "string exceeds 262144 bytes"); }
+    ret fail(a, id, "oom", "out of memory");
+}
+
+# one file into jobs/<job>/<path>: exclusive, atomic, and contained under the root
+fun job_write(s: *session.Session, req: i64, root_rel: str, job_id: str, rel: str, text: str) res[str, A.Error] {
+    val a: *A.Allocator = ?s.ra;
+    if (text == nil || rel == nil || root_rel == nil || job_id == nil) {
+        ret fail(s.a, req, "job_path", "job.write needs path and text; root and job are optional");
+    }
+    val croot: res[str, A.Error] = pathx.canonical(a, root_rel);
+    val crel: res[str, A.Error] = pathx.canonical(a, rel);
+    if (sel croot.err) { ret fail(s.a, req, "oom", "out of memory"); }
+    if (sel crel.err) { ret fail(s.a, req, "oom", "out of memory"); }
+    val slash: opt[usize] = util.index_byte(job_id, str_len(job_id), '/');
+    if (pathx.check(croot.ok) != pathx.P_OK || pathx.check(crel.ok) != pathx.P_OK || pathx.check(job_id) != pathx.P_OK || sel slash.some) {
+        ret fail(s.a, req, "job_path", "root, job, and path must be relative to the workspace root and must not contain ..");
+    }
+    val dir: res[str, A.Error] = pathx.join(a, croot.ok, job_id);
+    if (sel dir.err) { ret fail(s.a, req, "oom", "out of memory"); }
+    val full_rel: res[str, A.Error] = pathx.join(a, dir.ok, crel.ok);
+    if (sel full_rel.err) { ret fail(s.a, req, "oom", "out of memory"); }
+    var set: commit.Set = commit.init(a, s.root);
+    val added: res[usize, A.Error] = commit.add(?set, full_rel.ok, text, str_len(text), commit.MODE_CREATE);
+    if (sel added.err) { ret fail(s.a, req, "oom", "out of memory"); }
+    commit.observe(?set);
+    val e: *commit.Entry = commit.entry(?set, 0);
+    if (e.status == commit.ST_CONFLICT) {
+        if (util.eq(e.reason, "exists")) { ret fail(s.a, req, "job_exists", "refusing to overwrite an existing file"); }
+        ret fail(s.a, req, "job_path", commit.reason_message(e.reason));
+    }
+    if (e.status == commit.ST_CREATE) {
+        var held: commit.Lock;
+        if (commit.lock(?set, s.lock_ms, ?held) != 0) { ret fail(s.a, req, "locked", "another qark process held the workspace lock"); }
+        commit.observe(?set);
+        if (e.status == commit.ST_CONFLICT) {
+            commit.unlock(?held);
+            ret fail(s.a, req, "job_exists", "refusing to overwrite an existing file");
+        }
+        val out: commit.Outcome = commit.publish(?set);
+        commit.unlock(?held);
+        if (!out.ok) { ret fail(s.a, req, "job_write", out.msg); }
+    }
+    var w: jw.Jw = jw.init(a);
+    jw.obj(?w);
+    jw.f_str(?w, "path", e.full);
+    jw.f_str(?w, "sha256", ?e.sha[0]);
+    jw.f_i64(?w, "bytes", e.len::i64);
+    jw.obj_end(?w);
+    ret reply(s.a, req, true, jw.text(?w));
+}
+
+fun write_op(op: str) bool {
+    ret util.eq(op, "apply") || util.eq(op, "read") || util.eq(op, "search") || util.eq(op, "template.list") || util.eq(op, "template.define") || util.eq(op, "template.render") || util.eq(op, "job.verify") || util.eq(op, "session.info");
+}
+
+# run one write-layer op into w; true when w holds a result rather than an error
+pub fun run_write(s: *session.Session, op: str, args: *json.Value, w: *jw.Jw) bool {
+    if (util.eq(op, "apply")) { ret write.apply(s, args, w); }
+    if (util.eq(op, "read")) { ret write.read(s, args, w); }
+    if (util.eq(op, "search")) { ret write.search(s, args, w); }
+    if (util.eq(op, "template.list")) { ret write.templates(s, args, w); }
+    if (util.eq(op, "template.define")) { ret write.define(s, args, w); }
+    if (util.eq(op, "template.render")) { ret write.render(s, args, w); }
+    if (util.eq(op, "job.verify")) {
+        var dir: str = nil;
+        val df: opt[*json.Value] = json.value_find(args, "dir");
+        if (sel df.some) {
+            if (json.value_is_string(df.some)) {
+                var p: *u8 = nil;
+                if (decode_string(?s.ra, df.some, MAX_FIELD, ?p) == 1) { dir = p; }
+            }
+        }
+        if (dir == nil) { ret write.simple_error(w, "spec_field", "job.verify needs dir, such as jobs/etl"); }
+        var matched: bool = false;
+        ret write.verify(s, dir, w, ?matched);
+    }
+    ret write.info(s, w);
+}
+
+fun handle_obj(s: *session.Session, obj: *json.Value) res[str, A.Error] {
+    val req: i64 = field_i64(obj, "id", 0);
+    var op: str = nil;
+    val op_st: i64 = field_str(s.a, obj, "op", ?op);
+    if (op_st >= 2) { ret str_fail(s.a, req, op_st); }
+    if (op_st != 1) { ret fail(s.a, req, "missing_op", "request has no op"); }
+    val args: opt[*json.Value] = json.value_find(obj, "args");
+    var argp: *json.Value = obj;
+    if (sel args.some) { argp = args.some; }
+
+    if (write_op(op)) {
+        var w: jw.Jw = jw.init(?s.ra);
+        val ok: bool = run_write(s, op, argp, ?w);
+        util.free(s.a, op);
+        if (w.failed) { ret fail(s.a, req, "oom", "out of memory while writing the reply"); }
+        ret reply(s.a, req, ok, jw.text(?w));
+    }
+    if (util.eq(op, "buf.create")) {
+        var name: str = nil;
+        var ft: str = nil;
+        val name_st: i64 = field_str(s.a, argp, "name", ?name);
+        if (name_st >= 2) {
+            util.free(s.a, op);
+            ret str_fail(s.a, req, name_st);
+        }
+        val ft_st: i64 = field_str(s.a, argp, "filetype", ?ft);
+        if (ft_st >= 2) {
+            util.free(s.a, name);
+            util.free(s.a, op);
+            ret str_fail(s.a, req, ft_st);
+        }
+        val made: res[i64, A.Error] = buffer.create(?s.eng.bufs, name, ft);
+        util.free(s.a, name);
+        util.free(s.a, ft);
+        util.free(s.a, op);
+        if (sel made.err) { ret fail(s.a, req, "oom", "could not create the buffer"); }
+        var num: [32]u8;
+        val nn: usize = util.fmt_i64(?num[0], 32, made.ok);
+        var fixed: [80]u8;
+        var i: usize = 0;
+        val prefix: str = "{\"buf\":";
+        for (prefix[i] != 0) {
+            fixed[i] = prefix[i];
+            i = i + 1;
+        }
+        var k: usize = 0;
+        for (k < nn) {
+            fixed[i] = num[k];
+            i = i + 1;
+            k = k + 1;
+        }
+        fixed[i] = '}';
+        i = i + 1;
+        fixed[i] = 0;
+        ret reply(s.a, req, true, ?fixed[0]);
+    }
+    if (util.eq(op, "buf.set_lines")) {
+        val buf_id: i64 = field_i64(argp, "buf", 0);
+        val start: i64 = field_i64(argp, "start", 0);
+        val end: i64 = field_i64(argp, "end", -1);
+        val lines: opt[*json.Value] = json.value_find(argp, "lines");
+        if (!sel lines.some) {
+            util.free(s.a, op);
+            ret fail(s.a, req, "bad_lines", "lines must be an array of strings");
+        }
+        if (!json.value_is_array(lines.some)) {
+            util.free(s.a, op);
+            ret fail(s.a, req, "bad_lines", "lines must be an array of strings");
+        }
+        val count_u: usize = json.value_count(lines.some);
+        if (count_u > MAX_LINES) {
+            util.free(s.a, op);
+            ret fail(s.a, req, "too_many_lines", "buf.set_lines accepts at most 4096 lines");
+        }
+        val srcs: res[**u8, A.Error] = A.allocate[*u8](s.a, count_u);
+        if (sel srcs.err) {
+            util.free(s.a, op);
+            ret fail(s.a, req, "oom", "out of memory");
+        }
+        val lens: res[*usize, A.Error] = A.allocate[usize](s.a, count_u);
+        if (sel lens.err) {
+            A.deallocate[*u8](s.a, srcs.ok, count_u);
+            util.free(s.a, op);
+            ret fail(s.a, req, "oom", "out of memory");
+        }
+        val owned: res[*str, A.Error] = A.allocate[str](s.a, count_u);
+        if (sel owned.err) {
+            A.deallocate[*u8](s.a, srcs.ok, count_u);
+            A.deallocate[usize](s.a, lens.ok, count_u);
+            util.free(s.a, op);
+            ret fail(s.a, req, "oom", "out of memory");
+        }
+        var i: usize = 0;
+        for (i < count_u) {
+            srcs.ok[i] = nil;
+            lens.ok[i] = 0;
+            owned.ok[i] = nil;
+            i = i + 1;
+        }
+        var bad: i64 = 0;
+        i = 0;
+        for (i < count_u && bad == 0) {
+            val item: opt[*json.Value] = json.value_get(lines.some, i);
+            if (sel item.some) {
+                if (json.value_is_string(item.some)) {
+                    val dec: i64 = decode_string(s.a, item.some, MAX_LINE, ?owned.ok[i]);
+                    if (dec == 1) {
+                        srcs.ok[i] = owned.ok[i];
+                        lens.ok[i] = str_len(owned.ok[i]);
+                    }
+                    or (dec == 2) { bad = 2; }
+                    or { bad = 3; }
+                }
+                or { bad = 1; }
+            }
+            or { bad = 1; }
+            i = i + 1;
+        }
+        if (bad != 0) {
+            var k: usize = 0;
+            for (k < count_u) {
+                util.free(s.a, owned.ok[k]);
+                k = k + 1;
+            }
+            A.deallocate[*u8](s.a, srcs.ok, count_u);
+            A.deallocate[usize](s.a, lens.ok, count_u);
+            A.deallocate[str](s.a, owned.ok, count_u);
+            util.free(s.a, op);
+            if (bad == 2) { ret fail(s.a, req, "line_too_long", "a line exceeds 65536 bytes"); }
+            if (bad == 3) { ret fail(s.a, req, "oom", "out of memory"); }
+            ret fail(s.a, req, "bad_lines", "lines must be an array of strings");
+        }
+        val sp: err[A.Error] = buffer.splice(?s.eng.bufs, buf_id, start, end, srcs.ok, lens.ok, count_u::i64, true);
+        i = 0;
+        for (i < count_u) {
+            util.free(s.a, owned.ok[i]);
+            i = i + 1;
+        }
+        A.deallocate[*u8](s.a, srcs.ok, count_u);
+        A.deallocate[usize](s.a, lens.ok, count_u);
+        A.deallocate[str](s.a, owned.ok, count_u);
+        util.free(s.a, op);
+        if (sel sp.err) { ret fail(s.a, req, "splice", "could not replace lines"); }
+        ret reply(s.a, req, true, "{\"ok\":true}");
+    }
+    if (util.eq(op, "keys.feed")) {
+        var keys: str = nil;
+        val keys_st: i64 = field_str(s.a, argp, "keys", ?keys);
+        if (keys_st >= 2) {
+            util.free(s.a, op);
+            ret str_fail(s.a, req, keys_st);
+        }
+        val fed: err[A.Error] = eng.feed(?s.eng, keys);
+        util.free(s.a, keys);
+        util.free(s.a, op);
+        if (sel fed.err) { ret fail(s.a, req, "keys", "could not feed keys"); }
+        ret reply(s.a, req, true, "{\"ok\":true}");
+    }
+    if (util.eq(op, "cmd.ex")) {
+        var line: str = nil;
+        val line_st: i64 = field_str(s.a, argp, "line", ?line);
+        if (line_st >= 2) {
+            util.free(s.a, op);
+            ret str_fail(s.a, req, line_st);
+        }
+        val ran: err[A.Error] = eng.command(?s.eng, line);
+        util.free(s.a, line);
+        util.free(s.a, op);
+        if (sel ran.err) { ret fail(s.a, req, "ex", "could not run the command"); }
+        ret reply(s.a, req, true, "{\"ok\":true}");
+    }
+    if (util.eq(op, "eval")) {
+        var src: str = nil;
+        val src_st: i64 = field_str(s.a, argp, "src", ?src);
+        if (src_st >= 2) {
+            util.free(s.a, op);
+            ret str_fail(s.a, req, src_st);
+        }
+        if (src_st != 1) {
+            util.free(s.a, op);
+            ret fail(s.a, req, "missing_src", "eval needs a src string");
+        }
+        val value: res[u32, v.VmError] = ev.eval_src(?s.vm, src);
+        util.free(s.a, src);
+        util.free(s.a, op);
+        if (sel value.err) { ret fail(s.a, req, "eval", "lisp evaluation failed"); }
+        val printed: res[str, A.Error] = pr.print(?s.vm, value.ok);
+        if (sel printed.err) { ret fail(s.a, req, "eval", "could not print the value"); }
+        var body: *u8 = nil;
+        var bl: usize = 0;
+        var bc: usize = 0;
+        util.append_str(s.a, ?body, ?bl, ?bc, "{\"value\":");
+        util.append_str(s.a, ?body, ?bl, ?bc, printed.ok);
+        util.append_str(s.a, ?body, ?bl, ?bc, "}");
+        util.free(s.a, printed.ok);
+        if (s.vm.since_gc > 20000) { h.gc(?s.vm); }
+        val exact: res[str, A.Error] = util.dup_n(s.a, body, bl);
+        if (body != nil) { A.deallocate[u8](s.a, body, bc + 1); }
+        if (sel exact.err) { ret exact; }
+        val out: res[str, A.Error] = reply(s.a, req, true, exact.ok);
+        util.free(s.a, exact.ok);
+        ret out;
+    }
+    if (util.eq(op, "job.write")) {
+        var root: str = nil;
+        var rel: str = nil;
+        var text: str = nil;
+        val root_st: i64 = field_str(s.a, argp, "root", ?root);
+        val path_st: i64 = field_str(s.a, argp, "path", ?rel);
+        val text_st: i64 = field_str(s.a, argp, "text", ?text);
+        if (root_st >= 2 || path_st >= 2 || text_st >= 2) {
+            util.free(s.a, root);
+            util.free(s.a, rel);
+            util.free(s.a, text);
+            util.free(s.a, op);
+            ret str_fail(s.a, req, 2);
+        }
+        if (root_st == 3 || path_st == 3 || text_st == 3) {
+            util.free(s.a, root);
+            util.free(s.a, rel);
+            util.free(s.a, text);
+            util.free(s.a, op);
+            ret str_fail(s.a, req, 3);
+        }
+        if (root == nil) {
+            val d: res[str, A.Error] = util.dup(s.a, "jobs");
+            if (sel d.ok) { root = d.ok; }
+        }
+        var job_id: str = nil;
+        val job_st: i64 = field_str(s.a, argp, "job", ?job_id);
+        if (job_st >= 2) {
+            util.free(s.a, root);
+            util.free(s.a, rel);
+            util.free(s.a, text);
+            util.free(s.a, op);
+            ret str_fail(s.a, req, job_st);
+        }
+        if (job_id == nil) {
+            val d: res[str, A.Error] = util.dup(s.a, "job");
+            if (sel d.ok) { job_id = d.ok; }
+        }
+        util.free(s.a, op);
+        val out: res[str, A.Error] = job_write(s, req, root, job_id, rel, text);
+        util.free(s.a, root);
+        util.free(s.a, rel);
+        util.free(s.a, text);
+        util.free(s.a, job_id);
+        ret out;
+    }
+    if (util.eq(op, "validate.ident")) {
+        var lang: str = nil;
+        var name: str = nil;
+        val lang_st: i64 = field_str(s.a, argp, "lang", ?lang);
+        val name_st: i64 = field_str(s.a, argp, "name", ?name);
+        if (lang_st >= 2 || name_st >= 2) {
+            util.free(s.a, lang);
+            util.free(s.a, name);
+            util.free(s.a, op);
+            ret str_fail(s.a, req, 2);
+        }
+        val ok: bool = ident.ident_ok(lang, name);
+        util.free(s.a, lang);
+        util.free(s.a, name);
+        util.free(s.a, op);
+        if (ok) { ret reply(s.a, req, true, "{\"ok\":true}"); }
+        ret reply(s.a, req, true, "{\"ok\":false}");
+    }
+    util.free(s.a, op);
+    ret fail(s.a, req, "unknown_op", "unknown operation");
+}
+
+fun id_fallback(id: str) i64 {
+    ret 0;
+}
+
+# true when the line has a byte other than space, tab, or CR
+pub fun line_actionable(line: str) bool {
+    if (line == nil) { ret false; }
+    var i: usize = 0;
+    val n: usize = str_len(line);
+    for (i < n) {
+        val c: u8 = line[i];
+        if (c != ' ' && c != '\t' && c != '\r') { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# dispatch one ndjson request line; the returned string is owned by s.a
+pub fun dispatch(s: *session.Session, line: str) res[str, A.Error] {
+    session.begin_request(s);
+    if (!line_actionable(line)) { ret fail(s.a, 0, "empty", "blank line"); }
+    val parsed: res[json.Value, json.JsonError] = json.parse(line, str_len(line), ?s.ra);
+    if (sel parsed.err) { ret fail(s.a, 0, "json", "could not parse the request as one json object"); }
+    var value: json.Value = parsed.ok;
+    ret handle_obj(s, ?value);
+}
+
+use std.system.capability;
+
+$if (capability.HOSTED) {
+    use std.filesystem;
+    use io_error: std.io.error;
+    use page: std.allocator.page;
+    use std.types.string.str_contains;
+    use std.types.string.str_equals;
+
+    test dispatch__session_info {
+        var a: A.Allocator;
+        val made: err[A.Error] = page.make(?a);
+        if (sel made.err) { ret 1; }
+        val opened: res[session.Session, A.Error] = session.open(?a);
+        if (sel opened.err) { ret 2; }
+        var s: session.Session = opened.ok;
+        session.bind(?s);
+        val out: res[str, A.Error] = dispatch(?s, "{\"id\":1,\"op\":\"session.info\"}");
+        if (sel out.err) { ret 3; }
+        if (!str_contains(out.ok, "{\"id\":1,\"ok\":true,\"result\":{\"name\":\"qark\",\"version\":\"0.2.0\",\"protocol\":2,")) {
+            ret 4;
+        }
+        util.free(?a, out.ok);
+        session.close(?s);
+        ret 0;
+    }
+
+    fun replied(r: res[str, A.Error], needle: str) bool {
+        if (sel r.ok) { ret str_contains(r.ok, needle); }
+        ret false;
+    }
+
+    test dispatch__apply_creates_then_reports_unchanged_and_refuses {
+        var a: A.Allocator;
+        val made: err[A.Error] = page.make(?a);
+        if (sel made.err) { ret 1; }
+        val tf: res[filesystem.TempFile, filesystem.FsError] = filesystem.temp_create(?a, "qark_apply");
+        if (sel tf.err) { ret 2; }
+        var t: filesystem.TempFile = tf.ok;
+        val dir: res[str, A.Error] = util.dup(?a, filesystem.temp_path(?t));
+        filesystem.temp_close_and_remove(?t);
+        if (sel dir.err) { ret 3; }
+        val mk: err[io_error.Error] = filesystem.create_dir(dir.ok, 493);
+        if (sel mk.err) { ret 4; }
+        val opened: res[session.Session, A.Error] = session.open(?a);
+        if (sel opened.err) { ret 5; }
+        var s: session.Session = opened.ok;
+        session.bind(?s);
+        if (!session.set_root(?s, dir.ok)) { ret 6; }
+        var bad: i32 = 0;
+        val req: str = "{\"id\":1,\"op\":\"apply\",\"args\":{\"check\":false,\"vars\":{\"xs\":[\"a\",\"b\"]},\"files\":[{\"each\":\"xs\",\"path\":\"out/{{.}}.txt\",\"tmpl\":\"item {{.}} #{{@index}}\\n\"}]}}";
+        if (!replied(dispatch(?s, req), "\"created\":2")) { bad = 8; }
+        if (bad == 0 && !replied(dispatch(?s, req), "\"unchanged\":2")) { bad = 9; }
+        if (bad == 0 && !replied(dispatch(?s, "{\"id\":3,\"op\":\"apply\",\"args\":{\"check\":false,\"path\":\"out/a.txt\",\"text\":\"other\\n\"}}"), "\"reason\":\"exists\"")) { bad = 10; }
+        if (bad == 0 && !replied(dispatch(?s, "{\"id\":4,\"op\":\"apply\",\"args\":{\"path\":\"../escape.txt\",\"text\":\"x\"}}"), "\"code\":\"path_dots\"")) { bad = 11; }
+        if (bad == 0 && !replied(dispatch(?s, "{\"id\":5,\"op\":\"read\",\"args\":{\"path\":\"out/b.txt\"}}"), "\"text\":\"item b #1\\n\"")) { bad = 12; }
+        session.close(?s);
+        filesystem.remove_all(?a, dir.ok);
+        ret bad;
+    }
+
+    test line_actionable__ignores_cr_and_blanks {
+        if (line_actionable(nil)) { ret 1; }
+        if (line_actionable("")) { ret 2; }
+        if (line_actionable("\r")) { ret 3; }
+        if (line_actionable(" \t\r")) { ret 4; }
+        if (!line_actionable("{")) { ret 5; }
+        ret 0;
+    }
+
+    test dispatch__refuses_too_many_lines_without_changing_the_buffer {
+        var a: A.Allocator;
+        val made: err[A.Error] = page.make(?a);
+        if (sel made.err) { ret 1; }
+        val opened: res[session.Session, A.Error] = session.open(?a);
+        if (sel opened.err) { ret 2; }
+        var s: session.Session = opened.ok;
+        val seeded: res[str, A.Error] = dispatch(?s, "{\"id\":1,\"op\":\"buf.set_lines\",\"args\":{\"buf\":1,\"start\":0,\"end\":-1,\"lines\":[\"keep\"]}}");
+        if (sel seeded.err) { ret 3; }
+        if (!str_contains(seeded.ok, "\"ok\":true")) { ret 4; }
+        util.free(?a, seeded.ok);
+        var buf: *u8 = nil;
+        var len: usize = 0;
+        var cap: usize = 0;
+        val head: err[A.Error] = util.append_str(?a, ?buf, ?len, ?cap, "{\"id\":2,\"op\":\"buf.set_lines\",\"args\":{\"buf\":1,\"start\":0,\"end\":-1,\"lines\":[");
+        if (sel head.err) { ret 5; }
+        var i: usize = 0;
+        for (i < 4097) {
+            if (i > 0) {
+                val comma: err[A.Error] = util.append_byte(?a, ?buf, ?len, ?cap, ',');
+                if (sel comma.err) { ret 6; }
+            }
+            val item: err[A.Error] = util.append_str(?a, ?buf, ?len, ?cap, "\"a\"");
+            if (sel item.err) { ret 7; }
+            i = i + 1;
+        }
+        val tail: err[A.Error] = util.append_str(?a, ?buf, ?len, ?cap, "]}}");
+        if (sel tail.err) { ret 8; }
+        val out: res[str, A.Error] = dispatch(?s, buf);
+        if (buf != nil) { A.deallocate[u8](?a, buf, cap + 1); }
+        if (sel out.err) { ret 9; }
+        if (!str_contains(out.ok, "too_many_lines")) { ret 10; }
+        util.free(?a, out.ok);
+        val got: opt[*buffer.Buffer] = buffer.get(?s.eng.bufs, 1);
+        if (!sel got.some) { ret 11; }
+        val joined: res[str, A.Error] = text.join(?got.some.text);
+        if (sel joined.err) { ret 12; }
+        if (!str_equals(joined.ok, "keep\n")) { ret 13; }
+        util.free(?a, joined.ok);
+        val unknown: res[str, A.Error] = dispatch(?s, "{\"id\":3,\"op\":\"nope\"}");
+        if (sel unknown.err) { ret 14; }
+        if (!str_contains(unknown.ok, "unknown_op")) { ret 15; }
+        util.free(?a, unknown.ok);
+        session.close(?s);
+        ret 0;
+    }
+}

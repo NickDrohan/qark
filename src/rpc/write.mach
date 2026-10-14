@@ -1,0 +1,1203 @@
+# the write layer: apply a spec, read files with their hashes, and manage templates
+#
+# every operation writes one json object into the caller's writer: the result
+# when it returns true, or an error object {code, message, ...} when it
+# returns false. the ndjson worker, the mcp server, and the cli all wrap these
+# same objects, so an agent sees one contract whichever way it connects.
+
+use std.chrono.duration;
+use std.chrono.time;
+use std.collections.vector;
+use std.crypto.rand;
+use std.data.json;
+use std.filesystem;
+use io_error: std.io.error;
+use std.text.utf8;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+
+use A: std.allocator;
+use check: qark.gen.check;
+use commit: qark.gen.commit;
+use diff: qark.gen.diff;
+use pathx: qark.gen.pathx;
+use scan: qark.gen.scan;
+use jw: qark.rpc.jw;
+use builtin: qark.spec.builtin;
+use spec: qark.spec.spec;
+use tmpl: qark.spec.tmpl;
+use session: qark.session;
+use util: qark.util;
+
+pub val READ_MAX: usize = 262144;
+
+fun now_us(start: time.Instant) i64 {
+    val el: time.Elapsed = time.elapsed(start);
+    if (sel el.ok) { ret duration.duration_usec(el.ok); }
+    ret 0;
+}
+
+fun started() time.Instant {
+    val now: time.InstantClock = time.instant();
+    if (sel now.ok) { ret now.ok; }
+    var zero: time.Instant;
+    ret zero;
+}
+
+fun error_obj(w: *jw.Jw, code: str, msg: str) {
+    jw.obj(w);
+    jw.f_str(w, "code", code);
+    jw.f_str(w, "message", msg);
+}
+
+pub fun simple_error(w: *jw.Jw, code: str, msg: str) bool {
+    error_obj(w, code, msg);
+    jw.obj_end(w);
+    ret false;
+}
+
+fun spec_error(w: *jw.Jw, e: *spec.Err) bool {
+    var code: str = e.code;
+    if (code == nil) { code = "spec"; }
+    var msg: str = e.msg;
+    if (msg == nil) { msg = "the spec was refused"; }
+    error_obj(w, code, msg);
+    if (e.field != nil) { jw.f_str(w, "field", e.field); }
+    if (e.path != nil) { jw.f_str(w, "path", e.path); }
+    if (e.tname != nil) { jw.f_str(w, "template", e.tname); }
+    if (e.line > 0) { jw.f_i64(w, "line", e.line); }
+    jw.obj_end(w);
+    ret false;
+}
+
+fun lines_of(p: *u8, n: usize) i64 {
+    if (n == 0) { ret 0; }
+    var k: i64 = 0;
+    var i: usize = 0;
+    for (i < n) {
+        if (p[i] == '\n') { k = k + 1; }
+        i = i + 1;
+    }
+    if (p[n - 1] != '\n') { k = k + 1; }
+    ret k;
+}
+
+fun txn_id(out: *u8) {
+    var rnd: [8]u8;
+    rand.fill(?rnd[0], 8);
+    util.fmt_hex(out, 17, ?rnd[0], 8);
+}
+
+# templates outside the spec: this session's, then the workspace's, then qark's own
+fun lib_find(ctx: *u8, name: str, out: *spec.Tpl) bool {
+    val s: *session.Session = ctx::*session.Session;
+    var i: usize = 0;
+    for (i < s.tpls.len) {
+        if (util.eq(s.tpls.data[i].name, name)) {
+            @out = s.tpls.data[i];
+            ret true;
+        }
+        i = i + 1;
+    }
+    if (pathx.check(name) == pathx.P_OK) {
+        var w: jw.Jw = jw.init(?s.ra);
+        jw.raw(?w, ".qark/templates/");
+        jw.raw(?w, name);
+        jw.raw(?w, ".tmpl");
+        if (!w.failed && w.buf != nil) {
+            val full: res[str, A.Error] = pathx.native(?s.ra, s.root, w.buf);
+            if (sel full.ok) {
+                val text: res[str, filesystem.FsError] = filesystem.read_string(?s.ra, full.ok);
+                if (sel text.ok) {
+                    out.name = name;
+                    out.lang = spec.lang_of(name);
+                    out.body = text.ok;
+                    out.len = str_len(text.ok);
+                    out.src = "workspace";
+                    out.desc = nil;
+                    var path_w: jw.Jw = jw.init(?s.ra);
+                    jw.raw(?path_w, ".qark/templates/");
+                    jw.raw(?path_w, name);
+                    jw.raw(?path_w, ".path");
+                    val path_full: res[str, A.Error] = pathx.native(?s.ra, s.root, jw.text(?path_w));
+                    if (sel path_full.ok) {
+                        val pat: res[str, filesystem.FsError] = filesystem.read_string(?s.ra, path_full.ok);
+                        if (sel pat.ok) { out.pathpat = pat.ok; }
+                    }
+                    ret true;
+                }
+            }
+        }
+    }
+    ret builtin.find(name, out);
+}
+
+fun file_receipt(w: *jw.Jw, a: *A.Allocator, e: *commit.Entry, dry: bool, preview: bool, show_diff: bool) {
+    jw.obj(w);
+    jw.f_str(w, "path", e.rel);
+    if (dry) { jw.f_str(w, "status", commit.plan_name(e.status)); }
+    or { jw.f_str(w, "status", commit.status_name(e.status)); }
+    if (e.status == commit.ST_CONFLICT) {
+        jw.f_str(w, "reason", e.reason);
+        jw.f_str(w, "message", commit.reason_message(e.reason));
+        if (e.existed) { jw.f_str(w, "current_sha256", ?e.old_sha[0]); }
+    }
+    if (e.status == commit.ST_UNCHANGED) {
+        if (e.edited) {
+            jw.f_str(w, "reason", "no_change");
+            jw.f_str(w, "message", "the edits produced the same bytes already on disk");
+        }
+        or {
+            jw.f_str(w, "reason", "same_content");
+            jw.f_str(w, "message", "the file already has this content");
+        }
+    }
+    if (e.notes.len > 0) {
+        jw.key(w, "notes");
+        jw.arr(w);
+        var ni: usize = 0;
+        for (ni < e.notes.len) {
+            jw.str_v(w, e.notes.data[ni]);
+            ni = ni + 1;
+        }
+        jw.arr_end(w);
+    }
+    if (e.mode != commit.MODE_DELETE) {
+        jw.f_str(w, "sha256", ?e.sha[0]);
+        jw.f_i64(w, "bytes", e.len::i64);
+        jw.f_i64(w, "lines", lines_of(e.data, e.len));
+    }
+    if (e.existed && (e.status == commit.ST_REPLACE || e.status == commit.ST_DELETE)) {
+        jw.f_str(w, "prev_sha256", ?e.old_sha[0]);
+    }
+    if (e.lang != nil) { jw.f_str(w, "lang", e.lang); }
+    if (e.check != commit.CK_NONE) {
+        jw.f_str(w, "check", check.check_name(e.check));
+        if (e.check == commit.CK_FAILED) {
+            if (e.ck_line > 0) { jw.f_i64(w, "line", e.ck_line); }
+            if (e.ck_col > 0) { jw.f_i64(w, "col", e.ck_col); }
+        }
+        if (e.ck_msg != nil && e.check != commit.CK_OK) { jw.f_str(w, "check_message", e.ck_msg); }
+    }
+    if (show_diff && (e.status == commit.ST_CREATE || e.status == commit.ST_REPLACE || e.status == commit.ST_DELETE)) {
+        var op: *u8 = e.old;
+        var on: usize = e.old_len;
+        var np: *u8 = e.data;
+        var nn: usize = e.len;
+        if (!e.existed) { op = nil; on = 0; }
+        if (e.status == commit.ST_DELETE) { np = nil; nn = 0; }
+        if (op == nil) { on = 0; }
+        if (np == nil) { nn = 0; }
+        var dw: jw.Jw = jw.init(a);
+        diff.unified(a, op, on, np, nn, ?dw);
+        if (!dw.failed && dw.len > 0) {
+            jw.key(w, "diff");
+            jw.str_n(w, dw.buf, dw.len);
+        }
+    }
+    if (preview && e.mode != commit.MODE_DELETE) {
+        var n: usize = e.len;
+        if (n > READ_MAX) { n = READ_MAX; }
+        jw.key(w, "text");
+        jw.str_n(w, e.data, n);
+        if (n < e.len) { jw.f_bool(w, "truncated", true); }
+    }
+    jw.obj_end(w);
+}
+
+fun files_list(w: *jw.Jw, set: *commit.Set, dry: bool, preview: bool, only_problems: bool, show_diff: bool, a: *A.Allocator) {
+    jw.key(w, "files");
+    jw.arr(w);
+    var i: usize = 0;
+    for (i < commit.count(set)) {
+        val e: *commit.Entry = commit.entry(set, i);
+        val problem: bool = e.status == commit.ST_CONFLICT || e.check == commit.CK_FAILED;
+        if (!only_problems || problem) { file_receipt(w, a, e, dry, preview, show_diff); }
+        i = i + 1;
+    }
+    jw.arr_end(w);
+}
+
+fun counts(w: *jw.Jw, set: *commit.Set) {
+    jw.f_i64(w, "created", commit.tally(set, commit.ST_CREATE));
+    jw.f_i64(w, "replaced", commit.tally(set, commit.ST_REPLACE));
+    jw.f_i64(w, "unchanged", commit.tally(set, commit.ST_UNCHANGED));
+    jw.f_i64(w, "deleted", commit.tally(set, commit.ST_DELETE));
+}
+
+fun check_tally(set: *commit.Set, ck: u8) i64 {
+    var n: i64 = 0;
+    var i: usize = 0;
+    for (i < commit.count(set)) {
+        val e: *commit.Entry = commit.entry(set, i);
+        if (e.check == ck && e.lang != nil) { n = n + 1; }
+        i = i + 1;
+    }
+    ret n;
+}
+
+fun journal_line(s: *session.Session, sp: *spec.Spec, txn: *u8) i64 {
+    var w: jw.Jw = jw.init(?s.ra);
+    jw.obj(?w);
+    val clock: time.Clock = time.now();
+    if (sel clock.ok) { jw.f_i64(?w, "ts_ms", time.time_unix_msec(clock.ok)); }
+    jw.f_str(?w, "txn", txn);
+    if (sp.job != nil) { jw.f_str(?w, "job", sp.job); }
+    if (sp.tag != nil) { jw.f_str(?w, "tag", sp.tag); }
+    jw.f_str(?w, "spec_sha256", ?sp.sha[0]);
+    jw.key(?w, "files");
+    jw.arr(?w);
+    var i: usize = 0;
+    for (i < commit.count(?sp.set)) {
+        val e: *commit.Entry = commit.entry(?sp.set, i);
+        if (e.status == commit.ST_CREATE || e.status == commit.ST_REPLACE || e.status == commit.ST_DELETE) {
+            jw.obj(?w);
+            jw.f_str(?w, "path", e.rel);
+            jw.f_str(?w, "status", commit.status_name(e.status));
+            if (e.mode != commit.MODE_DELETE) { jw.f_str(?w, "sha256", ?e.sha[0]); }
+            if (e.existed) { jw.f_str(?w, "prev_sha256", ?e.old_sha[0]); }
+            jw.obj_end(?w);
+        }
+        i = i + 1;
+    }
+    jw.arr_end(?w);
+    jw.obj_end(?w);
+    jw.byte(?w, '\n');
+    if (w.failed) { ret -1; }
+    ret commit.journal(?sp.set, w.buf, w.len);
+}
+
+# apply a spec: compile, observe, check, then publish under the workspace lock
+pub fun apply(s: *session.Session, args: *json.Value, w: *jw.Jw) bool {
+    val t0: time.Instant = started();
+    var compact: jw.Jw = jw.init(?s.ra);
+    spec.emit_json(?compact, args, false, 0);
+    var sp: spec.Spec;
+    var e: spec.Err;
+    var lib: spec.Lib;
+    lib.ctx = (s::usize)::*u8;
+    lib.find = lib_find;
+    if (!spec.compile(?sp, ?s.ra, s.root, args, compact.buf, compact.len, ?lib, ?e)) { ret spec_error(w, ?e); }
+    if (s.force_dry) { sp.dry = true; }
+    val preview: bool = spec.fbool_pub(args, "preview");
+    val t_compile: i64 = now_us(t0);
+    commit.observe(?sp.set);
+    val conflicts: i64 = commit.tally(?sp.set, commit.ST_CONFLICT);
+    if (conflicts > 0 && !sp.dry) {
+        error_obj(w, "conflict", "a file conflicts with what is on disk; nothing was written. each conflict below names the reason and the current sha256");
+        files_list(w, ?sp.set, false, false, true, false, ?s.ra);
+        jw.obj_end(w);
+        ret false;
+    }
+    var t_check: i64 = t_compile;
+    if (sp.check != spec.CHECK_OFF) {
+        check.run(?s.ra, s.a, s.root, ?sp.set, ?s.tools, check.TIMEOUT_MS);
+        t_check = now_us(t0);
+    }
+    val failed: i64 = check_tally(?sp.set, commit.CK_FAILED);
+    val skipped: i64 = check_tally(?sp.set, commit.CK_SKIPPED);
+    val blocked: bool = failed > 0 || (sp.check == spec.CHECK_REQUIRED && skipped > 0);
+    if (blocked && !sp.dry) {
+        if (failed > 0) { error_obj(w, "check_failed", "a file failed its syntax check; nothing was written. fix the lines named below and apply again"); }
+        or { error_obj(w, "check_unavailable", "check is required but a checker could not run; nothing was written"); }
+        jw.key(w, "files");
+        jw.arr(w);
+        var i: usize = 0;
+        for (i < commit.count(?sp.set)) {
+            val en: *commit.Entry = commit.entry(?sp.set, i);
+            if (en.check == commit.CK_FAILED || (sp.check == spec.CHECK_REQUIRED && en.check == commit.CK_SKIPPED)) { file_receipt(w, ?s.ra, en, false, false, false); }
+            i = i + 1;
+        }
+        jw.arr_end(w);
+        jw.obj_end(w);
+        ret false;
+    }
+    var txn: [17]u8;
+    txn_id(?txn[0]);
+    var journal: i64 = -1;
+    if (!sp.dry && commit.dirty(?sp.set)) {
+        var held: commit.Lock;
+        val locked: i64 = commit.lock(?sp.set, s.lock_ms, ?held);
+        if (locked == 1) { ret simple_error(w, "locked", "another qark process held the workspace lock too long; nothing was written. retry the same request"); }
+        if (locked != 0) { ret simple_error(w, "lock_failed", "the workspace lock under .qark could not be taken; nothing was written"); }
+        commit.observe(?sp.set);
+        if (commit.tally(?sp.set, commit.ST_CONFLICT) > 0) {
+            commit.unlock(?held);
+            error_obj(w, "conflict", "a file changed while this apply was checking; nothing was written");
+            files_list(w, ?sp.set, false, false, true, false, ?s.ra);
+            jw.obj_end(w);
+            ret false;
+        }
+        if (sp.check != spec.CHECK_OFF) {
+            check.run_staged(?s.ra, s.root, ?sp.set, check.TIMEOUT_MS);
+            t_check = now_us(t0);
+            if (check_tally(?sp.set, commit.CK_FAILED) > 0) {
+                commit.unlock(?held);
+                error_obj(w, "check_failed", "a file failed its project check; nothing was written. fix the lines named below and apply again");
+                jw.key(w, "files");
+                jw.arr(w);
+                var ci: usize = 0;
+                for (ci < commit.count(?sp.set)) {
+                    val en: *commit.Entry = commit.entry(?sp.set, ci);
+                    if (en.check == commit.CK_FAILED) { file_receipt(w, ?s.ra, en, false, false, false); }
+                    ci = ci + 1;
+                }
+                jw.arr_end(w);
+                jw.obj_end(w);
+                ret false;
+            }
+        }
+        val out: commit.Outcome = commit.publish(?sp.set);
+        if (!out.ok) {
+            commit.unlock(?held);
+            error_obj(w, out.code, out.msg);
+            if (out.index >= 0) { jw.f_str(w, "path", commit.entry(?sp.set, out.index::usize).rel); }
+            jw.obj_end(w);
+            ret false;
+        }
+        journal = journal_line(s, ?sp, ?txn[0]);
+        commit.unlock(?held);
+        s.written = s.written + commit.tally(?sp.set, commit.ST_CREATE) + commit.tally(?sp.set, commit.ST_REPLACE);
+    }
+    s.applies = s.applies + 1;
+    val t_total: i64 = now_us(t0);
+    jw.obj(w);
+    jw.f_str(w, "txn", ?txn[0]);
+    jw.f_bool(w, "dry_run", sp.dry);
+    if (sp.dry) {
+        jw.f_bool(w, "ready", conflicts == 0 && !blocked);
+    }
+    if (sp.job != nil) { jw.f_str(w, "job", sp.job); }
+    if (sp.dest != nil && sp.dest[0] != 0) { jw.f_str(w, "dest", sp.dest); }
+    jw.f_str(w, "spec_sha256", ?sp.sha[0]);
+    counts(w, ?sp.set);
+    files_list(w, ?sp.set, sp.dry, preview, false, sp.diff, ?s.ra);
+    if (sp.warns.len > 0) {
+        jw.key(w, "warnings");
+        jw.arr(w);
+        var wi: usize = 0;
+        for (wi < sp.warns.len) {
+            jw.str_v(w, sp.warns.data[wi]);
+            wi = wi + 1;
+        }
+        jw.arr_end(w);
+    }
+    if (sp.manifest >= 0) { jw.f_str(w, "manifest", commit.entry(?sp.set, sp.manifest::usize).rel); }
+    if (journal >= 0) { jw.f_i64(w, "journal_offset", journal); }
+    jw.key(w, "ms");
+    jw.obj(w);
+    jw.f_ms(w, "compile", t_compile);
+    jw.f_ms(w, "check", t_check - t_compile);
+    jw.f_ms(w, "commit", t_total - t_check);
+    jw.f_ms(w, "total", t_total);
+    jw.obj_end(w);
+    jw.obj_end(w);
+    ret true;
+}
+
+fun name_lt(a: str, b: str) bool {
+    var i: usize = 0;
+    for (a[i] != 0 && a[i] == b[i]) { i = i + 1; }
+    ret a[i] < b[i];
+}
+
+fun read_one(s: *session.Session, rel_in: str, content: bool, max: usize, lo: i64, hi: i64, outline: bool, w: *jw.Jw) {
+    val a: *A.Allocator = ?s.ra;
+    jw.obj(w);
+    var rel: str = rel_in;
+    var root_dir: bool = util.eq(rel_in, ".") || rel_in[0] == 0;
+    if (!root_dir) {
+        val canon: res[str, A.Error] = pathx.canonical(a, rel_in);
+        if (sel canon.ok) { rel = canon.ok; }
+        val r: i64 = pathx.check(rel);
+        if (r != pathx.P_OK) {
+            jw.f_str(w, "path", rel);
+            jw.f_str(w, "error", pathx.code(r));
+            jw.f_str(w, "message", pathx.message(r));
+            jw.obj_end(w);
+            ret;
+        }
+    }
+    jw.f_str(w, "path", rel);
+    var full: str = s.root;
+    if (!root_dir) {
+        val f: res[str, A.Error] = pathx.native(a, s.root, rel);
+        if (sel f.ok) { full = f.ok; }
+    }
+    val m: res[filesystem.Metadata, io_error.Error] = filesystem.metadata_link(full);
+    if (sel m.err) {
+        jw.f_bool(w, "exists", false);
+        jw.obj_end(w);
+        ret;
+    }
+    jw.f_bool(w, "exists", true);
+    if (m.ok.kind == filesystem.KIND_DIR) {
+        jw.f_str(w, "kind", "dir");
+        val names: res[vector.Vector[str], filesystem.FsError] = filesystem.read_dir(a, full);
+        if (sel names.ok) {
+            var list: vector.Vector[str] = names.ok;
+            var i: usize = 1;
+            for (i < list.len) {
+                var j: usize = i;
+                for (j > 0 && name_lt(list.data[j], list.data[j - 1])) {
+                    val t: str = list.data[j];
+                    list.data[j] = list.data[j - 1];
+                    list.data[j - 1] = t;
+                    j = j - 1;
+                }
+                i = i + 1;
+            }
+            jw.key(w, "entries");
+            jw.arr(w);
+            var k: usize = 0;
+            for (k < list.len && k < 2000) {
+                val name: str = list.data[k];
+                val child: res[str, A.Error] = pathx.native(a, full, name);
+                var kind: str = "file";
+                if (sel child.ok) {
+                    val cm: res[filesystem.Metadata, io_error.Error] = filesystem.metadata_link(child.ok);
+                    if (sel cm.ok) {
+                        if (cm.ok.kind == filesystem.KIND_DIR) { kind = "dir"; }
+                        or (cm.ok.kind == filesystem.KIND_SYMLINK) { kind = "link"; }
+                    }
+                }
+                jw.obj(w);
+                jw.f_str(w, "name", name);
+                jw.f_str(w, "kind", kind);
+                jw.obj_end(w);
+                k = k + 1;
+            }
+            jw.arr_end(w);
+            if (list.len > 2000) { jw.f_bool(w, "truncated", true); }
+        }
+        jw.obj_end(w);
+        ret;
+    }
+    if (m.ok.kind != filesystem.KIND_FILE) {
+        jw.f_str(w, "kind", "other");
+        jw.obj_end(w);
+        ret;
+    }
+    jw.f_str(w, "kind", "file");
+    val got: res[vector.Vector[u8], filesystem.FsError] = filesystem.read_bytes(a, full);
+    if (sel got.err) {
+        jw.f_str(w, "error", "unreadable");
+        jw.obj_end(w);
+        ret;
+    }
+    val p: *u8 = got.ok.data;
+    val n: usize = got.ok.len;
+    var hex: [65]u8;
+    commit.hash_hex(p, n, ?hex[0]);
+    jw.f_str(w, "sha256", ?hex[0]);
+    jw.f_i64(w, "bytes", n::i64);
+    jw.f_i64(w, "lines", lines_of(p, n));
+    if (outline) {
+        var lang: str = spec.lang_of(rel);
+        if (lang == nil) {
+            val rn: usize = str_len(rel);
+            if (rn > 5 && util.eq((rel::usize + rn - 5)::*u8, ".mach")) { lang = "mach"; }
+        }
+        if (lang != nil && n > 0 && utf8.validate(p, n)) { scan.outline(a, lang, p, n, w); }
+        or { jw.key(w, "symbols"); jw.arr(w); jw.arr_end(w); }
+    }
+    if (content) {
+        if (n > 0 && !utf8.validate(p, n)) { jw.f_bool(w, "binary", true); }
+        or {
+            var from: usize = 0;
+            var to: usize = n;
+            if (lo > 0) {
+                var line: i64 = 1;
+                var i: usize = 0;
+                from = n;
+                to = n;
+                if (lo == 1) { from = 0; }
+                for (i < n) {
+                    if (p[i] == '\n') {
+                        line = line + 1;
+                        if (line == lo) { from = i + 1; }
+                        if (line == hi + 1) {
+                            to = i + 1;
+                            brk;
+                        }
+                    }
+                    i = i + 1;
+                }
+                if (from > to) { from = to; }
+                jw.f_i64(w, "first_line", lo);
+            }
+            var take: usize = to - from;
+            var cut: bool = false;
+            if (take > max) {
+                take = max;
+                cut = true;
+            }
+            jw.key(w, "text");
+            jw.str_n(w, (p::usize + from)::*u8, take);
+            if (cut) { jw.f_bool(w, "truncated", true); }
+        }
+    }
+    jw.obj_end(w);
+}
+
+# read files with their sha256, so an agent can edit with expect; directories list their entries
+pub fun read(s: *session.Session, args: *json.Value, w: *jw.Jw) bool {
+    val a: *A.Allocator = ?s.ra;
+    var content: bool = true;
+    val cf: opt[*json.Value] = json.value_find(args, "content");
+    if (sel cf.some) {
+        if (json.value_is_bool(cf.some)) { content = json.value_bool(cf.some); }
+    }
+    var max: usize = READ_MAX;
+    val mf: opt[*json.Value] = json.value_find(args, "max_bytes");
+    if (sel mf.some) {
+        if (json.value_is_number(mf.some) && json.value_number(mf.some) > 0) { max = json.value_number(mf.some)::usize; }
+    }
+    var outline: bool = false;
+    val of2: opt[*json.Value] = json.value_find(args, "outline");
+    if (sel of2.some) {
+        if (json.value_is_bool(of2.some)) { outline = json.value_bool(of2.some); }
+    }
+    var lo: i64 = 0;
+    var hi: i64 = 0;
+    val lf: opt[*json.Value] = json.value_find(args, "lines");
+    if (sel lf.some) {
+        if (json.value_is_array(lf.some) && json.value_count(lf.some) == 2) {
+            val g0: opt[*json.Value] = json.value_get(lf.some, 0);
+            val g1: opt[*json.Value] = json.value_get(lf.some, 1);
+            if (sel g0.some) { lo = json.value_number(g0.some); }
+            if (sel g1.some) { hi = json.value_number(g1.some); }
+            if (lo < 1 || hi < lo) { ret simple_error(w, "read_range", "lines must be [first, last], 1-based and inclusive"); }
+        }
+    }
+    jw.obj(w);
+    jw.key(w, "files");
+    jw.arr(w);
+    var any: bool = false;
+    val one: opt[*json.Value] = json.value_find(args, "path");
+    if (sel one.some) {
+        if (json.value_is_string(one.some)) {
+            var p: *u8 = nil;
+            var pn: usize = 0;
+            if (spec.decode_pub(a, one.some, ?p, ?pn)) {
+                read_one(s, p, content, max, lo, hi, outline, w);
+                any = true;
+            }
+        }
+    }
+    val many: opt[*json.Value] = json.value_find(args, "paths");
+    if (sel many.some) {
+        if (json.value_is_array(many.some)) {
+            var i: usize = 0;
+            for (i < json.value_count(many.some) && i < 256) {
+                val g: opt[*json.Value] = json.value_get(many.some, i);
+                if (sel g.some) {
+                    if (json.value_is_string(g.some)) {
+                        var p: *u8 = nil;
+                        var pn: usize = 0;
+                        if (spec.decode_pub(a, g.some, ?p, ?pn)) {
+                            read_one(s, p, content, max, lo, hi, outline, w);
+                            any = true;
+                        }
+                    }
+                }
+                i = i + 1;
+            }
+        }
+    }
+    if (!any) {
+        jw.clear(w);
+        ret simple_error(w, "read_bad", "give path or paths, relative to the workspace root; use \".\" for the root directory");
+    }
+    jw.arr_end(w);
+    jw.obj_end(w);
+    ret true;
+}
+
+# the leading {{!-- comment --}} of a template, first line only
+fun description(a: *A.Allocator, body: *u8, n: usize) str {
+    if (n < 6 || body[0] != '{' || body[1] != '{' || body[2] != '!') { ret nil; }
+    var s: usize = 3;
+    if (s + 1 < n && body[s] == '-' && body[s + 1] == '-') { s = s + 2; }
+    for (s < n && (body[s] == ' ' || body[s] == '\t')) { s = s + 1; }
+    var e: usize = s;
+    for (e < n && body[e] != '\n' && !(body[e] == '-' && e + 1 < n && body[e + 1] == '-') && body[e] != '}') { e = e + 1; }
+    val d: res[str, A.Error] = util.dup_n(a, (body::usize + s)::*u8, e - s);
+    if (sel d.err) { ret nil; }
+    ret d.ok;
+}
+
+fun template_entry(a: *A.Allocator, w: *jw.Jw, t: *spec.Tpl, show: bool) {
+    jw.obj(w);
+    jw.f_str(w, "name", t.name);
+    jw.f_str(w, "source", t.src);
+    if (t.lang != nil) { jw.f_str(w, "lang", t.lang); }
+    var desc: str = t.desc;
+    if (desc == nil) { desc = description(a, t.body, t.len); }
+    if (desc != nil) { jw.f_str(w, "description", desc); }
+    var names: vector.Vector[str] = vector.init[str](a);
+    if (tmpl.names(a, t.body, t.len, ?names)) {
+        jw.key(w, "vars");
+        jw.arr(w);
+        var i: usize = 0;
+        for (i < names.len) {
+            jw.str_v(w, names.data[i]);
+            i = i + 1;
+        }
+        jw.arr_end(w);
+    }
+    if (show) {
+        jw.key(w, "text");
+        jw.str_n(w, t.body, t.len);
+    }
+    jw.obj_end(w);
+}
+
+fun pathx_native_or(a: *A.Allocator, root: str, rel: str) str {
+    val p: res[str, A.Error] = pathx.native(a, root, rel);
+    if (sel p.ok) { ret p.ok; }
+    ret root;
+}
+
+fun list_workspace(s: *session.Session, w: *jw.Jw, dir_rel: str, depth: i64) {
+    val a: *A.Allocator = ?s.ra;
+    if (depth > 3) { ret; }
+    val full: res[str, A.Error] = pathx.native(a, s.root, dir_rel);
+    if (sel full.err) { ret; }
+    val names: res[vector.Vector[str], filesystem.FsError] = filesystem.read_dir(a, full.ok);
+    if (sel names.err) { ret; }
+    var i: usize = 0;
+    for (i < names.ok.len) {
+        val name: str = names.ok.data[i];
+        val child_rel: res[str, A.Error] = pathx.join(a, dir_rel, name);
+        if (sel child_rel.ok) {
+            val n: usize = str_len(name);
+            if (n > 5 && util.eq((name::usize + n - 5)::*u8, ".tmpl")) {
+                val t_full: res[str, A.Error] = pathx.native(a, s.root, child_rel.ok);
+                if (sel t_full.ok) {
+                    val text: res[str, filesystem.FsError] = filesystem.read_string(a, t_full.ok);
+                    if (sel text.ok) {
+                        val rel_n: usize = str_len(child_rel.ok);
+                        val tname: res[str, A.Error] = util.dup_n(a, (child_rel.ok::usize + 16)::*u8, rel_n - 16 - 5);
+                        if (sel tname.ok) {
+                            var t: spec.Tpl;
+                            t.name = tname.ok;
+                            t.lang = spec.lang_of(tname.ok);
+                            t.body = text.ok;
+                            t.len = str_len(text.ok);
+                            t.src = "workspace";
+                            template_entry(a, w, ?t, false);
+                        }
+                    }
+                }
+            }
+            or {
+                val m: res[filesystem.Metadata, io_error.Error] = filesystem.metadata_link(pathx_native_or(a, s.root, child_rel.ok));
+                if (sel m.ok) {
+                    if (m.ok.kind == filesystem.KIND_DIR) { list_workspace(s, w, child_rel.ok, depth + 1); }
+                }
+            }
+        }
+        i = i + 1;
+    }
+}
+
+# list every template an apply can name, or show one with its text
+pub fun templates(s: *session.Session, args: *json.Value, w: *jw.Jw) bool {
+    val a: *A.Allocator = ?s.ra;
+    var show: *u8 = nil;
+    var sn: usize = 0;
+    val sf: opt[*json.Value] = json.value_find(args, "name");
+    if (sel sf.some) {
+        if (json.value_is_string(sf.some)) { spec.decode_pub(a, sf.some, ?show, ?sn); }
+    }
+    if (show != nil) {
+        var t: spec.Tpl;
+        if (!lib_find((s::usize)::*u8, show, ?t)) { ret simple_error(w, "tmpl_unknown", "no template has that name; list templates without a name to see them all"); }
+        template_entry(a, w, ?t, true);
+        ret true;
+    }
+    jw.obj(w);
+    jw.key(w, "templates");
+    jw.arr(w);
+    var i: usize = 0;
+    for (i < s.tpls.len) {
+        template_entry(a, w, ?s.tpls.data[i], false);
+        i = i + 1;
+    }
+    list_workspace(s, w, ".qark/templates", 0);
+    i = 0;
+    for (i < builtin.COUNT) {
+        var t: spec.Tpl;
+        if (builtin.at(i, ?t)) { template_entry(a, w, ?t, false); }
+        i = i + 1;
+    }
+    jw.arr_end(w);
+    jw.obj_end(w);
+    ret true;
+}
+
+# keep a template for this session, and on disk under .qark/templates when persist is true
+pub fun define(s: *session.Session, args: *json.Value, w: *jw.Jw) bool {
+    val a: *A.Allocator = ?s.ra;
+    var name: *u8 = nil;
+    var nn: usize = 0;
+    val nf: opt[*json.Value] = json.value_find(args, "name");
+    if (!sel nf.some) { ret simple_error(w, "spec_field", "template.define needs a name such as etl/loader"); }
+    if (!json.value_is_string(nf.some) || !spec.decode_pub(a, nf.some, ?name, ?nn)) { ret simple_error(w, "spec_field", "name must be a string"); }
+    val canon: res[str, A.Error] = pathx.canonical(a, name);
+    if (sel canon.err) { ret simple_error(w, "oom", "out of memory"); }
+    val r: i64 = pathx.check(canon.ok);
+    if (r != pathx.P_OK) { ret simple_error(w, pathx.code(r), "a template name is a relative path such as etl/loader"); }
+    var body: *u8 = nil;
+    var bn: usize = 0;
+    val tf: opt[*json.Value] = json.value_find(args, "text");
+    val lf: opt[*json.Value] = json.value_find(args, "lines");
+    if (sel tf.some) {
+        if (!json.value_is_string(tf.some) || !spec.decode_pub(a, tf.some, ?body, ?bn)) { ret simple_error(w, "spec_type", "text must be a string"); }
+    }
+    or (sel lf.some) {
+        if (!json.value_is_array(lf.some) || !spec.lines_pub(a, lf.some, ?body, ?bn)) { ret simple_error(w, "spec_type", "lines must be a list of strings"); }
+    }
+    or { ret simple_error(w, "spec_field", "template.define needs text or lines"); }
+    var probe_ctx: tmpl.Ctx;
+    tmpl.ctx_init(?probe_ctx);
+    var names: vector.Vector[str] = vector.init[str](a);
+    if (!tmpl.names(a, body, bn, ?names)) { ret simple_error(w, "tmpl_syntax", "the template does not parse; render it with template.render to see where"); }
+    var lang: str = spec.lang_of(canon.ok);
+    var lp: *u8 = nil;
+    var lpn: usize = 0;
+    val lgf: opt[*json.Value] = json.value_find(args, "lang");
+    if (sel lgf.some) {
+        if (json.value_is_string(lgf.some) && spec.decode_pub(a, lgf.some, ?lp, ?lpn)) { lang = lp; }
+    }
+    var desc: *u8 = nil;
+    var dn: usize = 0;
+    val df: opt[*json.Value] = json.value_find(args, "description");
+    if (sel df.some) {
+        if (json.value_is_string(df.some)) { spec.decode_pub(a, df.some, ?desc, ?dn); }
+    }
+    var t: spec.Tpl;
+    val n_c: res[str, A.Error] = util.dup(s.a, canon.ok);
+    val b_c: res[str, A.Error] = util.dup_n(s.a, body, bn);
+    if (sel n_c.err) { ret simple_error(w, "oom", "out of memory"); }
+    if (sel b_c.err) { ret simple_error(w, "oom", "out of memory"); }
+    t.name = n_c.ok;
+    t.body = b_c.ok;
+    t.len = bn;
+    t.src = "session";
+    t.lang = nil;
+    if (lang != nil) {
+        val l_c: res[str, A.Error] = util.dup(s.a, lang);
+        if (sel l_c.ok) { t.lang = l_c.ok; }
+    }
+    t.desc = nil;
+    if (desc != nil) {
+        val d_c: res[str, A.Error] = util.dup(s.a, desc);
+        if (sel d_c.ok) { t.desc = d_c.ok; }
+    }
+    val pathf: opt[*json.Value] = json.value_find(args, "path");
+    if (sel pathf.some) {
+        var pp: *u8 = nil;
+        var pn: usize = 0;
+        if (!json.value_is_string(pathf.some) || !spec.decode_pub(a, pathf.some, ?pp, ?pn)) { ret simple_error(w, "spec_type", "path must be a string, the pattern each row expands to"); }
+        val p_c: res[str, A.Error] = util.dup_n(s.a, pp, pn);
+        if (sel p_c.err) { ret simple_error(w, "oom", "out of memory"); }
+        t.pathpat = p_c.ok;
+    }
+    var te: tmpl.Err;
+    if (!tmpl.prepare(s.a, b_c.ok, bn, ?t.prog, ?te)) {
+        var code: str = te.code;
+        if (code == nil) { code = "tmpl_syntax"; }
+        var msg: str = te.msg;
+        if (msg == nil) { msg = "the template does not parse"; }
+        ret simple_error(w, code, msg);
+    }
+    var replaced: bool = false;
+    var i: usize = 0;
+    for (i < s.tpls.len) {
+        if (util.eq(s.tpls.data[i].name, t.name)) {
+            s.tpls.data[i] = t;
+            replaced = true;
+        }
+        i = i + 1;
+    }
+    if (!replaced) { vector.push[spec.Tpl](?s.tpls, t); }
+    var persisted: str = nil;
+    val pf: opt[*json.Value] = json.value_find(args, "persist");
+    if (sel pf.some) {
+        if (json.value_is_bool(pf.some) && json.value_bool(pf.some)) {
+            var pw: jw.Jw = jw.init(a);
+            jw.raw(?pw, ".qark/templates/");
+            jw.raw(?pw, canon.ok);
+            jw.raw(?pw, ".tmpl");
+            val full: res[str, A.Error] = pathx.native(a, s.root, jw.text(?pw));
+            if (sel full.ok) {
+                val wrote: err[filesystem.FsError] = filesystem.replace_bytes_atomic(a, full.ok, body, bn, 420, 493);
+                if (sel wrote.ok) { persisted = jw.text(?pw); }
+                var path_rel: jw.Jw = jw.init(a);
+                jw.raw(?path_rel, ".qark/templates/");
+                jw.raw(?path_rel, canon.ok);
+                jw.raw(?path_rel, ".path");
+                val path_full: res[str, A.Error] = pathx.native(a, s.root, jw.text(?path_rel));
+                if (sel path_full.ok) {
+                    if (t.pathpat != nil && t.pathpat[0] != 0) {
+                        filesystem.replace_bytes_atomic(a, path_full.ok, t.pathpat, str_len(t.pathpat), 420, 493);
+                    }
+                    or { filesystem.remove_file(path_full.ok); }
+                }
+            }
+        }
+    }
+    jw.obj(w);
+    jw.f_str(w, "name", t.name);
+    jw.f_bool(w, "replaced", replaced);
+    if (persisted != nil) { jw.f_str(w, "persisted", persisted); }
+    jw.key(w, "vars");
+    jw.arr(w);
+    i = 0;
+    for (i < names.len) {
+        jw.str_v(w, names.data[i]);
+        i = i + 1;
+    }
+    jw.arr_end(w);
+    jw.obj_end(w);
+    ret true;
+}
+
+# render a named or inline template against vars without writing anything
+pub fun render(s: *session.Session, args: *json.Value, w: *jw.Jw) bool {
+    val a: *A.Allocator = ?s.ra;
+    var body: *u8 = nil;
+    var bn: usize = 0;
+    var tname: str = "tmpl";
+    var lang: str = "text";
+    val nf: opt[*json.Value] = json.value_find(args, "template");
+    val tf: opt[*json.Value] = json.value_find(args, "tmpl");
+    if (sel nf.some) {
+        var name: *u8 = nil;
+        var nn: usize = 0;
+        if (!json.value_is_string(nf.some) || !spec.decode_pub(a, nf.some, ?name, ?nn)) { ret simple_error(w, "spec_type", "template must be a name"); }
+        var t: spec.Tpl;
+        if (!lib_find((s::usize)::*u8, name, ?t)) { ret simple_error(w, "tmpl_unknown", "no template has that name"); }
+        body = t.body;
+        bn = t.len;
+        tname = t.name;
+        if (t.lang != nil) { lang = t.lang; }
+    }
+    or (sel tf.some) {
+        if (!json.value_is_string(tf.some) || !spec.decode_pub(a, tf.some, ?body, ?bn)) { ret simple_error(w, "spec_type", "tmpl must be template text"); }
+    }
+    or { ret simple_error(w, "spec_field", "template.render needs template (a name) or tmpl (text)"); }
+    var c: tmpl.Ctx;
+    tmpl.ctx_init(?c);
+    var empty: json.Value;
+    empty.kind = json.OBJECT;
+    val vf: opt[*json.Value] = json.value_find(args, "vars");
+    if (sel vf.some) {
+        if (!json.value_is_object(vf.some)) { ret simple_error(w, "spec_type", "vars must be an object"); }
+        tmpl.ctx_push(?c, vf.some);
+    }
+    or { tmpl.ctx_push(?c, ?empty); }
+    var lib: spec.Lib;
+    lib.ctx = (s::usize)::*u8;
+    lib.find = lib_find;
+    var tl: tmpl.Lib;
+    var holder: spec.Spec;
+    holder.inline = vector.init[spec.Tpl](a);
+    holder.lib = ?lib;
+    tl.ctx = ((?holder)::usize)::*u8;
+    tl.find = spec.partial_find_pub;
+    var out: *u8 = nil;
+    var on: usize = 0;
+    var te: tmpl.Err;
+    if (!tmpl.render(a, tname, lang, body, bn, ?c, ?tl, ?out, ?on, ?te)) {
+        error_obj(w, te.code, te.msg);
+        if (te.tname != nil) { jw.f_str(w, "template", te.tname); }
+        if (te.line > 0) { jw.f_i64(w, "line", te.line); }
+        jw.obj_end(w);
+        ret false;
+    }
+    jw.obj(w);
+    jw.key(w, "text");
+    jw.str_n(w, out, on);
+    jw.f_i64(w, "bytes", on::i64);
+    jw.obj_end(w);
+    ret true;
+}
+
+fun listed(names: *vector.Vector[str], rel: str) bool {
+    var i: usize = 0;
+    for (i < names.len) {
+        if (util.eq(names.data[i], rel)) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+fun extras(s: *session.Session, w: *jw.Jw, base: str, sub: str, names: *vector.Vector[str], depth: i64, found: *i64) {
+    val a: *A.Allocator = ?s.ra;
+    if (depth > 8) { ret; }
+    val dir_rel: res[str, A.Error] = pathx.join(a, base, sub);
+    if (sel dir_rel.err) { ret; }
+    val full: res[str, A.Error] = pathx.native(a, s.root, dir_rel.ok);
+    if (sel full.err) { ret; }
+    val entries: res[vector.Vector[str], filesystem.FsError] = filesystem.read_dir(a, full.ok);
+    if (sel entries.err) { ret; }
+    var i: usize = 0;
+    for (i < entries.ok.len) {
+        val name: str = entries.ok.data[i];
+        val rel: res[str, A.Error] = pathx.join(a, sub, name);
+        if (sel rel.ok) {
+            val child: res[str, A.Error] = pathx.native(a, full.ok, name);
+            var is_dir: bool = false;
+            if (sel child.ok) {
+                val m: res[filesystem.Metadata, io_error.Error] = filesystem.metadata_link(child.ok);
+                if (sel m.ok) { is_dir = m.ok.kind == filesystem.KIND_DIR; }
+            }
+            if (is_dir) { extras(s, w, base, rel.ok, names, depth + 1, found); }
+            or (!util.eq(rel.ok, "manifest.json") && !listed(names, rel.ok)) {
+                jw.str_v(w, rel.ok);
+                @found = @found + 1;
+            }
+        }
+        i = i + 1;
+    }
+}
+
+# check a job directory against its manifest: every listed file present with its hash, nothing unlisted
+#
+# a mismatch is still a report: verify returns true with ok false inside, and
+# sets matched; it returns false only when there is no manifest to check against
+pub fun verify(s: *session.Session, dir_in: str, w: *jw.Jw, matched: *bool) bool {
+    @matched = false;
+    val a: *A.Allocator = ?s.ra;
+    val canon: res[str, A.Error] = pathx.canonical(a, dir_in);
+    if (sel canon.err) { ret simple_error(w, "oom", "out of memory"); }
+    val r: i64 = pathx.check(canon.ok);
+    if (r != pathx.P_OK) { ret simple_error(w, pathx.code(r), "give the job directory relative to the workspace root, such as jobs/etl"); }
+    val mrel: res[str, A.Error] = pathx.join(a, canon.ok, "manifest.json");
+    if (sel mrel.err) { ret simple_error(w, "oom", "out of memory"); }
+    val mfull: res[str, A.Error] = pathx.native(a, s.root, mrel.ok);
+    if (sel mfull.err) { ret simple_error(w, "oom", "out of memory"); }
+    val text: res[str, filesystem.FsError] = filesystem.read_string(a, mfull.ok);
+    if (sel text.err) { ret simple_error(w, "no_manifest", "the directory has no readable manifest.json"); }
+    val parsed: res[json.Value, json.JsonError] = json.parse(text.ok, str_len(text.ok), a);
+    if (sel parsed.err) { ret simple_error(w, "bad_manifest", "manifest.json is not valid json"); }
+    var doc: json.Value = parsed.ok;
+    val files: opt[*json.Value] = json.value_find(?doc, "files");
+    if (!sel files.some) { ret simple_error(w, "bad_manifest", "manifest.json has no files list"); }
+    if (!json.value_is_array(files.some)) { ret simple_error(w, "bad_manifest", "manifest.json files is not a list"); }
+    var names: vector.Vector[str] = vector.init[str](a);
+    var bad: i64 = 0;
+    jw.obj(w);
+    jw.f_str(w, "dir", canon.ok);
+    val jobf: opt[*json.Value] = json.value_find(?doc, "job");
+    if (sel jobf.some) {
+        if (json.value_is_string(jobf.some)) {
+            var jn: usize = 0;
+            val jp: *u8 = json.value_string(jobf.some, ?jn);
+            jw.key(w, "job");
+            jw.wire_str(w, jp, jn);
+        }
+    }
+    jw.key(w, "files");
+    jw.arr(w);
+    var i: usize = 0;
+    for (i < json.value_count(files.some)) {
+        val g: opt[*json.Value] = json.value_get(files.some, i);
+        if (sel g.some) {
+            var p: *u8 = nil;
+            var pn: usize = 0;
+            var hp: *u8 = nil;
+            var hn: usize = 0;
+            val pf: opt[*json.Value] = json.value_find(g.some, "path");
+            val hf: opt[*json.Value] = json.value_find(g.some, "sha256");
+            var has_p: bool = false;
+            var has_h: bool = false;
+            if (sel pf.some) { has_p = json.value_is_string(pf.some) && spec.decode_pub(a, pf.some, ?p, ?pn); }
+            if (sel hf.some) { has_h = json.value_is_string(hf.some) && spec.decode_pub(a, hf.some, ?hp, ?hn); }
+            jw.obj(w);
+            if (!has_p || !has_h || pathx.check(p) != pathx.P_OK) {
+                jw.f_bool(w, "ok", false);
+                jw.f_str(w, "reason", "entry has no safe path or no sha256");
+                bad = bad + 1;
+            }
+            or {
+                vector.push[str](?names, p);
+                jw.f_str(w, "path", p);
+                val frel: res[str, A.Error] = pathx.join(a, canon.ok, p);
+                var ok: bool = false;
+                var why: str = "missing";
+                if (sel frel.ok) {
+                    val ffull: res[str, A.Error] = pathx.native(a, s.root, frel.ok);
+                    if (sel ffull.ok) {
+                        val got: res[vector.Vector[u8], filesystem.FsError] = filesystem.read_bytes(a, ffull.ok);
+                        if (sel got.ok) {
+                            var hex: [65]u8;
+                            commit.hash_hex(got.ok.data, got.ok.len, ?hex[0]);
+                            if (util.eq(?hex[0], hp)) { ok = true; }
+                            or {
+                                why = "sha256 differs from the manifest";
+                                jw.f_str(w, "sha256", ?hex[0]);
+                            }
+                        }
+                    }
+                }
+                jw.f_bool(w, "ok", ok);
+                if (!ok) {
+                    jw.f_str(w, "reason", why);
+                    bad = bad + 1;
+                }
+            }
+            jw.obj_end(w);
+        }
+        i = i + 1;
+    }
+    jw.arr_end(w);
+    var extra: i64 = 0;
+    jw.key(w, "unlisted");
+    jw.arr(w);
+    extras(s, w, canon.ok, "", ?names, 0, ?extra);
+    jw.arr_end(w);
+    jw.f_bool(w, "ok", bad == 0);
+    jw.f_bool(w, "clean", extra == 0);
+    jw.obj_end(w);
+    @matched = bad == 0;
+    ret true;
+}
+
+# grep or list the workspace; matches group per file with that file's sha256
+#
+# pattern is literal text unless regex is true, which reads it as the qark
+# dialect: . [] () | * + ? {} ^ $ \< \> \d \w \s. glob narrows which files
+# (* stays within a directory, ** crosses). with no pattern it lists the
+# matching paths instead. skips .git, .qark, node_modules, and friends
+# unless all is true; skips binary files and files over 4 MiB.
+pub fun search(s: *session.Session, args: *json.Value, w: *jw.Jw) bool {
+    val a: *A.Allocator = ?s.ra;
+    var o: scan.Opts;
+    o.pat = nil;
+    o.patn = 0;
+    o.is_re = false;
+    o.icase = false;
+    o.glob = nil;
+    o.path = "";
+    o.ctx = 0;
+    o.max = 100;
+    o.max_files = 20000;
+    o.all = false;
+    val pf: opt[*json.Value] = json.value_find(args, "pattern");
+    if (sel pf.some) {
+        var p: *u8 = nil;
+        var pn: usize = 0;
+        if (!json.value_is_string(pf.some) || !spec.decode_pub(a, pf.some, ?p, ?pn)) {
+            ret simple_error(w, "spec_type", "pattern must be a string");
+        }
+        o.pat = p;
+        o.patn = pn;
+    }
+    val rf: opt[*json.Value] = json.value_find(args, "regex");
+    if (sel rf.some) {
+        if (json.value_is_bool(rf.some)) { o.is_re = json.value_bool(rf.some); }
+    }
+    val ic: opt[*json.Value] = json.value_find(args, "icase");
+    if (sel ic.some) {
+        if (json.value_is_bool(ic.some)) { o.icase = json.value_bool(ic.some); }
+    }
+    val al: opt[*json.Value] = json.value_find(args, "all");
+    if (sel al.some) {
+        if (json.value_is_bool(al.some)) { o.all = json.value_bool(al.some); }
+    }
+    val gf: opt[*json.Value] = json.value_find(args, "glob");
+    if (sel gf.some) {
+        var g: *u8 = nil;
+        var gn: usize = 0;
+        if (!json.value_is_string(gf.some) || !spec.decode_pub(a, gf.some, ?g, ?gn)) {
+            ret simple_error(w, "spec_type", "glob must be a string such as **/*.py");
+        }
+        o.glob = g;
+    }
+    val xf: opt[*json.Value] = json.value_find(args, "context");
+    if (sel xf.some) {
+        if (json.value_is_number(xf.some)) {
+            o.ctx = json.value_number(xf.some);
+            if (o.ctx < 0) { o.ctx = 0; }
+            if (o.ctx > 20) { o.ctx = 20; }
+        }
+    }
+    val mf: opt[*json.Value] = json.value_find(args, "max");
+    if (sel mf.some) {
+        if (json.value_is_number(mf.some)) {
+            o.max = json.value_number(mf.some);
+            if (o.max < 1) { o.max = 1; }
+            if (o.max > 100000) { o.max = 100000; }
+        }
+    }
+    val mf2: opt[*json.Value] = json.value_find(args, "max_files");
+    if (sel mf2.some) {
+        if (json.value_is_number(mf2.some)) {
+            o.max_files = json.value_number(mf2.some);
+            if (o.max_files < 1) { o.max_files = 1; }
+            if (o.max_files > 200000) { o.max_files = 200000; }
+        }
+    }
+    val df: opt[*json.Value] = json.value_find(args, "path");
+    if (sel df.some) {
+        var p: *u8 = nil;
+        var pn: usize = 0;
+        if (!json.value_is_string(df.some) || !spec.decode_pub(a, df.some, ?p, ?pn)) {
+            ret simple_error(w, "spec_type", "path must be a string, a directory relative to the workspace root");
+        }
+        val canon: res[str, A.Error] = pathx.canonical(a, p);
+        if (sel canon.err) { ret simple_error(w, "oom", "out of memory"); }
+        val r: i64 = pathx.check(canon.ok);
+        if (r != pathx.P_OK) { ret simple_error(w, pathx.code(r), pathx.message(r)); }
+        o.path = canon.ok;
+    }
+    if (!scan.run(a, s.root, ?o, w)) {
+        ret simple_error(w, "bad_pattern", "the pattern is not a valid qark regex; it supports . [] () | * + ? {} ^ $ \\< \\> \\d \\w \\s");
+    }
+    ret true;
+}
+
+# what this worker is, where it writes, and what it can check
+pub fun info(s: *session.Session, w: *jw.Jw) bool {
+    check.probe(s.a, ?s.tools);
+    jw.obj(w);
+    jw.f_str(w, "name", "qark");
+    jw.f_str(w, "version", spec.VERSION);
+    jw.f_i64(w, "protocol", 2);
+    jw.f_str(w, "root", s.root);
+    jw.key(w, "ops");
+    jw.raw_v(w, "[\"apply\",\"read\",\"search\",\"template.list\",\"template.define\",\"template.render\",\"job.verify\",\"session.info\",\"buf.create\",\"buf.set_lines\",\"keys.feed\",\"cmd.ex\",\"eval\",\"job.write\",\"validate.ident\"]");
+    jw.f_i64(w, "search_file_bytes", scan.MAX_SCAN_BYTES::i64);
+    jw.key(w, "limits");
+    jw.obj(w);
+    jw.f_i64(w, "files_per_apply", spec.MAX_FILES::i64);
+    jw.f_i64(w, "bytes_per_file", spec.MAX_FILE_BYTES::i64);
+    jw.f_i64(w, "bytes_per_apply", spec.MAX_TOTAL_BYTES::i64);
+    jw.f_i64(w, "read_bytes", READ_MAX::i64);
+    jw.f_i64(w, "lock_wait_ms", s.lock_ms);
+    jw.obj_end(w);
+    jw.key(w, "checkers");
+    jw.obj(w);
+    jw.f_str(w, "python", s.tools.python);
+    jw.f_str(w, "node", s.tools.node);
+    jw.f_str(w, "powershell", s.tools.pwsh);
+    jw.f_str(w, "bash", s.tools.bash);
+    jw.f_str(w, "json", "builtin");
+    jw.f_str(w, "toml", "builtin");
+    jw.obj_end(w);
+    jw.f_i64(w, "applies", s.applies);
+    jw.f_i64(w, "files_written", s.written);
+    jw.obj_end(w);
+    ret true;
+}

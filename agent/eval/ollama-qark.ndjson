@@ -1,0 +1,7 @@
+{"id":1,"op":"session.info"}
+{"id":2,"op":"eval","args":{"src":"(* 2 55)"}}
+{"id":3,"op":"validate.ident","args":{"lang":"python","name":"double_sum"}}
+{"args":{"root":"jobs","path":"double_sum.py","text":"def double_sum(n):\n    return 2 * sum(range(1, n + 1))\n\nif __name__ == \u0027__main__\u0027:\n    print(double_sum(10))","job":"granite42-3b"},"op":"job.write","id":4}
+{"args":{"root":"jobs","path":"double_sum.py","text":"def double_sum(n):\n    return 2 * sum(range(1, n + 1))\n\nif __name__ == \u0027__main__\u0027:\n    print(double_sum(10))","job":"granite42-8b"},"op":"job.write","id":5}
+{"args":{"root":"jobs","path":"print_total.ps1","text":"$sum = 0\nfor ($i = 1; $i -le 10; $i++) {\n    $sum += $i\n}\nWrite-Output (2 * $sum)","job":"granite41-3b"},"op":"job.write","id":6}
+{"args":{"root":"jobs","path":"double_sum.js","text":"function doubleSum(n) {\n    return 2 * (n * (n + 1) / 2);\n}\n\nconsole.log(doubleSum(10));","job":"granite41-8b"},"op":"job.write","id":7}

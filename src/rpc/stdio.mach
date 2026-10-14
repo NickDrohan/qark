@@ -1,0 +1,111 @@
+# headless worker: one json object per line on stdin, one reply per line on stdout
+#
+# stdin is read in 64 KiB chunks. a CR anywhere is dropped, a blank line is
+# ignored, and a line longer than MAX_REQUEST is refused without being kept.
+
+use std.filesystem;
+use io_error: std.io.error;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+
+use A: std.allocator;
+use mcp: qark.rpc.mcp;
+use ops: qark.rpc.ops;
+use session: qark.session;
+use util: qark.util;
+
+pub val MAX_REQUEST: usize = 134217728;
+
+val CHUNK: usize = 65536;
+
+fun write_all(data: *u8, n: usize) {
+    var off: usize = 0;
+    for (off < n) {
+        val wr: res[usize, io_error.Error] = filesystem.write(filesystem.STDOUT, (data::usize + off)::*u8, n - off);
+        if (sel wr.err) { ret; }
+        if (wr.ok == 0) { ret; }
+        off = off + wr.ok;
+    }
+}
+
+fun answer(s: *session.Session, line_in: str, use_mcp: bool) {
+    var line: str = line_in;
+    if (line[0] == 239 && line[1] == 187 && line[2] == 191) { line = (line::usize + 3)::str; }
+    if (!ops.line_actionable(line)) { ret; }
+    var out: res[str, A.Error] = res[str, A.Error].err{A.Error.exhausted{}};
+    if (use_mcp) { out = mcp.handle(s, line); }
+    or { out = ops.dispatch(s, line); }
+    if (sel out.ok) {
+        val n: usize = str_len(out.ok);
+        if (n > 0) { write_all(out.ok, n); }
+        util.free(s.a, out.ok);
+    }
+}
+
+fun too_long(use_mcp: bool) {
+    var msg: str = "{\"id\":0,\"ok\":false,\"error\":{\"code\":\"too_long\",\"message\":\"request line longer than 128 MiB\"}}\n";
+    if (use_mcp) { msg = "{\"jsonrpc\":\"2.0\",\"id\":null,\"error\":{\"code\":-32600,\"message\":\"request line longer than 128 MiB\"}}\n"; }
+    write_all(msg, str_len(msg));
+}
+
+# read stdin until eof, answering each line; use_mcp speaks json-rpc instead of qark's ndjson
+pub fun serve(s: *session.Session, use_mcp: bool) i64 {
+    val chunk_r: res[*u8, A.Error] = A.allocate[u8](s.a, CHUNK);
+    if (sel chunk_r.err) { ret 1; }
+    val chunk: *u8 = chunk_r.ok;
+    var buf: *u8 = nil;
+    var len: usize = 0;
+    var cap: usize = 0;
+    var dropping: bool = false;
+    for {
+        val rd: res[usize, io_error.Error] = filesystem.read(filesystem.STDIN, chunk, CHUNK);
+        var n: usize = 0;
+        if (sel rd.ok) { n = rd.ok; }
+        if (n == 0) {
+            if (len > 0 && !dropping) {
+                buf[len] = 0;
+                answer(s, buf, use_mcp);
+            }
+            if (buf != nil) { A.deallocate[u8](s.a, buf, cap + 1); }
+            A.deallocate[u8](s.a, chunk, CHUNK);
+            ret 0;
+        }
+        var start: usize = 0;
+        var i: usize = 0;
+        for (i < n) {
+            val c: u8 = chunk[i];
+            if (c == '\n' || c == '\r') {
+                if (i > start && !dropping) {
+                    val ap: err[A.Error] = util.append(s.a, ?buf, ?len, ?cap, (chunk::usize + start)::*u8, i - start);
+                    if (sel ap.err) { ret 1; }
+                }
+                if (c == '\n') {
+                    if (dropping) { too_long(use_mcp); }
+                    or (len > 0) {
+                        buf[len] = 0;
+                        answer(s, buf, use_mcp);
+                    }
+                    len = 0;
+                    dropping = false;
+                }
+                start = i + 1;
+            }
+            i = i + 1;
+        }
+        if (n > start && !dropping) {
+            val ap: err[A.Error] = util.append(s.a, ?buf, ?len, ?cap, (chunk::usize + start)::*u8, n - start);
+            if (sel ap.err) { ret 1; }
+        }
+        if (len > MAX_REQUEST) {
+            dropping = true;
+            len = 0;
+        }
+    }
+    ret 0;
+}

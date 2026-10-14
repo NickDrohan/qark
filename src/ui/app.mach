@@ -1,0 +1,59 @@
+# full-screen loop over the current buffer
+
+use std.system.os;
+use std.types.bool.bool;
+use std.types.option.opt;
+use std.types.size.usize;
+use std.types.string.str;
+
+use buffer: qark.core.buffer;
+use mode: qark.core.mode;
+use text: qark.core.text;
+use eng: qark.core.engine;
+use keys: qark.core.keys;
+use session: qark.session;
+use term: qark.term;
+
+fun draw(s: *session.Session) {
+    term.write_str("\x1b[2J\x1b[H");
+    val b: opt[*buffer.Buffer] = buffer.current(?s.eng.bufs);
+    if (sel b.some) {
+        var i: i64 = 0;
+        val n: i64 = text.line_count(?b.some.text);
+        var shown: i64 = 0;
+        for (i < n && shown < 20) {
+            val line: opt[*text.Line] = text.line_at(?b.some.text, i);
+            if (sel line.some) {
+                if (line.some.data != nil) { term.write_str(line.some.data); }
+            }
+            term.write_str("\r\n");
+            shown = shown + 1;
+            i = i + 1;
+        }
+        term.write_str("\x1b[7m ");
+        term.write_str(mode.name(s.eng.mode));
+        term.write_str("  qark \x1b[0m\r\n");
+    }
+}
+
+# run until the editor sets quit or the user types q in normal mode via Esc then :q
+pub fun run(s: *session.Session) i64 {
+    session.bind(s);
+    if (!term.enable()) { ret 1; }
+    draw(s);
+    var idle: i64 = 0;
+    for (!s.eng.quit && idle < 1000000) {
+        val key: opt[keys.Key] = term.poll();
+        if (sel key.some) {
+            eng.handle(?s.eng, key.some);
+            draw(s);
+            idle = 0;
+        }
+        or {
+            os.sleep(20000000);
+            idle = idle + 1;
+        }
+    }
+    term.disable();
+    ret 0;
+}

@@ -1,0 +1,9 @@
+{
+  "id": "double",
+  "language": "python",
+  "prompt": "Generate a python function double(value) that returns value * 2, plus a main that prints double(21).",
+  "script": "(+ 1 1)",
+  "validators": ["python"],
+  "expect_ident": "double",
+  "forbid_overwrite": true
+}

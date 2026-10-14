@@ -1,0 +1,57 @@
+# indentation from the previous line's brackets
+
+use std.types.bool.bool;
+use std.types.option.opt;
+
+use motion: qark.core.motion;
+use text: qark.core.text;
+
+# suggested indent column for a line, in spaces
+pub fun suggest(t: *text.Text, row: i64, shift: i64) i64 {
+    if (row <= 0) { ret 0; }
+    var prev: i64 = row - 1;
+    var base: i64 = 0;
+    val len: i64 = motion.line_len(t, prev);
+    var i: i64 = 0;
+    for (i < len) {
+        val b: u8 = motion.byte_at(t, prev, i);
+        if (b != ' ' && b != '\t') { brk; }
+        if (b == '\t') { base = base + shift; }
+        or { base = base + 1; }
+        i = i + 1;
+    }
+    var extra: i64 = 0;
+    for (i < len) {
+        val b: u8 = motion.byte_at(t, prev, i);
+        if (b == '{' || b == '(' || b == '[') { extra = extra + shift; }
+        if ((b == '}' || b == ')' || b == ']') && extra >= shift) { extra = extra - shift; }
+        i = i + 1;
+    }
+    var cur: i64 = 0;
+    val clen: i64 = motion.line_len(t, row);
+    for (cur < clen) {
+        val b: u8 = motion.byte_at(t, row, cur);
+        if (b != ' ' && b != '\t') { brk; }
+        cur = cur + 1;
+    }
+    if (cur < clen) {
+        val b: u8 = motion.byte_at(t, row, cur);
+        if ((b == '}' || b == ')' || b == ']') && extra >= shift) { extra = extra - shift; }
+    }
+    ret base + extra;
+}
+
+# true when a newline should keep the indent of the line above
+pub fun copy_above(t: *text.Text, row: i64) i64 {
+    if (row <= 0) { ret 0; }
+    var n: i64 = 0;
+    val len: i64 = motion.line_len(t, row - 1);
+    var i: i64 = 0;
+    for (i < len) {
+        val b: u8 = motion.byte_at(t, row - 1, i);
+        if (b != ' ' && b != '\t') { brk; }
+        n = n + 1;
+        i = i + 1;
+    }
+    ret n;
+}

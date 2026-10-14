@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "qark": {
+      "command": "D:\\Dev\\Qark\\out\\windows-x86_64\\release\\bin\\qark.exe",
+      "args": ["mcp", "--root", "."]
+    }
+  }
+}

@@ -1,0 +1,36 @@
+{{!-- a node.js command-line script: --name value flags, an async main, and an exit code.
+vars: description; args [{name, default}]; body (main's code, indented for you; args holds the flags) --}}
+#!/usr/bin/env node
+// {{description}}
+'use strict';
+
+function parseArgs(argv) {
+  const args = {
+{{#if args}}
+{{#each args}}
+    {{name|camel}}: {{#if default}}{{default|js}}{{else}}undefined{{/if}},
+{{/each}}
+{{/if}}
+  };
+  for (let i = 0; i < argv.length; i++) {
+    const m = /^--([^=]+)(?:=(.*))?$/.exec(argv[i]);
+    if (!m) continue;
+    const key = m[1].replace(/-([a-z])/g, (_, c) => c.toUpperCase());
+    if (m[2] !== undefined) args[key] = m[2];
+    else if (argv[i + 1] !== undefined && !argv[i + 1].startsWith('--')) args[key] = argv[++i];
+    else args[key] = true;
+  }
+  return args;
+}
+
+async function main(args) {
+  {{body|default:"return 0;"|indent:2}}
+}
+
+main(parseArgs(process.argv.slice(2))).then(
+  (code) => process.exit(typeof code === 'number' ? code : 0),
+  (err) => {
+    console.error(err && err.stack ? err.stack : err);
+    process.exit(1);
+  },
+);

@@ -1,0 +1,358 @@
+# ex commands: ranges, substitute, global, edit, write, maps, set
+
+use std.filesystem;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+
+use A: std.allocator;
+use buffer: qark.core.buffer;
+use ft: qark.core.filetype;
+use re: qark.core.regex;
+use text: qark.core.text;
+use util: qark.util;
+
+# callbacks the editor fills in; nil means the command is refused
+pub rec Hooks {
+    ctx:    *u8;
+    write:  fun(*u8, i64) i64;
+    shell:  fun(*u8, str) i64;
+    lisp:   fun(*u8, str) i64;
+    normal: fun(*u8, str) i64;
+    source: fun(*u8, str) i64;
+    map:    fun(*u8, u8, str, str, u8) i64;
+}
+
+# the pieces of the editor an ex command may touch
+# ---
+# sandbox: refuse commands that reach outside the buffer (write, edit, source,
+#          call, shell, map) and refuse unknown commands instead of ignoring them
+pub rec Ex {
+    a:         *A.Allocator;
+    bufs:      *buffer.Buffers;
+    quit:      *bool;
+    shift:     *i64;
+    expandtab: *bool;
+    hooks:     Hooks;
+    msg:       *str;
+    sandbox:   bool;
+}
+
+fun set_msg(ex: *Ex, s: str) {
+    if (ex.msg == nil) { ret; }
+    util.free(ex.a, @ex.msg);
+    val d: res[str, A.Error] = util.dup(ex.a, s);
+    if (sel d.ok) { @ex.msg = d.ok; }
+}
+
+fun skip_ws(s: str, i: *usize) {
+    val n: usize = str_len(s);
+    for (@i < n && (s[@i] == ' ' || s[@i] == '\t')) { @i = @i + 1; }
+}
+
+fun parse_line_ref(ex: *Ex, s: str, i: *usize, cur: i64, last: i64) i64 {
+    skip_ws(s, i);
+    if (@i >= str_len(s)) { ret cur; }
+    val c: u8 = s[@i];
+    if (c == '.') {
+        @i = @i + 1;
+        ret cur;
+    }
+    if (c == '$') {
+        @i = @i + 1;
+        ret last;
+    }
+    if (c == '%') {
+        @i = @i + 1;
+        ret -2;
+    }
+    if (c >= '0' && c <= '9') {
+        var v: i64 = 0;
+        for (@i < str_len(s) && s[@i] >= '0' && s[@i] <= '9') {
+            v = v * 10 + (s[@i] - '0')::i64;
+            @i = @i + 1;
+        }
+        if (v < 1) { v = 1; }
+        ret v - 1;
+    }
+    ret cur;
+}
+
+# run one ex command without the leading colon
+pub fun exec(ex: *Ex, line: str) err[A.Error] {
+    if (line == nil) { ret err[A.Error].ok{}; }
+    val buf: opt[*buffer.Buffer] = buffer.current(ex.bufs);
+    if (!sel buf.some) { ret err[A.Error].err{A.Error.invalid{}}; }
+    var i: usize = 0;
+    val last: i64 = text.line_count(?buf.some.text) - 1;
+    var r1: i64 = buf.some.row;
+    var r2: i64 = buf.some.row;
+    val c0: u8 = line[0];
+    if (c0 == '%' || c0 == '.' || c0 == '$' || (c0 >= '0' && c0 <= '9')) {
+        val a: i64 = parse_line_ref(ex, line, ?i, buf.some.row, last);
+        if (a == -2) {
+            r1 = 0;
+            r2 = last;
+        }
+        or {
+            r1 = a;
+            r2 = a;
+            skip_ws(line, ?i);
+            if (i < str_len(line) && line[i] == ',') {
+                i = i + 1;
+                r2 = parse_line_ref(ex, line, ?i, buf.some.row, last);
+                if (r2 == -2) { r2 = last; }
+            }
+        }
+    }
+    skip_ws(line, ?i);
+    var cmd: [32]u8;
+    var cn: usize = 0;
+    for (i < str_len(line) && cn + 1 < 32) {
+        val ch: u8 = line[i];
+        if (ch == ' ' || ch == '\t' || ch == '/') { brk; }
+        cmd[cn] = ch;
+        cn = cn + 1;
+        i = i + 1;
+    }
+    cmd[cn] = 0;
+    skip_ws(line, ?i);
+    val rest: str = (line::usize + i)::*u8;
+    if (ex.sandbox) {
+        val c: str = ?cmd[0];
+        val outside: bool = util.eq(c, "w") || util.eq(c, "write") || util.eq(c, "wq") || util.eq(c, "e") || util.eq(c, "edit") || util.eq(c, "source") || util.eq(c, "call");
+        val mapping: bool = util.eq(c, "map") || util.eq(c, "nmap") || util.eq(c, "imap") || util.eq(c, "vmap");
+        if (outside || mapping || cmd[0] == '!' || line[0] == '!') {
+            set_msg(ex, "not allowed here");
+            ret err[A.Error].err{A.Error.invalid{}};
+        }
+        val known: bool = util.eq(c, "q") || util.eq(c, "quit") || util.eq(c, "d") || util.eq(c, "delete") || util.eq(c, "s") || util.eq(c, "substitute") || util.eq(c, "g") || util.eq(c, "global") || util.eq(c, "v") || util.eq(c, "normal") || util.eq(c, "set");
+        if (!known) {
+            set_msg(ex, "unknown command");
+            ret err[A.Error].err{A.Error.invalid{}};
+        }
+    }
+
+    if (util.eq(?cmd[0], "q") || util.eq(?cmd[0], "quit")) {
+        if (ex.quit != nil) { @ex.quit = true; }
+        ret err[A.Error].ok{};
+    }
+    if (util.eq(?cmd[0], "w") || util.eq(?cmd[0], "write") || util.eq(?cmd[0], "wq")) {
+        if (ex.hooks.write != nil) { ex.hooks.write(ex.hooks.ctx, buf.some.id); }
+        buf.some.modified = false;
+        if (util.eq(?cmd[0], "wq") && ex.quit != nil) { @ex.quit = true; }
+        ret err[A.Error].ok{};
+    }
+    if (util.eq(?cmd[0], "e") || util.eq(?cmd[0], "edit")) {
+        val bytes: res[str, filesystem.FsError] = filesystem.read_string(ex.a, rest);
+        if (sel bytes.err) {
+            set_msg(ex, "edit failed");
+            ret err[A.Error].ok{};
+        }
+        val n: usize = str_len(bytes.ok);
+        val loaded: err[A.Error] = buffer.load(ex.bufs, buf.some.id, bytes.ok, n);
+        val named: err[A.Error] = buffer.set_name(ex.bufs, buf.some.id, rest);
+        val typed: err[A.Error] = buffer.set_ft(ex.bufs, buf.some.id, ft.from_name(rest));
+        util.free(ex.a, bytes.ok);
+        if (sel loaded.err) { ret loaded; }
+        if (sel named.err) { ret named; }
+        if (sel typed.err) { ret typed; }
+        ret err[A.Error].ok{};
+    }
+    if (util.eq(?cmd[0], "d") || util.eq(?cmd[0], "delete")) {
+        var srcs: [1]*u8;
+        var lens: [1]usize;
+        if (r2 < r1) {
+            val t: i64 = r1;
+            r1 = r2;
+            r2 = t;
+        }
+        val sp: err[A.Error] = buffer.splice(ex.bufs, buf.some.id, r1, r2 + 1, ?srcs[0], ?lens[0], 0, true);
+        if (sel sp.err) { ret sp; }
+        buf.some.row = r1;
+        buffer.clamp_col(buf.some);
+        ret err[A.Error].ok{};
+    }
+    if (util.eq(?cmd[0], "s") || util.eq(?cmd[0], "substitute")) {
+        ret substitute(ex, buf.some, r1, r2, rest);
+    }
+    if (util.eq(?cmd[0], "g") || util.eq(?cmd[0], "global") || util.eq(?cmd[0], "v")) {
+        ret global(ex, buf.some, r1, r2, rest, util.eq(?cmd[0], "v"));
+    }
+    if (util.eq(?cmd[0], "normal")) {
+        if (ex.hooks.normal != nil) { ex.hooks.normal(ex.hooks.ctx, rest); }
+        ret err[A.Error].ok{};
+    }
+    if (util.eq(?cmd[0], "call")) {
+        if (ex.hooks.lisp != nil) { ex.hooks.lisp(ex.hooks.ctx, rest); }
+        ret err[A.Error].ok{};
+    }
+    if (util.eq(?cmd[0], "source")) {
+        if (ex.hooks.source != nil) { ex.hooks.source(ex.hooks.ctx, rest); }
+        ret err[A.Error].ok{};
+    }
+    if (util.eq(?cmd[0], "set")) {
+        ret do_set(ex, rest);
+    }
+    if (util.eq(?cmd[0], "map") || util.eq(?cmd[0], "nmap") || util.eq(?cmd[0], "imap") || util.eq(?cmd[0], "vmap")) {
+        if (ex.hooks.map == nil) { ret err[A.Error].ok{}; }
+        var modeb: u8 = 0;
+        if (util.eq(?cmd[0], "imap")) { modeb = 1; }
+        if (util.eq(?cmd[0], "vmap")) { modeb = 2; }
+        var lhs: [128]u8;
+        var li: usize = 0;
+        var j: usize = 0;
+        val rn: usize = str_len(rest);
+        for (j < rn && rest[j] != ' ' && li + 1 < 128) {
+            lhs[li] = rest[j];
+            li = li + 1;
+            j = j + 1;
+        }
+        lhs[li] = 0;
+        for (j < rn && rest[j] == ' ') { j = j + 1; }
+        ex.hooks.map(ex.hooks.ctx, modeb, ?lhs[0], (rest::usize + j)::*u8, 1);
+        ret err[A.Error].ok{};
+    }
+    if (cmd[0] == '!') {
+        val shell_line: str = (line::usize + i)::*u8;
+        # the command word included '!' only when '!' was the whole word; a
+        # leading '!' with no space is the filter form `!cmd`
+        if (ex.hooks.shell != nil) { ex.hooks.shell(ex.hooks.ctx, shell_line); }
+        ret err[A.Error].ok{};
+    }
+    if (line[0] == '!') {
+        if (ex.hooks.shell != nil) { ex.hooks.shell(ex.hooks.ctx, (line::usize + 1)::*u8); }
+        ret err[A.Error].ok{};
+    }
+    set_msg(ex, "unknown command");
+    ret err[A.Error].ok{};
+}
+
+fun do_set(ex: *Ex, rest: str) err[A.Error] {
+    if (util.eq(rest, "expandtab")) {
+        if (ex.expandtab != nil) { @ex.expandtab = true; }
+        ret err[A.Error].ok{};
+    }
+    if (util.eq(rest, "noexpandtab")) {
+        if (ex.expandtab != nil) { @ex.expandtab = false; }
+        ret err[A.Error].ok{};
+    }
+    val n: usize = str_len(rest);
+    if (n > 10 && rest[0] == 's') {
+        var v: i64 = 0;
+        var j: usize = 0;
+        for (j < n && rest[j] != '=') { j = j + 1; }
+        if (j < n && rest[j] == '=') {
+            j = j + 1;
+            for (j < n && rest[j] >= '0' && rest[j] <= '9') {
+                v = v * 10 + (rest[j] - '0')::i64;
+                j = j + 1;
+            }
+            if (ex.shift != nil && v > 0) { @ex.shift = v; }
+        }
+    }
+    ret err[A.Error].ok{};
+}
+
+fun substitute(ex: *Ex, buf: *buffer.Buffer, r1: i64, r2: i64, rest: str) err[A.Error] {
+    if (rest == nil || rest[0] == 0) { ret err[A.Error].ok{}; }
+    val sep: u8 = rest[0];
+    var i: usize = 1;
+    var p1: usize = 1;
+    for (rest[i] != 0 && rest[i] != sep) { i = i + 1; }
+    val p1n: usize = i - p1;
+    if (rest[i] != sep) { ret err[A.Error].ok{}; }
+    i = i + 1;
+    var p2: usize = i;
+    for (rest[i] != 0 && rest[i] != sep) { i = i + 1; }
+    val p2n: usize = i - p2;
+    var global: bool = false;
+    if (rest[i] == sep) {
+        i = i + 1;
+        if (rest[i] == 'g') { global = true; }
+    }
+    val prog: res[re.Prog, A.Error] = re.compile(ex.a, (rest::usize + p1)::*u8, p1n);
+    if (sel prog.err) { ret err[A.Error].err{prog.err}; }
+    var progv: re.Prog = prog.ok;
+    var row: i64 = r1;
+    var end: i64 = r2;
+    if (end < row) { end = row; }
+    for (row <= end && row < text.line_count(?buf.text)) {
+        val g: opt[*text.Line] = text.line_at(?buf.text, row);
+        if (sel g.some) {
+            var out: [4096]u8;
+            var out_len: usize = 0;
+            val hit: bool = re.replace_first(?progv, g.some.data, g.some.len::i64, (rest::usize + p2)::*u8, p2n::i64, ?out[0], 4096, ?out_len);
+            if (hit) {
+                var srcs: [1]*u8;
+                var lens: [1]usize;
+                srcs[0] = ?out[0];
+                lens[0] = out_len;
+                val sp: err[A.Error] = buffer.splice(ex.bufs, buf.id, row, row + 1, ?srcs[0], ?lens[0], 1, true);
+                if (sel sp.err) {
+                    re.dnit(?progv);
+                    ret sp;
+                }
+                if (global) {
+                    # one extra pass is enough for the common double
+                    val g2: opt[*text.Line] = text.line_at(?buf.text, row);
+                    if (sel g2.some) {
+                        val hit2: bool = re.replace_first(?progv, g2.some.data, g2.some.len::i64, (rest::usize + p2)::*u8, p2n::i64, ?out[0], 4096, ?out_len);
+                        if (hit2) {
+                            srcs[0] = ?out[0];
+                            lens[0] = out_len;
+                            buffer.splice(ex.bufs, buf.id, row, row + 1, ?srcs[0], ?lens[0], 1, true);
+                        }
+                    }
+                }
+            }
+        }
+        row = row + 1;
+    }
+    re.dnit(?progv);
+    ret err[A.Error].ok{};
+}
+
+fun global(ex: *Ex, buf: *buffer.Buffer, r1: i64, r2: i64, rest: str, invert: bool) err[A.Error] {
+    if (rest == nil || rest[0] == 0) { ret err[A.Error].ok{}; }
+    val sep: u8 = rest[0];
+    var i: usize = 1;
+    for (rest[i] != 0 && rest[i] != sep) { i = i + 1; }
+    val pat_n: usize = i - 1;
+    if (rest[i] != sep) { ret err[A.Error].ok{}; }
+    i = i + 1;
+    val cmd: str = (rest::usize + i)::*u8;
+    val prog: res[re.Prog, A.Error] = re.compile(ex.a, (rest::usize + 1)::*u8, pat_n);
+    if (sel prog.err) { ret err[A.Error].err{prog.err}; }
+    var progv: re.Prog = prog.ok;
+    var row: i64 = r1;
+    for (row <= r2) {
+        if (row >= text.line_count(?buf.text)) { brk; }
+        val g: opt[*text.Line] = text.line_at(?buf.text, row);
+        var hit: bool = false;
+        if (sel g.some) {
+            val m: re.Match = re.find(?progv, g.some.data, g.some.len::i64, 0);
+            hit = m.ok;
+        }
+        if (hit != invert) {
+            buf.row = row;
+            if (util.eq(cmd, "d") || util.eq(cmd, "delete")) {
+                buffer.splice(ex.bufs, buf.id, row, row + 1, nil, nil, 0, true);
+                r2 = r2 - 1;
+            }
+            or {
+                if (ex.hooks.normal != nil) { ex.hooks.normal(ex.hooks.ctx, cmd); }
+                row = row + 1;
+            }
+        }
+        or { row = row + 1; }
+    }
+    re.dnit(?progv);
+    ret err[A.Error].ok{};
+}

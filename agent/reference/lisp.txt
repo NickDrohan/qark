@@ -1,0 +1,3 @@
+﻿special: quote if begin let lambda def defmacro quasiquote
+builtin: + - * / cons car cdr list null? not eq? < str-len gc type-of
+prelude: when unless defun for-each

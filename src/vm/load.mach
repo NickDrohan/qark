@@ -1,0 +1,27 @@
+# embedded prelude
+
+use std.types.error.err;
+use std.types.result.res;
+use std.types.size.usize;
+
+use A: std.allocator;
+use ev: qark.vm.eval;
+use v: qark.vm.value;
+
+#[embed("../../scripts/prelude.qk")]
+val PRELUDE: [_]u8;
+
+# evaluate the embedded prelude; boot happens inside eval_src
+pub fun prelude(vm: *v.Vm) res[u32, v.VmError] {
+    var buf: [4096]u8;
+    val n: usize = $length_of(PRELUDE);
+    var copy: usize = n;
+    if (copy > 4095) { copy = 4095; }
+    var i: usize = 0;
+    for (i < copy) {
+        buf[i] = PRELUDE[i];
+        i = i + 1;
+    }
+    buf[copy] = 0;
+    ret ev.eval_src(vm, ?buf[0]);
+}

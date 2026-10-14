@@ -1,0 +1,1341 @@
+# a spec compiled into a change set: templates rendered, lists fanned out, edits applied
+#
+# a spec is one json object. files lists what should exist afterwards; each
+# entry gives a path and exactly one source of bytes:
+#
+#   text      the bytes as written
+#   lines     a list of lines, joined with "\n" and ending in "\n"
+#   tmpl      inline template text rendered with vars, with, and the each item
+#   template  the name of a template from the spec, the session, the workspace, or qark
+#   json      any json value, written as pretty json
+#   edits     a list of edits applied to the file as it is now
+#   move      a source path moved here: the destination gets its bytes and
+#             the source is deleted, in the same atomic commit. expect on a
+#             move pins the source's sha256
+#   delete    true removes the file
+#
+# set diff true on the spec to get a unified diff of every changed file in
+# the receipt
+#
+# each fans one entry out over a list. with adds variables to one entry. a job
+# writes under jobs/<job> and adds manifest.json, which records every file's
+# hash so the executor can verify what it received.
+
+use std.collections.vector;
+use std.data.json;
+use std.filesystem;
+use io_error: std.io.error;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+
+use A: std.allocator;
+use path: std.types.path;
+use commit: qark.gen.commit;
+use pathx: qark.gen.pathx;
+use jw: qark.rpc.jw;
+use edit: qark.spec.edit;
+use expand: qark.spec.expand;
+use tmpl: qark.spec.tmpl;
+use util: qark.util;
+
+pub val CHECK_OFF:      u8 = 0;
+pub val CHECK_ON:       u8 = 1;
+pub val CHECK_REQUIRED: u8 = 2;
+
+pub val MAX_FILES:       usize = 1024;
+pub val MAX_FILE_BYTES:  usize = 8388608;
+pub val MAX_TOTAL_BYTES: usize = 67108864;
+
+pub val VERSION: str = "0.2.0";
+
+# why a spec was refused
+# ---
+# code:  static code such as spec_field or tmpl_var
+# msg:   message, owned by the spec allocator
+# field: where in the spec, such as files[2].path
+# path:  the file path involved, when known
+# line:  1-based line in a template or file, 0 when none
+# tname: template name, when the failure is inside one
+pub rec Err {
+    code:  str;
+    msg:   str;
+    field: str;
+    path:  str;
+    line:  i64;
+    tname: str;
+}
+
+# a named template
+# ---
+# src: where it came from: spec, session, workspace, or builtin
+pub rec Tpl {
+    name:    str;
+    lang:    str;
+    body:    *u8;
+    len:     usize;
+    src:     str;
+    desc:    str;
+    pathpat: str;
+    prog:    tmpl.Prog;
+}
+
+# where templates outside the spec come from
+pub rec Lib {
+    ctx:  *u8;
+    find: fun(*u8, str, *Tpl) bool;
+}
+
+# a compiled spec; it must not move after compile starts
+pub rec Spec {
+    a:            *A.Allocator;
+    root:         str;
+    set:          commit.Set;
+    job:          str;
+    dest:         str;
+    check:        u8;
+    dry:          bool;
+    prune:        bool;
+    diff:         bool;
+    tag:          str;
+    run:          *json.Value;
+    vars:         *json.Value;
+    empty:        json.Value;
+    inline:       vector.Vector[Tpl];
+    lib:          *Lib;
+    tlib:         tmpl.Lib;
+    sha:          [65]u8;
+    folded:       vector.Vector[str];
+    total:        usize;
+    default_mode: u8;
+    manifest:     i64;
+    files:        i64;
+    warns:        vector.Vector[str];
+    pcache:       tmpl.Cache;
+}
+
+fun fail(e: *Err, code: str, msg: str, field: str) bool {
+    e.code = code;
+    e.msg = msg;
+    e.field = field;
+    ret false;
+}
+
+# "files[3].key", or "files[3]" when key is nil
+fun at(a: *A.Allocator, fi: usize, key: str) str {
+    var w: jw.Jw = jw.init(a);
+    jw.raw(?w, "files[");
+    var num: [24]u8;
+    val n: usize = util.fmt_i64(?num[0], 24, fi::i64);
+    jw.bytes(?w, ?num[0], n);
+    jw.raw(?w, "]");
+    if (key != nil) {
+        jw.raw(?w, ".");
+        jw.raw(?w, key);
+    }
+    if (w.buf == nil || w.failed) { ret "files"; }
+    ret w.buf;
+}
+
+fun cat3(a: *A.Allocator, p1: str, p2: str, p3: str) str {
+    var w: jw.Jw = jw.init(a);
+    jw.raw(?w, p1);
+    jw.raw(?w, p2);
+    jw.raw(?w, p3);
+    if (w.buf == nil || w.failed) { ret p1; }
+    ret w.buf;
+}
+
+# 1 decoded into out, 0 absent, -1 not a string, -2 out of memory
+fun fstr(a: *A.Allocator, obj: *json.Value, key: str, out: **u8, n: *usize) i64 {
+    val f: opt[*json.Value] = json.value_find(obj, key);
+    if (!sel f.some) { ret 0; }
+    if (!json.value_is_string(f.some)) { ret -1; }
+    var raw_n: usize = 0;
+    json.value_string(f.some, ?raw_n);
+    val got: res[*u8, A.Error] = A.allocate[u8](a, raw_n + 1);
+    if (sel got.err) { ret -2; }
+    val dec: res[usize, json.JsonError] = json.value_string_decode(f.some, got.ok, raw_n + 1);
+    if (sel dec.err) { ret -1; }
+    if (dec.ok > raw_n) { ret -1; }
+    got.ok[dec.ok] = 0;
+    @out = got.ok;
+    @n = dec.ok;
+    ret 1;
+}
+
+fun decode_value(a: *A.Allocator, v: *json.Value, out: **u8, n: *usize) bool {
+    var raw_n: usize = 0;
+    json.value_string(v, ?raw_n);
+    val got: res[*u8, A.Error] = A.allocate[u8](a, raw_n + 1);
+    if (sel got.err) { ret false; }
+    val dec: res[usize, json.JsonError] = json.value_string_decode(v, got.ok, raw_n + 1);
+    if (sel dec.err) { ret false; }
+    if (dec.ok > raw_n) { ret false; }
+    got.ok[dec.ok] = 0;
+    @out = got.ok;
+    @n = dec.ok;
+    ret true;
+}
+
+# 1 true, 0 false or absent, -1 not a boolean
+fun fbool(obj: *json.Value, key: str) i64 {
+    val f: opt[*json.Value] = json.value_find(obj, key);
+    if (!sel f.some) { ret 0; }
+    if (!json.value_is_bool(f.some)) { ret -1; }
+    if (json.value_bool(f.some)) { ret 1; }
+    ret 0;
+}
+
+fun lower(c: u8) u8 {
+    if (c >= 'A' && c <= 'Z') { ret c + 32; }
+    ret c;
+}
+
+fun ext_is(ext: str, want: str) bool {
+    val n: usize = str_len(want);
+    if (str_len(ext) != n) { ret false; }
+    var i: usize = 0;
+    for (i < n) {
+        if (lower(ext[i]) != want[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# the checker for a path, from its extension; nil when none applies
+pub fun lang_of(rel: str) str {
+    val ext: str = path.extension(rel);
+    if (ext == nil) { ret nil; }
+    if (ext_is(ext, "py") || ext_is(ext, "pyw")) { ret "python"; }
+    if (ext_is(ext, "js") || ext_is(ext, "cjs") || ext_is(ext, "mjs")) { ret "node"; }
+    if (ext_is(ext, "ps1") || ext_is(ext, "psm1")) { ret "powershell"; }
+    if (ext_is(ext, "sh") || ext_is(ext, "bash")) { ret "bash"; }
+    if (ext_is(ext, "json")) { ret "json"; }
+    if (ext_is(ext, "toml")) { ret "toml"; }
+    ret nil;
+}
+
+# the canonical checker name for a spec's check field, or nil when unknown
+fun checker_name(s: str) str {
+    if (util.eq(s, "python") || util.eq(s, "py")) { ret "python"; }
+    if (util.eq(s, "node") || util.eq(s, "javascript") || util.eq(s, "js")) { ret "node"; }
+    if (util.eq(s, "powershell") || util.eq(s, "pwsh") || util.eq(s, "ps1")) { ret "powershell"; }
+    if (util.eq(s, "bash") || util.eq(s, "sh")) { ret "bash"; }
+    if (util.eq(s, "json")) { ret "json"; }
+    if (util.eq(s, "toml")) { ret "toml"; }
+    ret nil;
+}
+
+fun indent(w: *jw.Jw, depth: usize) {
+    var i: usize = 0;
+    for (i < depth) {
+        jw.raw(w, "  ");
+        i = i + 1;
+    }
+}
+
+# json text of a parsed value; parsed strings and keys are already escaped
+pub fun emit_json(w: *jw.Jw, v: *json.Value, pretty: bool, depth: usize) {
+    if (json.value_is_null(v)) {
+        jw.raw(w, "null");
+        ret;
+    }
+    if (json.value_is_bool(v)) {
+        if (json.value_bool(v)) { jw.raw(w, "true"); }
+        or { jw.raw(w, "false"); }
+        ret;
+    }
+    if (json.value_is_number(v)) {
+        if (json.value_is_float(v)) { jw.float(w, json.value_float(v)); }
+        or {
+            var num: [32]u8;
+            val n: usize = util.fmt_i64(?num[0], 32, json.value_number(v));
+            jw.bytes(w, ?num[0], n);
+        }
+        ret;
+    }
+    if (json.value_is_string(v)) {
+        var n: usize = 0;
+        val p: *u8 = json.value_string(v, ?n);
+        jw.byte(w, '"');
+        jw.bytes(w, p, n);
+        jw.byte(w, '"');
+        ret;
+    }
+    val count: usize = json.value_count(v);
+    val is_obj: bool = json.value_is_object(v);
+    var open: u8 = '[';
+    var close: u8 = ']';
+    if (is_obj) {
+        open = '{';
+        close = '}';
+    }
+    jw.byte(w, open);
+    if (count == 0) {
+        jw.byte(w, close);
+        ret;
+    }
+    var i: usize = 0;
+    for (i < count) {
+        if (i > 0) { jw.byte(w, ','); }
+        if (pretty) {
+            jw.byte(w, '\n');
+            indent(w, depth + 1);
+        }
+        if (is_obj) {
+            val k: opt[str] = json.value_key(v, i);
+            if (sel k.some) {
+                jw.byte(w, '"');
+                jw.bytes(w, k.some, json.value_key_len(v, i));
+                jw.byte(w, '"');
+            }
+            jw.byte(w, ':');
+            if (pretty) { jw.byte(w, ' '); }
+        }
+        val g: opt[*json.Value] = json.value_get(v, i);
+        if (sel g.some) { emit_json(w, g.some, pretty, depth + 1); }
+        i = i + 1;
+    }
+    if (pretty) {
+        jw.byte(w, '\n');
+        indent(w, depth);
+    }
+    jw.byte(w, close);
+}
+
+fun find_tpl(sp: *Spec, name: str, out: *Tpl) bool {
+    var i: usize = 0;
+    for (i < sp.inline.len) {
+        if (util.eq(sp.inline.data[i].name, name)) {
+            @out = sp.inline.data[i];
+            ret true;
+        }
+        i = i + 1;
+    }
+    if (sp.lib != nil && sp.lib.find != nil) { ret sp.lib.find(sp.lib.ctx, name, out); }
+    ret false;
+}
+
+fun partial_find(ctx: *u8, name: str, body: **u8, len: *usize, lang: *str) bool {
+    val sp: *Spec = ctx::*Spec;
+    var t: Tpl;
+    if (!find_tpl(sp, name, ?t)) { ret false; }
+    @body = t.body;
+    @len = t.len;
+    @lang = t.lang;
+    ret true;
+}
+
+fun has_braces(p: *u8, n: usize) bool {
+    var i: usize = 0;
+    for (i + 1 < n) {
+        if (p[i] == '{' && p[i + 1] == '{') { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+fun tmpl_fail(sp: *Spec, e: *Err, te: *tmpl.Err, field: str, rel: str) bool {
+    e.code = te.code;
+    e.msg = te.msg;
+    e.line = te.line;
+    e.tname = te.tname;
+    e.field = field;
+    e.path = rel;
+    ret false;
+}
+
+fun span_is(p: *u8, n: usize, s: str) bool {
+    if (p == nil || n != str_len(s)) { ret false; }
+    var i: usize = 0;
+    for (i < n) {
+        if (p[i] != s[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun find_col(cols: *expand.Cell, ncol: usize, name: str, out: *usize) bool {
+    var i: usize = 0;
+    for (i < ncol) {
+        if (span_is(cols[i].p, cols[i].n, name)) {
+            @out = i;
+            ret true;
+        }
+        i = i + 1;
+    }
+    ret false;
+}
+
+fun write_object(w: *jw.Jw, cols: *expand.Cell, cells: *expand.Cell, ncol: usize) {
+    jw.raw(w, "{");
+    var i: usize = 0;
+    for (i < ncol) {
+        if (i > 0) { jw.raw(w, ","); }
+        jw.quoted(w, cols[i].p, cols[i].n);
+        jw.raw(w, ":");
+        jw.quoted(w, cells[i].p, cells[i].n);
+        i = i + 1;
+    }
+    jw.raw(w, "}");
+}
+
+fun parse_obj(a: *A.Allocator, w: *jw.Jw, out: *json.Value) bool {
+    if (w.failed || w.buf == nil) { ret false; }
+    val parsed: res[json.Value, json.JsonError] = json.parse(w.buf, w.len, a);
+    if (sel parsed.err) { ret false; }
+    @out = parsed.ok;
+    ret true;
+}
+
+fun ensure_prog(sp: *Spec, t: *Tpl, out: *tmpl.Prog, te: *tmpl.Err) bool {
+    if (t.prog.ready) {
+        @out = t.prog;
+        ret true;
+    }
+    ret tmpl.cache_prepare(?sp.pcache, sp.a, t.body, t.len, out, te);
+}
+
+fun render_with(sp: *Spec, name: str, lang: str, prog: *tmpl.Prog, ctx: *tmpl.Ctx, out: **u8, on: *usize, te: *tmpl.Err) bool {
+    ret tmpl.render_prog(sp.a, name, lang, prog, ctx, ?sp.tlib, ?sp.pcache, out, on, te);
+}
+
+# put already-rendered bytes at a concrete relative path
+fun place_file(sp: *Spec, given: *u8, gn: usize, data: *u8, dn: usize, e: *Err) bool {
+    val a: *A.Allocator = sp.a;
+    val owned: res[str, A.Error] = util.dup_n(a, given, gn);
+    if (sel owned.err) { ret fail(e, "oom", "out of memory", "expand"); }
+    val canon: res[str, A.Error] = pathx.canonical(a, owned.ok);
+    if (sel canon.err) { ret fail(e, "oom", "out of memory", "expand"); }
+    val pr: i64 = pathx.check(canon.ok);
+    if (pr != pathx.P_OK) {
+        e.path = canon.ok;
+        ret fail(e, pathx.code(pr), pathx.message(pr), "expand");
+    }
+    val rel: res[str, A.Error] = pathx.join(a, sp.dest, canon.ok);
+    if (sel rel.err) { ret fail(e, "oom", "out of memory", "expand"); }
+    e.path = rel.ok;
+    val folded: res[str, A.Error] = pathx.folded(a, rel.ok);
+    if (sel folded.err) { ret fail(e, "oom", "out of memory", "expand"); }
+    if (seen_path(sp, folded.ok)) {
+        ret fail(e, "duplicate_path", "two files resolve to the same path (paths compare without case); give each row a distinct path", "expand");
+    }
+    vector.push[str](?sp.folded, folded.ok);
+    var bytes: *u8 = data;
+    var n: usize = dn;
+    if (bytes == nil) {
+        bytes = "";
+        n = 0;
+    }
+    if (n > MAX_FILE_BYTES) { ret fail(e, "too_large", "a file is larger than 8 MiB", "expand"); }
+    sp.total = sp.total + n;
+    if (sp.total > MAX_TOTAL_BYTES) { ret fail(e, "too_large", "the change set is larger than 64 MiB", "expand"); }
+    if (commit.count(?sp.set) >= MAX_FILES) { ret fail(e, "too_many_files", "a change set holds at most 1024 files", "expand"); }
+    val added: res[usize, A.Error] = commit.add(?sp.set, rel.ok, bytes, n, sp.default_mode);
+    if (sel added.err) { ret fail(e, "oom", "out of memory", "expand"); }
+    val ent: *commit.Entry = commit.entry(?sp.set, added.ok);
+    ent.lang = lang_of(rel.ok);
+    ent.exec = n >= 2 && bytes[0] == '#' && bytes[1] == '!';
+    sp.files = sp.files + 1;
+    ret true;
+}
+
+fun row_ctx(sp: *Spec, obj: *json.Value, c: *tmpl.Ctx, index: i64, count: i64, item: bool) bool {
+    tmpl.ctx_init(c);
+    if (!tmpl.ctx_push(c, sp.vars)) { ret false; }
+    if (item) { ret tmpl.ctx_push_item(c, obj, index, count, nil, 0); }
+    ret tmpl.ctx_push(c, obj);
+}
+
+fun compile_expand(sp: *Spec, text: *u8, n: usize, e: *Err) bool {
+    val a: *A.Allocator = sp.a;
+    var blocks: vector.Vector[expand.Block] = vector.init[expand.Block](a);
+    var ee: expand.Err;
+    if (!expand.parse(a, text, n, ?blocks, ?ee)) {
+        e.code = ee.code;
+        e.msg = ee.msg;
+        e.line = ee.line;
+        e.field = "expand";
+        ret false;
+    }
+    var b: usize = 0;
+    for (b < blocks.len) {
+        val block: *expand.Block = ?blocks.data[b];
+        val named: res[str, A.Error] = util.dup_n(a, block.name, block.namen);
+        if (sel named.err) { ret fail(e, "oom", "out of memory", "expand"); }
+        var t: Tpl;
+        if (!find_tpl(sp, named.ok, ?t)) {
+            ret fail(e, "tmpl_unknown", cat3(a, "no template named ", named.ok, "; define it under templates in the spec, call template.define, or list templates"), "expand");
+        }
+        var prog: tmpl.Prog;
+        var te: tmpl.Err;
+        if (!ensure_prog(sp, ?t, ?prog, ?te)) { ret tmpl_fail(sp, e, ?te, "expand", named.ok); }
+        var path_i: usize = 0;
+        val has_path: bool = find_col(block.cols, block.ncol, "path", ?path_i);
+        val patterned: bool = t.pathpat != nil && t.pathpat[0] != 0;
+        var braces: bool = false;
+        if (patterned) { braces = has_braces(t.pathpat, str_len(t.pathpat)); }
+        if (!has_path && !patterned) {
+            ret fail(e, "expand_path", "this macro has no path; add a path column, or define the template with a path pattern such as load_{{table}}.py", "expand");
+        }
+        if (!has_path && patterned && !braces) {
+            var w: jw.Jw = jw.init(a);
+            jw.raw(?w, "{\"rows\":[");
+            var r: usize = 0;
+            for (r < block.nrow) {
+                if (r > 0) { jw.raw(?w, ","); }
+                write_object(?w, block.cols, block.rows[r].cells, block.ncol);
+                r = r + 1;
+            }
+            jw.raw(?w, "]}");
+            var obj: json.Value;
+            if (!parse_obj(a, ?w, ?obj)) { ret fail(e, "oom", "out of memory", "expand"); }
+            var c: tmpl.Ctx;
+            if (!row_ctx(sp, ?obj, ?c, 0, 1, false)) { ret fail(e, "tmpl_depth", "scopes nest deeper than 32", "expand"); }
+            var lang: str = lang_of(t.pathpat);
+            if (lang == nil) { lang = t.lang; }
+            if (lang == nil) { lang = "text"; }
+            var data: *u8 = nil;
+            var dn: usize = 0;
+            if (!render_with(sp, named.ok, lang, ?prog, ?c, ?data, ?dn, ?te)) { ret tmpl_fail(sp, e, ?te, "expand", named.ok); }
+            if (!place_file(sp, t.pathpat, str_len(t.pathpat), data, dn, e)) { ret false; }
+        }
+        or {
+            var r: usize = 0;
+            for (r < block.nrow) {
+                var w: jw.Jw = jw.init(a);
+                write_object(?w, block.cols, block.rows[r].cells, block.ncol);
+                var obj: json.Value;
+                if (!parse_obj(a, ?w, ?obj)) { ret fail(e, "oom", "out of memory", "expand"); }
+                var c: tmpl.Ctx;
+                if (!row_ctx(sp, ?obj, ?c, r::i64, block.nrow::i64, true)) { ret fail(e, "tmpl_depth", "scopes nest deeper than 32", "expand"); }
+                var pathp: *u8 = nil;
+                var pathn: usize = 0;
+                if (has_path) {
+                    pathp = block.rows[r].cells[path_i].p;
+                    pathn = block.rows[r].cells[path_i].n;
+                    if (pathn == 0) { ret fail(e, "expand_path", "a path cell is empty", "expand"); }
+                }
+                or {
+                    var pprog: tmpl.Prog;
+                    if (!tmpl.cache_prepare(?sp.pcache, a, t.pathpat, str_len(t.pathpat), ?pprog, ?te)) { ret tmpl_fail(sp, e, ?te, "expand", named.ok); }
+                    if (!render_with(sp, "path", "text", ?pprog, ?c, ?pathp, ?pathn, ?te)) { ret tmpl_fail(sp, e, ?te, "expand", named.ok); }
+                }
+                var lang: str = "text";
+                if (pathp != nil && pathn > 0) {
+                    val owned_path: res[str, A.Error] = util.dup_n(a, pathp, pathn);
+                    if (sel owned_path.err) { ret fail(e, "oom", "out of memory", "expand"); }
+                    val guess: str = lang_of(owned_path.ok);
+                    if (guess != nil) { lang = guess; }
+                    or (t.lang != nil) { lang = t.lang; }
+                }
+                var data: *u8 = nil;
+                var dn: usize = 0;
+                if (!render_with(sp, named.ok, lang, ?prog, ?c, ?data, ?dn, ?te)) { ret tmpl_fail(sp, e, ?te, "expand", named.ok); }
+                if (!place_file(sp, pathp, pathn, data, dn, e)) { ret false; }
+                r = r + 1;
+            }
+        }
+        b = b + 1;
+    }
+    ret true;
+}
+
+fun seen_path(sp: *Spec, folded: str) bool {
+    var i: usize = 0;
+    for (i < sp.folded.len) {
+        if (util.eq(sp.folded.data[i], folded)) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+fun lines_text(a: *A.Allocator, v: *json.Value, out: **u8, n: *usize) bool {
+    var w: jw.Jw = jw.init(a);
+    var i: usize = 0;
+    for (i < json.value_count(v)) {
+        val g: opt[*json.Value] = json.value_get(v, i);
+        if (sel g.some) {
+            if (!json.value_is_string(g.some)) { ret false; }
+            var p: *u8 = nil;
+            var pn: usize = 0;
+            if (!decode_value(a, g.some, ?p, ?pn)) { ret false; }
+            jw.bytes(?w, p, pn);
+            jw.byte(?w, '\n');
+        }
+        i = i + 1;
+    }
+    if (w.failed) { ret false; }
+    if (w.buf == nil) {
+        @out = "";
+        @n = 0;
+        ret true;
+    }
+    @out = w.buf;
+    @n = w.len;
+    ret true;
+}
+
+fun mode_of(s: str, out: *u8) bool {
+    if (util.eq(s, "create")) {
+        @out = commit.MODE_CREATE;
+        ret true;
+    }
+    if (util.eq(s, "replace")) {
+        @out = commit.MODE_REPLACE;
+        ret true;
+    }
+    if (util.eq(s, "upsert")) {
+        @out = commit.MODE_UPSERT;
+        ret true;
+    }
+    ret false;
+}
+
+# compare a value_key slice, which is not null-terminated, to a literal
+fun key_matches(k: str, klen: usize, lit: str) bool {
+    var i: usize = 0;
+    for (i < klen) {
+        if (lit[i] == 0 || k[i] != lit[i]) { ret false; }
+        i = i + 1;
+    }
+    ret lit[klen] == 0;
+}
+
+# push one warning per object key not in the allowed list; prefix says where it was seen
+fun key_warns(sp: *Spec, obj: *json.Value, allowed: *str, n_allowed: usize, prefix: str, out: *vector.Vector[str]) {
+    if (!json.value_is_object(obj)) { ret; }
+    var i: usize = 0;
+    for (i < json.value_count(obj)) {
+        val k: opt[str] = json.value_key(obj, i);
+        if (sel k.some) {
+            val kn: usize = json.value_key_len(obj, i);
+            var ok: bool = false;
+            var j: usize = 0;
+            for (j < n_allowed) {
+                if (key_matches(k.some, kn, allowed[j])) { ok = true; brk; }
+                j = j + 1;
+            }
+            if (!ok) {
+                var w: jw.Jw = jw.init(sp.a);
+                jw.raw(?w, prefix);
+                jw.raw(?w, ": unrecognized key \"");
+                jw.bytes(?w, k.some, kn);
+                jw.raw(?w, "\"; ignored");
+                if (!w.failed && w.buf != nil) { vector.push[str](out, w.buf); }
+            }
+        }
+        i = i + 1;
+    }
+}
+
+# warn about misspelled or unexpected top-level spec keys
+fun top_key_warns(sp: *Spec, args: *json.Value) {
+    val allowed: [27]str = [27]str{"files", "path", "text", "lines", "tmpl", "template", "json", "edits", "move", "delete", "mode", "expect", "check", "each", "with", "executable", "job", "dest", "dry_run", "prune", "durable", "diff", "tag", "run", "vars", "templates", "expand"};
+    key_warns(sp, args, ?allowed[0], 27, "spec", ?sp.warns);
+}
+
+# warn about misspelled or unexpected keys on a file entry and on each of its edits
+fun file_key_warns(sp: *Spec, fv: *json.Value, rel: str, out: *vector.Vector[str]) {
+    val fkeys: [15]str = [15]str{"path", "text", "lines", "tmpl", "template", "json", "edits", "move", "delete", "mode", "expect", "check", "each", "with", "executable"};
+    key_warns(sp, fv, ?fkeys[0], 15, rel, out);
+    val ef: opt[*json.Value] = json.value_find(fv, "edits");
+    if (sel ef.some) {
+        if (json.value_is_array(ef.some)) {
+            val ekeys: [15]str = [15]str{"find", "find_re", "replace", "lines", "with", "insert_before", "insert_after", "append", "prepend", "ex", "keys", "occurrence", "all", "count", "within"};
+            var i: usize = 0;
+            for (i < json.value_count(ef.some)) {
+                val g: opt[*json.Value] = json.value_get(ef.some, i);
+                if (sel g.some) { key_warns(sp, g.some, ?ekeys[0], 15, rel, out); }
+                i = i + 1;
+            }
+        }
+    }
+}
+
+fun count_sources(fv: *json.Value) i64 {
+    var n: i64 = 0;
+    val keys: [8]str = [8]str{"text", "lines", "tmpl", "template", "json", "edits", "move", "delete"};
+    var i: usize = 0;
+    for (i < 8) {
+        val f: opt[*json.Value] = json.value_find(fv, keys[i]);
+        if (sel f.some) { n = n + 1; }
+        i = i + 1;
+    }
+    ret n;
+}
+
+fun compile_one(sp: *Spec, fv: *json.Value, fi: usize, item: *json.Value, k: i64, count: i64, key: *u8, keyn: usize, e: *Err) bool {
+    val a: *A.Allocator = sp.a;
+    var c: tmpl.Ctx;
+    tmpl.ctx_init(?c);
+    tmpl.ctx_push(?c, sp.vars);
+    val with: opt[*json.Value] = json.value_find(fv, "with");
+    if (sel with.some) {
+        if (!json.value_is_object(with.some)) { ret fail(e, "spec_type", "with must be an object of variables", at(a, fi, "with")); }
+        tmpl.ctx_push(?c, with.some);
+    }
+    if (item != nil) { tmpl.ctx_push_item(?c, item, k, count, key, keyn); }
+
+    var raw_path: *u8 = nil;
+    var raw_n: usize = 0;
+    if (fstr(a, fv, "path", ?raw_path, ?raw_n) != 1 || raw_n == 0) {
+        ret fail(e, "spec_field", "each file needs a path string, relative to the workspace root", at(a, fi, "path"));
+    }
+    var given: *u8 = raw_path;
+    if (has_braces(raw_path, raw_n)) {
+        var te: tmpl.Err;
+        var out: *u8 = nil;
+        var on: usize = 0;
+        var pprog: tmpl.Prog;
+        if (!tmpl.cache_prepare(?sp.pcache, a, raw_path, raw_n, ?pprog, ?te)) {
+            ret tmpl_fail(sp, e, ?te, at(a, fi, "path"), raw_path);
+        }
+        if (!tmpl.render_prog(a, "path", "text", ?pprog, ?c, ?sp.tlib, ?sp.pcache, ?out, ?on, ?te)) {
+            ret tmpl_fail(sp, e, ?te, at(a, fi, "path"), raw_path);
+        }
+        given = out;
+    }
+    val canon: res[str, A.Error] = pathx.canonical(a, given);
+    if (sel canon.err) { ret fail(e, "oom", "out of memory", at(a, fi, "path")); }
+    val pr: i64 = pathx.check(canon.ok);
+    if (pr != pathx.P_OK) {
+        e.path = canon.ok;
+        ret fail(e, pathx.code(pr), pathx.message(pr), at(a, fi, "path"));
+    }
+    val rel: res[str, A.Error] = pathx.join(a, sp.dest, canon.ok);
+    if (sel rel.err) { ret fail(e, "oom", "out of memory", at(a, fi, "path")); }
+    e.path = rel.ok;
+    val folded: res[str, A.Error] = pathx.folded(a, rel.ok);
+    if (sel folded.err) { ret fail(e, "oom", "out of memory", at(a, fi, "path")); }
+    if (seen_path(sp, folded.ok)) {
+        ret fail(e, "duplicate_path", "two files resolve to the same path (paths compare without case); give each item of an each list a distinct path, for example with {{name}} in it", at(a, fi, "path"));
+    }
+    vector.push[str](?sp.folded, folded.ok);
+
+    val nsrc: i64 = count_sources(fv);
+    if (nsrc != 1) {
+        ret fail(e, "spec_content", "give exactly one of text, lines, tmpl, template, json, edits, move, or delete", at(a, fi, nil));
+    }
+    var lang: str = lang_of(rel.ok);
+    var data: *u8 = nil;
+    var dn: usize = 0;
+    var mode: u8 = sp.default_mode;
+    var edit_hash: [65]u8;
+    var edited: bool = false;
+    var normed: bool = false;
+    var mixed: bool = false;
+    var moved: bool = false;
+    var deleting: bool = false;
+
+    val text_f: opt[*json.Value] = json.value_find(fv, "text");
+    val lines_f: opt[*json.Value] = json.value_find(fv, "lines");
+    val tmpl_f: opt[*json.Value] = json.value_find(fv, "tmpl");
+    val tname_f: opt[*json.Value] = json.value_find(fv, "template");
+    val json_f: opt[*json.Value] = json.value_find(fv, "json");
+    val edits_f: opt[*json.Value] = json.value_find(fv, "edits");
+    val move_f: opt[*json.Value] = json.value_find(fv, "move");
+    val del_f: opt[*json.Value] = json.value_find(fv, "delete");
+
+    if (sel text_f.some) {
+        if (!json.value_is_string(text_f.some) || !decode_value(a, text_f.some, ?data, ?dn)) {
+            ret fail(e, "spec_type", "text must be a string", at(a, fi, "text"));
+        }
+    }
+    or (sel lines_f.some) {
+        if (!json.value_is_array(lines_f.some) || !lines_text(a, lines_f.some, ?data, ?dn)) {
+            ret fail(e, "spec_type", "lines must be a list of strings", at(a, fi, "lines"));
+        }
+    }
+    or (sel tmpl_f.some) {
+        var body: *u8 = nil;
+        var bn: usize = 0;
+        if (!json.value_is_string(tmpl_f.some) || !decode_value(a, tmpl_f.some, ?body, ?bn)) {
+            ret fail(e, "spec_type", "tmpl must be a string of template text", at(a, fi, "tmpl"));
+        }
+        var te: tmpl.Err;
+        var tl: str = lang;
+        if (tl == nil) { tl = "text"; }
+        var iprog: tmpl.Prog;
+        if (!tmpl.cache_prepare(?sp.pcache, a, body, bn, ?iprog, ?te)) {
+            ret tmpl_fail(sp, e, ?te, at(a, fi, "tmpl"), rel.ok);
+        }
+        if (!tmpl.render_prog(a, rel.ok, tl, ?iprog, ?c, ?sp.tlib, ?sp.pcache, ?data, ?dn, ?te)) {
+            ret tmpl_fail(sp, e, ?te, at(a, fi, "tmpl"), rel.ok);
+        }
+    }
+    or (sel tname_f.some) {
+        var name: *u8 = nil;
+        var nn: usize = 0;
+        if (!json.value_is_string(tname_f.some) || !decode_value(a, tname_f.some, ?name, ?nn)) {
+            ret fail(e, "spec_type", "template must be a template name", at(a, fi, "template"));
+        }
+        var t: Tpl;
+        if (!find_tpl(sp, name, ?t)) {
+            ret fail(e, "tmpl_unknown", cat3(a, "no template named ", name, "; define it under templates in the spec, call template.define, or list templates"), at(a, fi, "template"));
+        }
+        var tl: str = lang;
+        if (tl == nil) { tl = t.lang; }
+        if (tl == nil) { tl = "text"; }
+        var te: tmpl.Err;
+        var nprog: tmpl.Prog;
+        if (!ensure_prog(sp, ?t, ?nprog, ?te)) { ret tmpl_fail(sp, e, ?te, at(a, fi, "template"), rel.ok); }
+        if (!tmpl.render_prog(a, t.name, tl, ?nprog, ?c, ?sp.tlib, ?sp.pcache, ?data, ?dn, ?te)) {
+            ret tmpl_fail(sp, e, ?te, at(a, fi, "template"), rel.ok);
+        }
+    }
+    or (sel json_f.some) {
+        var w: jw.Jw = jw.init(a);
+        emit_json(?w, json_f.some, true, 0);
+        jw.byte(?w, '\n');
+        if (w.failed) { ret fail(e, "oom", "out of memory", at(a, fi, "json")); }
+        data = w.buf;
+        dn = w.len;
+    }
+    or (sel edits_f.some) {
+        val full: res[str, A.Error] = pathx.native(a, sp.root, rel.ok);
+        if (sel full.err) { ret fail(e, "oom", "out of memory", at(a, fi, "edits")); }
+        val cur: res[vector.Vector[u8], filesystem.FsError] = filesystem.read_bytes(a, full.ok);
+        if (sel cur.err) {
+            ret fail(e, "edit_missing", "the file to edit does not exist or cannot be read; create it with text instead", at(a, fi, "edits"));
+        }
+        val cp: *u8 = cur.ok.data;
+        val cn: usize = cur.ok.len;
+        commit.hash_hex(cp, cn, ?edit_hash[0]);
+        var given_expect: *u8 = nil;
+        var gn: usize = 0;
+        if (fstr(a, fv, "expect", ?given_expect, ?gn) == 1 && !util.eq(given_expect, ?edit_hash[0])) {
+            e.code = "stale";
+            e.msg = cat3(a, "the file changed since expect was read; its sha256 is now ", ?edit_hash[0], "");
+            e.field = at(a, fi, "expect");
+            ret false;
+        }
+        var ee: edit.Err;
+        var src: *u8 = cp;
+        if (src == nil) { src = ""; }
+        if (!edit.apply(a, rel.ok, src, cn, edits_f.some, ?data, ?dn, ?ee, ?normed, ?mixed)) {
+            e.code = ee.code;
+            e.msg = ee.msg;
+            e.line = ee.line;
+            var w: jw.Jw = jw.init(a);
+            jw.raw(?w, at(a, fi, "edits"));
+            jw.raw(?w, "[");
+            var num: [24]u8;
+            val m: usize = util.fmt_i64(?num[0], 24, ee.index);
+            jw.bytes(?w, ?num[0], m);
+            jw.raw(?w, "]");
+            e.field = w.buf;
+            ret false;
+        }
+        mode = commit.MODE_REPLACE;
+        edited = true;
+    }
+    or (sel move_f.some) {
+        var mp: *u8 = nil;
+        var mn: usize = 0;
+        if (!json.value_is_string(move_f.some) || !decode_value(a, move_f.some, ?mp, ?mn) || mn == 0) {
+            ret fail(e, "spec_type", "move must be a source path, relative like path", at(a, fi, "move"));
+        }
+        val mcanon: res[str, A.Error] = pathx.canonical(a, mp);
+        if (sel mcanon.err) { ret fail(e, "oom", "out of memory", at(a, fi, "move")); }
+        val mpr: i64 = pathx.check(mcanon.ok);
+        if (mpr != pathx.P_OK) {
+            e.path = mcanon.ok;
+            ret fail(e, pathx.code(mpr), pathx.message(mpr), at(a, fi, "move"));
+        }
+        val mrel: res[str, A.Error] = pathx.join(a, sp.dest, mcanon.ok);
+        if (sel mrel.err) { ret fail(e, "oom", "out of memory", at(a, fi, "move")); }
+        val mfolded: res[str, A.Error] = pathx.folded(a, mrel.ok);
+        if (sel mfolded.err) { ret fail(e, "oom", "out of memory", at(a, fi, "move")); }
+        if (util.eq(mfolded.ok, folded.ok)) {
+            ret fail(e, "move_same", "move's source and path are the same file", at(a, fi, "move"));
+        }
+        if (seen_path(sp, mfolded.ok)) {
+            ret fail(e, "duplicate_path", "the move source is also written by this spec", at(a, fi, "move"));
+        }
+        vector.push[str](?sp.folded, mfolded.ok);
+        val mfull: res[str, A.Error] = pathx.native(a, sp.root, mrel.ok);
+        if (sel mfull.err) { ret fail(e, "oom", "out of memory", at(a, fi, "move")); }
+        val cur: res[vector.Vector[u8], filesystem.FsError] = filesystem.read_bytes(a, mfull.ok);
+        if (sel cur.err) {
+            ret fail(e, "edit_missing", "the file to move does not exist or cannot be read", at(a, fi, "move"));
+        }
+        data = cur.ok.data;
+        dn = cur.ok.len;
+        commit.hash_hex(data, dn, ?edit_hash[0]);
+        var gxp: *u8 = nil;
+        var gxn: usize = 0;
+        if (fstr(a, fv, "expect", ?gxp, ?gxn) == 1 && !util.eq(gxp, ?edit_hash[0])) {
+            e.code = "stale";
+            e.msg = cat3(a, "the move source changed since expect was read; its sha256 is now ", ?edit_hash[0], "");
+            e.field = at(a, fi, "expect");
+            ret false;
+        }
+        val del_added: res[usize, A.Error] = commit.add(?sp.set, mrel.ok, nil, 0, commit.MODE_DELETE);
+        if (sel del_added.err) { ret fail(e, "oom", "out of memory", at(a, fi, "move")); }
+        commit.set_expect(commit.entry(?sp.set, del_added.ok), ?edit_hash[0]);
+        moved = true;
+    }
+    or (sel del_f.some) {
+        if (!json.value_is_bool(del_f.some) || !json.value_bool(del_f.some)) {
+            ret fail(e, "spec_type", "delete must be true", at(a, fi, "delete"));
+        }
+        mode = commit.MODE_DELETE;
+        deleting = true;
+    }
+
+    var mstr: *u8 = nil;
+    var mn: usize = 0;
+    val ms: i64 = fstr(a, fv, "mode", ?mstr, ?mn);
+    if (ms == -1) { ret fail(e, "spec_type", "mode must be create, replace, or upsert", at(a, fi, "mode")); }
+    if (ms == 1 && !edited && !deleting) {
+        if (!mode_of(mstr, ?mode)) { ret fail(e, "spec_mode", "mode must be create, replace, or upsert", at(a, fi, "mode")); }
+    }
+
+    if (data == nil && !deleting) { data = ""; }
+    if (dn > MAX_FILE_BYTES) { ret fail(e, "too_large", "a file is larger than 8 MiB", at(a, fi, nil)); }
+    sp.total = sp.total + dn;
+    if (sp.total > MAX_TOTAL_BYTES) { ret fail(e, "too_large", "the change set is larger than 64 MiB", at(a, fi, nil)); }
+    if (commit.count(?sp.set) >= MAX_FILES) { ret fail(e, "too_many_files", "a change set holds at most 1024 files", at(a, fi, nil)); }
+
+    val added: res[usize, A.Error] = commit.add(?sp.set, rel.ok, data, dn, mode);
+    if (sel added.err) { ret fail(e, "oom", "out of memory", at(a, fi, nil)); }
+    val ent: *commit.Entry = commit.entry(?sp.set, added.ok);
+
+    var xp: *u8 = nil;
+    var xn: usize = 0;
+    val xs: i64 = fstr(a, fv, "expect", ?xp, ?xn);
+    if (xs == -1) { ret fail(e, "spec_type", "expect must be a sha256 hex string", at(a, fi, "expect")); }
+    if (edited) { commit.set_expect(ent, ?edit_hash[0]); }
+    or (xs == 1 && !moved) {
+        if (!commit.set_expect(ent, xp)) { ret fail(e, "spec_expect", "expect must be 64 hex digits, the sha256 that read or a receipt reported", at(a, fi, "expect")); }
+    }
+
+    var cname: *u8 = nil;
+    var cnn: usize = 0;
+    val cb: i64 = fbool(fv, "check");
+    if (cb == -1) {
+        if (fstr(a, fv, "check", ?cname, ?cnn) == 1) {
+            val canon_name: str = checker_name(cname);
+            if (canon_name == nil && !util.eq(cname, "none")) {
+                ret fail(e, "spec_check", "check must be true, false, none, python, node, powershell, bash, json, or toml", at(a, fi, "check"));
+            }
+            lang = canon_name;
+        }
+        or { ret fail(e, "spec_type", "check must be a boolean or a checker name", at(a, fi, "check")); }
+    }
+    or {
+        val present: opt[*json.Value] = json.value_find(fv, "check");
+        if (sel present.some) {
+            if (cb == 0) { lang = nil; }
+        }
+    }
+    if (deleting) { lang = nil; }
+    ent.lang = lang;
+    ent.exec = fbool(fv, "executable") == 1 || (dn >= 2 && data[0] == '#' && data[1] == '!');
+    ent.edited = edited;
+    if (normed) { commit.note(ent, "line endings normalized to match the file's; the find text applied as given"); }
+    if (mixed) { commit.note(ent, "the file has mixed line endings; find text matched byte-exact with no normalization"); }
+    file_key_warns(sp, fv, rel.ok, ?ent.notes);
+    sp.files = sp.files + 1;
+    ret true;
+}
+
+fun compile_file(sp: *Spec, fv: *json.Value, fi: usize, e: *Err) bool {
+    val a: *A.Allocator = sp.a;
+    if (!json.value_is_object(fv)) { ret fail(e, "spec_type", "each entry of files must be an object", at(a, fi, nil)); }
+    val each: opt[*json.Value] = json.value_find(fv, "each");
+    if (sel each.some) {
+        var list: *json.Value = each.some;
+        if (json.value_is_string(list)) {
+            var name: *u8 = nil;
+            var nn: usize = 0;
+            if (!decode_value(a, list, ?name, ?nn)) { ret fail(e, "spec_type", "each must be a list or the name of a list", at(a, fi, "each")); }
+            var found: *json.Value = nil;
+            val with: opt[*json.Value] = json.value_find(fv, "with");
+            if (sel with.some) {
+                val g: opt[*json.Value] = json.value_find(with.some, name);
+                if (sel g.some) { found = g.some; }
+            }
+            if (found == nil) {
+                val g: opt[*json.Value] = json.value_find(sp.vars, name);
+                if (sel g.some) { found = g.some; }
+            }
+            if (found == nil) {
+                var w: jw.Jw = jw.init(a);
+                jw.raw(?w, "each names ");
+                jw.raw(?w, name);
+                jw.raw(?w, ", which is not a variable in with or vars. each takes a list (or the name of a list in vars) and writes one file per item; vars has: ");
+                var k: usize = 0;
+                for (k < json.value_count(sp.vars)) {
+                    val key: opt[str] = json.value_key(sp.vars, k);
+                    if (sel key.some) {
+                        if (k > 0) { jw.raw(?w, ", "); }
+                        jw.bytes(?w, key.some, json.value_key_len(sp.vars, k));
+                    }
+                    k = k + 1;
+                }
+                if (json.value_count(sp.vars) == 0) { jw.raw(?w, "nothing"); }
+                ret fail(e, "spec_each", jw.text(?w), at(a, fi, "each"));
+            }
+            list = found;
+        }
+        if (!json.value_is_array(list) && !json.value_is_object(list)) {
+            ret fail(e, "spec_each", "each must be a list, an object, or the name of one in vars", at(a, fi, "each"));
+        }
+        var pp: *u8 = nil;
+        var ppn: usize = 0;
+        if (fstr(a, fv, "path", ?pp, ?ppn) == 1 && !has_braces(pp, ppn) && json.value_count(list) > 1) {
+            ret fail(e, "spec_each_path", "each writes one file per item, but this path has no {{...}} in it, so every item would write the same file. put the item's name in the path, such as report_{{table}}.py, or drop each", at(a, fi, "path"));
+        }
+        val count: usize = json.value_count(list);
+        var k: usize = 0;
+        for (k < count) {
+            val g: opt[*json.Value] = json.value_get(list, k);
+            if (sel g.some) {
+                var key: *u8 = nil;
+                var keyn: usize = 0;
+                if (json.value_is_object(list)) {
+                    val kk: opt[str] = json.value_key(list, k);
+                    if (sel kk.some) {
+                        key = kk.some;
+                        keyn = json.value_key_len(list, k);
+                    }
+                }
+                if (!compile_one(sp, fv, fi, g.some, k::i64, count::i64, key, keyn, e)) { ret false; }
+            }
+            k = k + 1;
+        }
+        ret true;
+    }
+    ret compile_one(sp, fv, fi, nil, 0, 1, nil, 0, e);
+}
+
+fun add_template(sp: *Spec, name: *u8, nn: usize, v: *json.Value, e: *Err) bool {
+    val a: *A.Allocator = sp.a;
+    var t: Tpl;
+    val copy: res[str, A.Error] = util.dup_n(a, name, nn);
+    if (sel copy.err) { ret fail(e, "oom", "out of memory", "templates"); }
+    t.name = copy.ok;
+    t.src = "spec";
+    if (json.value_is_string(v)) {
+        if (!decode_value(a, v, ?t.body, ?t.len)) { ret fail(e, "spec_type", "a template must be a string or an object with text", "templates"); }
+    }
+    or (json.value_is_object(v)) {
+        val tf: opt[*json.Value] = json.value_find(v, "text");
+        val lf: opt[*json.Value] = json.value_find(v, "lines");
+        if (sel tf.some) {
+            if (!json.value_is_string(tf.some) || !decode_value(a, tf.some, ?t.body, ?t.len)) {
+                ret fail(e, "spec_type", "a template's text must be a string", cat3(a, "templates.", t.name, ".text"));
+            }
+        }
+        or (sel lf.some) {
+            if (!json.value_is_array(lf.some) || !lines_text(a, lf.some, ?t.body, ?t.len)) {
+                ret fail(e, "spec_type", "a template's lines must be a list of strings", cat3(a, "templates.", t.name, ".lines"));
+            }
+        }
+        or { ret fail(e, "spec_field", "a template object needs text or lines", cat3(a, "templates.", t.name, "")); }
+        var lp: *u8 = nil;
+        var ln: usize = 0;
+        if (fstr(a, v, "lang", ?lp, ?ln) == 1) {
+            var canon_name: str = checker_name(lp);
+            if (canon_name == nil) { canon_name = lp; }
+            t.lang = canon_name;
+        }
+        var pp: *u8 = nil;
+        var pn: usize = 0;
+        if (fstr(a, v, "path", ?pp, ?pn) == 1) { t.pathpat = pp; }
+    }
+    or { ret fail(e, "spec_type", "a template must be a string or an object with text", cat3(a, "templates.", t.name, "")); }
+    var te: tmpl.Err;
+    if (!tmpl.prepare(a, t.body, t.len, ?t.prog, ?te)) { ret tmpl_fail(sp, e, ?te, cat3(a, "templates.", t.name, ""), t.name); }
+    vector.push[Tpl](?sp.inline, t);
+    ret true;
+}
+
+# the job's manifest: every file it holds, by path relative to the job, with its hash
+fun add_manifest(sp: *Spec, e: *Err) bool {
+    val a: *A.Allocator = sp.a;
+    var w: jw.Jw = jw.init(a);
+    jw.obj(?w);
+    jw.f_str(?w, "qark", VERSION);
+    jw.f_str(?w, "job", sp.job);
+    jw.f_str(?w, "spec_sha256", ?sp.sha[0]);
+    jw.key(?w, "files");
+    jw.arr(?w);
+    val prefix_n: usize = str_len(sp.dest) + 1;
+    var i: usize = 0;
+    for (i < commit.count(?sp.set)) {
+        val ent: *commit.Entry = commit.entry(?sp.set, i);
+        if (ent.mode != commit.MODE_DELETE) {
+            jw.obj(?w);
+            jw.f_str(?w, "path", (ent.rel::usize + prefix_n)::*u8);
+            jw.f_str(?w, "sha256", ?ent.sha[0]);
+            jw.f_i64(?w, "bytes", ent.len::i64);
+            if (ent.lang != nil) { jw.f_str(?w, "lang", ent.lang); }
+            if (ent.exec) { jw.f_bool(?w, "executable", true); }
+            jw.obj_end(?w);
+        }
+        i = i + 1;
+    }
+    jw.arr_end(?w);
+    if (sp.run != nil) {
+        jw.key(?w, "run");
+        var rw: jw.Jw = jw.init(a);
+        emit_json(?rw, sp.run, false, 0);
+        jw.raw_v(?w, jw.text(?rw));
+    }
+    jw.obj_end(?w);
+    jw.byte(?w, '\n');
+    if (w.failed) { ret fail(e, "oom", "out of memory", "job"); }
+    val rel: res[str, A.Error] = pathx.join(a, sp.dest, "manifest.json");
+    if (sel rel.err) { ret fail(e, "oom", "out of memory", "job"); }
+    val folded: res[str, A.Error] = pathx.folded(a, rel.ok);
+    if (sel folded.err) { ret fail(e, "oom", "out of memory", "job"); }
+    if (seen_path(sp, folded.ok)) { ret fail(e, "duplicate_path", "manifest.json is written by qark in a job; name your file something else", "files"); }
+    vector.push[str](?sp.folded, folded.ok);
+    val added: res[usize, A.Error] = commit.add(?sp.set, rel.ok, w.buf, w.len, commit.MODE_UPSERT);
+    if (sel added.err) { ret fail(e, "oom", "out of memory", "job"); }
+    commit.entry(?sp.set, added.ok).lang = "json";
+    sp.manifest = added.ok::i64;
+    ret true;
+}
+
+# delete files the previous manifest listed that this spec no longer produces
+fun prune_old(sp: *Spec, e: *Err) bool {
+    val a: *A.Allocator = sp.a;
+    val rel: res[str, A.Error] = pathx.join(a, sp.dest, "manifest.json");
+    if (sel rel.err) { ret fail(e, "oom", "out of memory", "prune"); }
+    val full: res[str, A.Error] = pathx.native(a, sp.root, rel.ok);
+    if (sel full.err) { ret fail(e, "oom", "out of memory", "prune"); }
+    val text: res[str, filesystem.FsError] = filesystem.read_string(a, full.ok);
+    if (sel text.err) { ret true; }
+    val parsed: res[json.Value, json.JsonError] = json.parse(text.ok, str_len(text.ok), a);
+    if (sel parsed.err) { ret true; }
+    var doc: json.Value = parsed.ok;
+    val files: opt[*json.Value] = json.value_find(?doc, "files");
+    if (!sel files.some) { ret true; }
+    if (!json.value_is_array(files.some)) { ret true; }
+    var i: usize = 0;
+    for (i < json.value_count(files.some)) {
+        val g: opt[*json.Value] = json.value_get(files.some, i);
+        if (sel g.some) {
+            var p: *u8 = nil;
+            var pn: usize = 0;
+            var hp: *u8 = nil;
+            var hn: usize = 0;
+            if (fstr(a, g.some, "path", ?p, ?pn) == 1 && pathx.check(p) == pathx.P_OK) {
+                val canon: res[str, A.Error] = pathx.canonical(a, p);
+                if (sel canon.ok) {
+                    val old_rel: res[str, A.Error] = pathx.join(a, sp.dest, canon.ok);
+                    if (sel old_rel.ok) {
+                        val folded: res[str, A.Error] = pathx.folded(a, old_rel.ok);
+                        if (sel folded.ok) {
+                            if (!seen_path(sp, folded.ok)) {
+                                val old_full: res[str, A.Error] = pathx.native(a, sp.root, old_rel.ok);
+                                var present: bool = false;
+                                if (sel old_full.ok) {
+                                    val ex: res[bool, io_error.Error] = filesystem.exists(old_full.ok);
+                                    if (sel ex.ok) { present = ex.ok; }
+                                }
+                                if (present) {
+                                    val added: res[usize, A.Error] = commit.add(?sp.set, old_rel.ok, nil, 0, commit.MODE_DELETE);
+                                    if (sel added.ok) {
+                                        if (fstr(a, g.some, "sha256", ?hp, ?hn) == 1) { commit.set_expect(commit.entry(?sp.set, added.ok), hp); }
+                                    }
+                                    vector.push[str](?sp.folded, folded.ok);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        i = i + 1;
+    }
+    ret true;
+}
+
+pub fun fbool_pub(obj: *json.Value, key: str) bool {
+    ret fbool(obj, key) == 1;
+}
+
+pub fun decode_pub(a: *A.Allocator, v: *json.Value, out: **u8, n: *usize) bool {
+    ret decode_value(a, v, out, n);
+}
+
+pub fun lines_pub(a: *A.Allocator, v: *json.Value, out: **u8, n: *usize) bool {
+    ret lines_text(a, v, out, n);
+}
+
+pub fun partial_find_pub(ctx: *u8, name: str, body: **u8, len: *usize, lang: *str) bool {
+    ret partial_find(ctx, name, body, len, lang);
+}
+
+# compile args into sp.set; raw is the request text the spec was parsed from
+pub fun compile(sp: *Spec, a: *A.Allocator, root: str, args: *json.Value, raw: *u8, raw_n: usize, lib: *Lib, e: *Err) bool {
+    sp.a = a;
+    sp.root = root;
+    sp.set = commit.init(a, root);
+    sp.inline = vector.init[Tpl](a);
+    sp.folded = vector.init[str](a);
+    sp.warns = vector.init[str](a);
+    tmpl.cache_init(?sp.pcache, a);
+    sp.lib = lib;
+    sp.tlib.ctx = (sp::usize)::*u8;
+    sp.tlib.find = partial_find;
+    sp.check = CHECK_ON;
+    sp.manifest = -1;
+    sp.dest = "";
+    sp.empty.kind = json.OBJECT;
+    sp.vars = ?sp.empty;
+    commit.hash_hex(raw, raw_n, ?sp.sha[0]);
+    e.code = nil;
+    e.msg = nil;
+    e.field = nil;
+    e.path = nil;
+    e.line = 0;
+    e.tname = nil;
+    if (!json.value_is_object(args)) { ret fail(e, "spec_type", "a spec is a json object with files, or with path and text", "spec"); }
+
+    var jp: *u8 = nil;
+    var jn: usize = 0;
+    val js: i64 = fstr(a, args, "job", ?jp, ?jn);
+    if (js == -1) { ret fail(e, "spec_type", "job must be a string", "job"); }
+    if (js == 1) {
+        val r: i64 = pathx.check(jp);
+        val slash: opt[usize] = util.index_byte(jp, jn, '/');
+        val bslash: opt[usize] = util.index_byte(jp, jn, '\\');
+        if (r != pathx.P_OK || sel slash.some || sel bslash.some) {
+            ret fail(e, "spec_job", "job must be one path segment such as etl-users", "job");
+        }
+    }
+    var dp: *u8 = nil;
+    var dpn: usize = 0;
+    val ds: i64 = fstr(a, args, "dest", ?dp, ?dpn);
+    if (ds == -1) { ret fail(e, "spec_type", "dest must be a string", "dest"); }
+    var dest: str = "";
+    if (ds == 1 && dpn > 0 && !util.eq(dp, ".")) {
+        val canon: res[str, A.Error] = pathx.canonical(a, dp);
+        if (sel canon.err) { ret fail(e, "oom", "out of memory", "dest"); }
+        val r: i64 = pathx.check(canon.ok);
+        if (r != pathx.P_OK) {
+            e.path = canon.ok;
+            ret fail(e, pathx.code(r), pathx.message(r), "dest");
+        }
+        dest = canon.ok;
+    }
+    sp.default_mode = commit.MODE_CREATE;
+    if (js == 1) {
+        sp.job = jp;
+        var base: str = dest;
+        if (ds != 1) { base = "jobs"; }
+        val d: res[str, A.Error] = pathx.join(a, base, jp);
+        if (sel d.err) { ret fail(e, "oom", "out of memory", "job"); }
+        sp.dest = d.ok;
+        sp.default_mode = commit.MODE_UPSERT;
+    }
+    or { sp.dest = dest; }
+
+    var mp: *u8 = nil;
+    var mpn: usize = 0;
+    val mss: i64 = fstr(a, args, "mode", ?mp, ?mpn);
+    if (mss == -1) { ret fail(e, "spec_type", "mode must be create, replace, or upsert", "mode"); }
+    if (mss == 1 && !mode_of(mp, ?sp.default_mode)) { ret fail(e, "spec_mode", "mode must be create, replace, or upsert", "mode"); }
+
+    val dry: i64 = fbool(args, "dry_run");
+    if (dry == -1) { ret fail(e, "spec_type", "dry_run must be a boolean", "dry_run"); }
+    sp.dry = dry == 1;
+    val prune: i64 = fbool(args, "prune");
+    if (prune == -1) { ret fail(e, "spec_type", "prune must be a boolean", "prune"); }
+    sp.prune = prune == 1;
+    if (sp.prune && js != 1) { ret fail(e, "spec_prune", "prune only applies to a job", "prune"); }
+    val durable: i64 = fbool(args, "durable");
+    if (durable == -1) { ret fail(e, "spec_type", "durable must be a boolean", "durable"); }
+    sp.set.durable = durable == 1;
+    val difff: i64 = fbool(args, "diff");
+    if (difff == -1) { ret fail(e, "spec_type", "diff must be a boolean", "diff"); }
+    sp.diff = difff == 1;
+
+    val chk: opt[*json.Value] = json.value_find(args, "check");
+    if (sel chk.some) {
+        if (json.value_is_bool(chk.some)) {
+            if (!json.value_bool(chk.some)) { sp.check = CHECK_OFF; }
+        }
+        or {
+            var cp: *u8 = nil;
+            var cpn: usize = 0;
+            if (fstr(a, args, "check", ?cp, ?cpn) == 1 && util.eq(cp, "required")) { sp.check = CHECK_REQUIRED; }
+            or { ret fail(e, "spec_type", "check must be true, false, or \"required\"", "check"); }
+        }
+    }
+    var tp: *u8 = nil;
+    var tpn: usize = 0;
+    if (fstr(a, args, "tag", ?tp, ?tpn) == 1) { sp.tag = tp; }
+    val run: opt[*json.Value] = json.value_find(args, "run");
+    if (sel run.some) { sp.run = run.some; }
+
+    val vars: opt[*json.Value] = json.value_find(args, "vars");
+    if (sel vars.some) {
+        if (!json.value_is_object(vars.some)) { ret fail(e, "spec_type", "vars must be an object", "vars"); }
+        sp.vars = vars.some;
+    }
+    val tpls: opt[*json.Value] = json.value_find(args, "templates");
+    if (sel tpls.some) {
+        if (!json.value_is_object(tpls.some)) { ret fail(e, "spec_type", "templates must be an object of name to template text", "templates"); }
+        var i: usize = 0;
+        for (i < json.value_count(tpls.some)) {
+            val k: opt[str] = json.value_key(tpls.some, i);
+            val g: opt[*json.Value] = json.value_get(tpls.some, i);
+            if (sel k.some) {
+                if (sel g.some) {
+                    if (!add_template(sp, k.some, json.value_key_len(tpls.some, i), g.some, e)) { ret false; }
+                }
+            }
+            i = i + 1;
+        }
+    }
+
+    var ep: *u8 = nil;
+    var en: usize = 0;
+    val es: i64 = fstr(a, args, "expand", ?ep, ?en);
+    if (es == -1) { ret fail(e, "spec_type", "expand must be a string of @macro tables", "expand"); }
+    if (es == 1) {
+        if (!compile_expand(sp, ep, en, e)) { ret false; }
+    }
+
+    val files: opt[*json.Value] = json.value_find(args, "files");
+    if (sel files.some) {
+        if (!json.value_is_array(files.some)) { ret fail(e, "spec_type", "files must be a list of file entries", "files"); }
+        var i: usize = 0;
+        for (i < json.value_count(files.some)) {
+            val g: opt[*json.Value] = json.value_get(files.some, i);
+            if (sel g.some) {
+                if (!compile_file(sp, g.some, i, e)) { ret false; }
+            }
+            i = i + 1;
+        }
+    }
+    or {
+        val single: opt[*json.Value] = json.value_find(args, "path");
+        if (sel single.some) {
+            if (!compile_file(sp, args, 0, e)) { ret false; }
+        }
+    }
+    if (commit.count(?sp.set) == 0 && !sp.prune) {
+        ret fail(e, "spec_files", "the spec lists no files; give files, path with text, or an expand table", "files");
+    }
+    top_key_warns(sp, args);
+    if (js == 1) {
+        if (sp.prune && !prune_old(sp, e)) { ret false; }
+        if (!add_manifest(sp, e)) { ret false; }
+    }
+    ret true;
+}

@@ -1,0 +1,6 @@
+;; javascript profile
+
+(def lang-javascript "javascript")
+(def js-comment "//")
+(def js-indent 2)
+(def js-function "function NAME(PARAMS) {\n  BODY\n}\n")

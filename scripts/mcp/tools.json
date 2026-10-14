@@ -1,0 +1,117 @@
+[
+  {
+    "name": "qark_apply",
+    "title": "Write files",
+    "description": "Create, replace, edit, move, or delete files under the workspace root in one atomic change set. Every file is rendered and syntax-checked (Python, Node, PowerShell, Bash, JSON, TOML) before anything is written; a conflict or failed check writes nothing. Re-sending the same request is safe: identical files report unchanged. The receipt lists each file's status, sha256, bytes, and check result. A new file must not exist unless mode is replace or upsert; to change an existing file, pass edits (exact find, regex find_re, a line range, or anchored inserts) or mode replace with expect set to its current sha256 from qark_read. move renames a file atomically: path is the destination and expect pins the source's sha256. Set diff true to get a unified diff of every change in the receipt, and combine it with dry_run to preview before writing. Use templates with each to fan one template out over a list (one call, many scripts). For a template that already exists, prefer expand: an @template block, a header row, and one record per line. job writes a self-contained directory under jobs/<job> with a manifest.json for the executor.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "files": {
+          "type": "array",
+          "description": "What should exist afterwards. Each entry has a path and exactly one of text, lines, tmpl, template, json, edits, move, or delete.",
+          "items": {
+            "type": "object",
+            "properties": {
+              "path": { "type": "string", "description": "Relative to the workspace root (or to jobs/<job>). May use {{vars}}." },
+              "text": { "type": "string", "description": "The file's bytes as written." },
+              "lines": { "type": "array", "items": { "type": "string" }, "description": "Lines joined with \\n, ending in \\n." },
+              "tmpl": { "type": "string", "description": "Inline Handlebars-style template: {{name}}, {{#each xs}}, {{#if x}}, {{x|py}} literal filters for py js json ps sh." },
+              "template": { "type": "string", "description": "Name of a template from templates, qark_templates, or the builtins (py/script, py/pytest, js/script, ps1/script, sh/script)." },
+              "json": { "description": "Any JSON value, written as pretty JSON." },
+              "edits": {
+                "type": "array",
+                "description": "Edits to the current file, in order. Each is one of: {find, replace, all?, count?, occurrence?, within?}; {find_re: regex, replace: text with \\0-\\9 captures, all?, count?, occurrence?, within?}; {lines:[first,last], with}; {insert_before|insert_after: N or \"text\" or {find|find_re, occurrence?}, with}; {append}, {prepend}; {ex: vim ex command like %s/a/b/g}; {keys: vim normal-mode keys}. within limits an edit to a span: [first,last] lines, a string, or {find|find_re, occurrence?} naming the span's text. occurrence picks the Nth match, -N counts back; ambiguous matches are refused unless occurrence, count, or all is set.",
+                "items": { "type": "object" }
+              },
+              "move": { "type": "string", "description": "Source path moved to this path atomically: the destination gets the source's bytes and the source is deleted in the same commit. expect pins the source's sha256; a stale source refuses the whole apply." },
+              "delete": { "type": "boolean", "description": "true removes the file." },
+              "with": { "type": "object", "description": "Variables for this entry's template, layered over vars." },
+              "each": { "description": "A list (or the name of a list in vars) to fan this entry out over; the item's fields become variables, plus {{@index}}." },
+              "mode": { "type": "string", "enum": ["create", "replace", "upsert"], "description": "create (default) refuses an existing file with different content; replace requires it to exist; upsert does either." },
+              "expect": { "type": "string", "description": "sha256 the current file must have, from qark_read or a receipt. With move it pins the source." },
+              "check": { "description": "false to skip the syntax check, or a checker name: python, node, powershell, bash, json, toml." },
+              "executable": { "type": "boolean" }
+            },
+            "required": ["path"]
+          }
+        },
+        "vars": { "type": "object", "description": "Variables every template can read." },
+        "templates": { "type": "object", "description": "Inline templates by name: a string, or {text|lines, lang}." },
+        "job": { "type": "string", "description": "Write under jobs/<job>/ and add manifest.json with every file's sha256." },
+        "dest": { "type": "string", "description": "Base directory for relative paths (default the workspace root, or jobs for a job)." },
+        "run": { "description": "With job: how the executor should run it, recorded in manifest.json, e.g. {\"argv\": [\"python\", \"main.py\"], \"timeout_ms\": 30000}." },
+        "prune": { "type": "boolean", "description": "With job: delete files the previous manifest listed that this spec no longer produces." },
+        "dry_run": { "type": "boolean", "description": "Render and check everything, report what would happen, write nothing." },
+        "preview": { "type": "boolean", "description": "With dry_run: include each file's rendered text in the receipt." },
+        "diff": { "type": "boolean", "description": "Include a unified diff of each changed file in the receipt. With dry_run it previews the change." },
+        "check": { "description": "true (default), false, or \"required\" to refuse when a checker is missing." },
+        "expand": { "type": "string", "description": "Shorthand tables. Each block is @template, a header row split on |, then one record per line. A blank line ends a block. A path column names the file; otherwise the template's path pattern is used. A pattern with no {{ and no path column writes one file and the template reads {{#each rows}}." },
+        "tag": { "type": "string", "description": "Who or what is writing, recorded in .qark/journal.ndjson." }
+      }
+    }
+  },
+  {
+    "name": "qark_read",
+    "title": "Read files",
+    "description": "Read files under the workspace root with their sha256, byte count, and line count, so a later qark_apply can edit them with expect. A directory path lists its entries; \".\" is the root. Use lines [first, last] to read part of a file, and outline true to get a symbol list (functions, classes, types, sections) without the file's text.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "path": { "type": "string" },
+        "paths": { "type": "array", "items": { "type": "string" } },
+        "content": { "type": "boolean", "description": "false returns only hashes and sizes." },
+        "lines": { "type": "array", "items": { "type": "integer" }, "description": "[first, last], 1-based and inclusive." },
+        "outline": { "type": "boolean", "description": "Include the file's symbols: name, kind, line, and end line for functions, classes, records, and sections." },
+        "max_bytes": { "type": "integer" }
+      }
+    }
+  },
+  {
+    "name": "qark_search",
+    "title": "Search files",
+    "description": "Search the workspace like ripgrep: pattern is literal text, or set regex true for the qark dialect (. [] () | * + ? {} ^ $ \\< \\> \\d \\w \\s). Matches come back grouped per file with that file's sha256, line and column numbers, and the matched text; context adds surrounding lines. glob narrows files (* stays within a directory, ** crosses; \"*.py\" matches by basename, \"src/*.py\" by path). path limits the search to a directory. With no pattern it lists the matching paths instead. Skips .git, .qark, node_modules, and build output unless all is true; skips binary files and files over 4 MiB.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "pattern": { "type": "string" },
+        "regex": { "type": "boolean" },
+        "icase": { "type": "boolean", "description": "Case-insensitive matching." },
+        "glob": { "type": "string", "description": "e.g. *.py, src/**/*.mach, scripts/*.ps1" },
+        "path": { "type": "string", "description": "Directory to search, relative to the workspace root (default the root)." },
+        "context": { "type": "integer", "description": "Lines of context around each match, 0-20." },
+        "max": { "type": "integer", "description": "Stop after this many matches (default 100); the reply reports truncated when capped." },
+        "max_files": { "type": "integer", "description": "Stop scanning after this many files (default 20000)." },
+        "all": { "type": "boolean", "description": "Include hidden and tool directories such as .qark." }
+      }
+    }
+  },
+  {
+    "name": "qark_templates",
+    "title": "List templates",
+    "description": "List the templates qark_apply can name (session, workspace .qark/templates, and builtin), each with its language, description, and the variables it reads. Pass name to get one template's full text.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "name": { "type": "string" }
+      }
+    }
+  },
+  {
+    "name": "qark_define_template",
+    "title": "Define a template",
+    "description": "Keep a named template for later qark_apply calls in this session, so many files can share it. persist true also saves it under .qark/templates for every future session. A name ending in an extension such as loader.py sets the language its |ident filter checks.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "name": { "type": "string" },
+        "text": { "type": "string" },
+        "lines": { "type": "array", "items": { "type": "string" } },
+        "lang": { "type": "string" },
+        "description": { "type": "string" },
+        "path": { "type": "string", "description": "Path pattern for an expand table, such as gen/{{who|snake}}.py. A constant path writes one file; the template then reads {{#each rows}}." },
+        "persist": { "type": "boolean" }
+      },
+      "required": ["name"]
+    }
+  }
+]

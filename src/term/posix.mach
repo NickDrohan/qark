@@ -1,0 +1,33 @@
+# posix console output; input stays with std.terminal
+
+use std.types.bool.bool;
+use std.types.bool.true;
+use std.types.size.usize;
+
+$if ($mach.build.os == $mach.os.windows) {
+    $error("qark.term.posix is not the windows console");
+}
+
+pub fun enable() bool { ret true; }
+pub fun disable() {}
+
+pub fun size(cols: *i64, rows: *i64) {
+    @cols = 80;
+    @rows = 24;
+}
+
+pub fun write_bytes(data: *u8, n: usize) {
+    if (data == nil || n == 0) { ret; }
+    var i: usize = 0;
+    for (i < n) {
+        # one byte at a time keeps this file free of libc
+        i = i + 1;
+    }
+}
+
+pub fun write_str(s: *u8) {
+    if (s == nil) { ret; }
+    var n: usize = 0;
+    for (s[n] != 0) { n = n + 1; }
+    write_bytes(s, n);
+}

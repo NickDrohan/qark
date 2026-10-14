@@ -1,0 +1,507 @@
+# operators: delete, change, yank, indent, case, join, put
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+
+use A: std.allocator;
+use buffer: qark.core.buffer;
+use mode: qark.core.mode;
+use motion: qark.core.motion;
+use obj: qark.core.textobj;
+use regs: qark.core.registers;
+use text: qark.core.text;
+use util: qark.util;
+
+# what an operator did to the cursor
+pub rec Applied {
+    ok:     bool;
+    insert: bool;
+    row:    i64;
+    col:    i64;
+}
+
+fun line_bytes(t: *text.Text, row: i64, len: *i64) *u8 {
+    val g: opt[*text.Line] = text.line_at(t, row);
+    if (!sel g.some) {
+        @len = 0;
+        ret nil;
+    }
+    @len = g.some.len::i64;
+    ret g.some.data;
+}
+
+fun yank_span(a: *A.Allocator, t: *text.Text, s: obj.Span, out: **u8, out_len: *usize, linewise: *bool) err[A.Error] {
+    var buf: *u8 = nil;
+    var len: usize = 0;
+    var cap: usize = 0;
+    @linewise = s.linewise;
+    if (s.linewise) {
+        var r: i64 = s.r1;
+        for (r < s.r2) {
+            var ln: i64 = 0;
+            val p: *u8 = line_bytes(t, r, ?ln);
+            if (ln > 0) {
+                val ap: err[A.Error] = util.append(a, ?buf, ?len, ?cap, p, ln::usize);
+                if (sel ap.err) { ret ap; }
+            }
+            val nl: err[A.Error] = util.append_byte(a, ?buf, ?len, ?cap, '\n');
+            if (sel nl.err) { ret nl; }
+            r = r + 1;
+        }
+    }
+    or (s.r1 == s.r2) {
+        var ln: i64 = 0;
+        val p: *u8 = line_bytes(t, s.r1, ?ln);
+        var c1: i64 = s.c1;
+        var c2: i64 = s.c2;
+        if (c1 < 0) { c1 = 0; }
+        if (c2 > ln) { c2 = ln; }
+        if (c2 > c1 && p != nil) {
+            val ap: err[A.Error] = util.append(a, ?buf, ?len, ?cap, (p::usize + c1::usize)::*u8, (c2 - c1)::usize);
+            if (sel ap.err) { ret ap; }
+        }
+    }
+    or {
+        var ln: i64 = 0;
+        val p: *u8 = line_bytes(t, s.r1, ?ln);
+        if (s.c1 < ln && p != nil) {
+            val ap: err[A.Error] = util.append(a, ?buf, ?len, ?cap, (p::usize + s.c1::usize)::*u8, (ln - s.c1)::usize);
+            if (sel ap.err) { ret ap; }
+        }
+        val nl: err[A.Error] = util.append_byte(a, ?buf, ?len, ?cap, '\n');
+        if (sel nl.err) { ret nl; }
+        var r: i64 = s.r1 + 1;
+        for (r < s.r2) {
+            ln = 0;
+            val mid: *u8 = line_bytes(t, r, ?ln);
+            if (ln > 0) {
+                val ap: err[A.Error] = util.append(a, ?buf, ?len, ?cap, mid, ln::usize);
+                if (sel ap.err) { ret ap; }
+            }
+            val br: err[A.Error] = util.append_byte(a, ?buf, ?len, ?cap, '\n');
+            if (sel br.err) { ret br; }
+            r = r + 1;
+        }
+        ln = 0;
+        val tail: *u8 = line_bytes(t, s.r2, ?ln);
+        var c2: i64 = s.c2;
+        if (c2 > ln) { c2 = ln; }
+        if (c2 > 0 && tail != nil) {
+            val ap: err[A.Error] = util.append(a, ?buf, ?len, ?cap, tail, c2::usize);
+            if (sel ap.err) { ret ap; }
+        }
+    }
+    val exact: res[str, A.Error] = util.dup_n(a, buf, len);
+    if (buf != nil) { A.deallocate[u8](a, buf, cap + 1); }
+    if (sel exact.err) { ret err[A.Error].err{exact.err}; }
+    @out = exact.ok;
+    @out_len = len;
+    ret err[A.Error].ok{};
+}
+
+fun put_line(bs: *buffer.Buffers, id: i64, row: i64, src: *u8, n: usize) err[A.Error] {
+    var srcs: [1]*u8;
+    var lens: [1]usize;
+    srcs[0] = src;
+    lens[0] = n;
+    ret buffer.splice(bs, id, row, row + 1, ?srcs[0], ?lens[0], 1, true);
+}
+
+fun delete_span(bs: *buffer.Buffers, id: i64, s: obj.Span) err[A.Error] {
+    val g: opt[*buffer.Buffer] = buffer.get(bs, id);
+    if (!sel g.some) { ret err[A.Error].err{A.Error.invalid{}}; }
+    val buf: *buffer.Buffer = g.some;
+    if (s.linewise) {
+        var count: i64 = s.r2 - s.r1;
+        if (count < 0) { count = 0; }
+        val sp: err[A.Error] = buffer.splice(bs, id, s.r1, s.r1 + count, nil, nil, 0, true);
+        if (sel sp.err) { ret sp; }
+        buf.row = s.r1;
+        if (buf.row >= text.line_count(?buf.text)) { buf.row = text.line_count(?buf.text) - 1; }
+        if (buf.row < 0) { buf.row = 0; }
+        buf.col = 0;
+        buffer.clamp_col(buf);
+        ret err[A.Error].ok{};
+    }
+    if (s.r1 == s.r2) {
+        var ln: i64 = 0;
+        val p: *u8 = line_bytes(?buf.text, s.r1, ?ln);
+        var built: *u8 = nil;
+        var blen: usize = 0;
+        var bcap: usize = 0;
+        if (s.c1 > 0 && p != nil) {
+            var n: i64 = s.c1;
+            if (n > ln) { n = ln; }
+            val ap: err[A.Error] = util.append(bs.a, ?built, ?blen, ?bcap, p, n::usize);
+            if (sel ap.err) { ret ap; }
+        }
+        if (s.c2 < ln && p != nil) {
+            val ap: err[A.Error] = util.append(bs.a, ?built, ?blen, ?bcap, (p::usize + s.c2::usize)::*u8, (ln - s.c2)::usize);
+            if (sel ap.err) { ret ap; }
+        }
+        val sp: err[A.Error] = put_line(bs, id, s.r1, built, blen);
+        if (built != nil) { A.deallocate[u8](bs.a, built, bcap + 1); }
+        if (sel sp.err) { ret sp; }
+        buf.row = s.r1;
+        buf.col = s.c1;
+        buffer.clamp_col(buf);
+        ret err[A.Error].ok{};
+    }
+    var built: *u8 = nil;
+    var blen: usize = 0;
+    var bcap: usize = 0;
+    var ln: i64 = 0;
+    val head: *u8 = line_bytes(?buf.text, s.r1, ?ln);
+    if (s.c1 > 0 && head != nil) {
+        var n: i64 = s.c1;
+        if (n > ln) { n = ln; }
+        val ap: err[A.Error] = util.append(bs.a, ?built, ?blen, ?bcap, head, n::usize);
+        if (sel ap.err) { ret ap; }
+    }
+    ln = 0;
+    val tail: *u8 = line_bytes(?buf.text, s.r2, ?ln);
+    if (s.c2 < ln && tail != nil) {
+        val ap: err[A.Error] = util.append(bs.a, ?built, ?blen, ?bcap, (tail::usize + s.c2::usize)::*u8, (ln - s.c2)::usize);
+        if (sel ap.err) { ret ap; }
+    }
+    var srcs: [1]*u8;
+    var lens: [1]usize;
+    srcs[0] = built;
+    lens[0] = blen;
+    val sp: err[A.Error] = buffer.splice(bs, id, s.r1, s.r2 + 1, ?srcs[0], ?lens[0], 1, true);
+    if (built != nil) { A.deallocate[u8](bs.a, built, bcap + 1); }
+    if (sel sp.err) { ret sp; }
+    buf.row = s.r1;
+    buf.col = s.c1;
+    buffer.clamp_col(buf);
+    ret err[A.Error].ok{};
+}
+
+fun map_case(b: u8, op: u8) u8 {
+    if (op == mode.OP_LOWER && b >= 'A' && b <= 'Z') { ret b + 32; }
+    if (op == mode.OP_UPPER && b >= 'a' && b <= 'z') { ret b - 32; }
+    if (op == mode.OP_TOGGLE) {
+        if (b >= 'A' && b <= 'Z') { ret b + 32; }
+        if (b >= 'a' && b <= 'z') { ret b - 32; }
+    }
+    ret b;
+}
+
+fun case_span(bs: *buffer.Buffers, id: i64, s: obj.Span, op: u8) err[A.Error] {
+    val g: opt[*buffer.Buffer] = buffer.get(bs, id);
+    if (!sel g.some) { ret err[A.Error].err{A.Error.invalid{}}; }
+    var r: i64 = s.r1;
+    var end: i64 = s.r2;
+    if (!s.linewise && s.r1 == s.r2) { end = s.r1; }
+    if (s.linewise) { end = s.r2 - 1; }
+    for (r <= end && r < text.line_count(?g.some.text)) {
+        var ln: i64 = 0;
+        val p: *u8 = line_bytes(?g.some.text, r, ?ln);
+        var c1: i64 = 0;
+        var c2: i64 = ln;
+        if (!s.linewise && r == s.r1) { c1 = s.c1; }
+        if (!s.linewise && r == s.r2) { c2 = s.c2; }
+        if (c1 < 0) { c1 = 0; }
+        if (c2 > ln) { c2 = ln; }
+        var built: *u8 = nil;
+        var blen: usize = 0;
+        var bcap: usize = 0;
+        var i: i64 = 0;
+        for (i < ln) {
+            var ch: u8 = 0;
+            if (p != nil) { ch = p[i::usize]; }
+            if (i >= c1 && i < c2) { ch = map_case(ch, op); }
+            val ap: err[A.Error] = util.append_byte(bs.a, ?built, ?blen, ?bcap, ch);
+            if (sel ap.err) { ret ap; }
+            i = i + 1;
+        }
+        val sp: err[A.Error] = put_line(bs, id, r, built, blen);
+        if (built != nil) { A.deallocate[u8](bs.a, built, bcap + 1); }
+        if (sel sp.err) { ret sp; }
+        r = r + 1;
+    }
+    ret err[A.Error].ok{};
+}
+
+fun indent_span(bs: *buffer.Buffers, id: i64, s: obj.Span, shift: i64, add: bool) err[A.Error] {
+    val g: opt[*buffer.Buffer] = buffer.get(bs, id);
+    if (!sel g.some) { ret err[A.Error].err{A.Error.invalid{}}; }
+    var r1: i64 = s.r1;
+    var r2: i64 = s.r2;
+    if (!s.linewise) {
+        r2 = s.r2;
+        if (s.c2 == 0 && r2 > r1) { r2 = r2 - 1; }
+    }
+    or { r2 = s.r2 - 1; }
+    var r: i64 = r1;
+    for (r <= r2) {
+        var ln: i64 = 0;
+        val p: *u8 = line_bytes(?g.some.text, r, ?ln);
+        var built: *u8 = nil;
+        var blen: usize = 0;
+        var bcap: usize = 0;
+        if (add) {
+            var i: i64 = 0;
+            for (i < shift) {
+                val ap: err[A.Error] = util.append_byte(bs.a, ?built, ?blen, ?bcap, ' ');
+                if (sel ap.err) { ret ap; }
+                i = i + 1;
+            }
+            if (ln > 0 && p != nil) {
+                val ap: err[A.Error] = util.append(bs.a, ?built, ?blen, ?bcap, p, ln::usize);
+                if (sel ap.err) { ret ap; }
+            }
+        }
+        or {
+            var skip: i64 = 0;
+            for (skip < shift && skip < ln) {
+                val ch: u8 = p[skip::usize];
+                if (ch != ' ' && ch != '\t') { brk; }
+                skip = skip + 1;
+            }
+            if (ln > skip && p != nil) {
+                val ap: err[A.Error] = util.append(bs.a, ?built, ?blen, ?bcap, (p::usize + skip::usize)::*u8, (ln - skip)::usize);
+                if (sel ap.err) { ret ap; }
+            }
+        }
+        val sp: err[A.Error] = put_line(bs, id, r, built, blen);
+        if (built != nil) { A.deallocate[u8](bs.a, built, bcap + 1); }
+        if (sel sp.err) { ret sp; }
+        r = r + 1;
+    }
+    ret err[A.Error].ok{};
+}
+
+# apply an operator to a span and yank into `reg` when the op deletes or yanks
+pub fun apply(bs: *buffer.Buffers, id: i64, rs: *regs.Registers, reg: u8, op: u8, s: obj.Span, shift: i64) res[Applied, A.Error] {
+    var done: Applied;
+    if (!s.ok) { ret res[Applied, A.Error].ok{done}; }
+    val g: opt[*buffer.Buffer] = buffer.get(bs, id);
+    if (!sel g.some) { ret res[Applied, A.Error].err{A.Error.invalid{}}; }
+    if (op == mode.OP_YANK || op == mode.OP_DELETE || op == mode.OP_CHANGE) {
+        var bytes: *u8 = nil;
+        var n: usize = 0;
+        var linewise: bool = false;
+        val y: err[A.Error] = yank_span(bs.a, ?g.some.text, s, ?bytes, ?n, ?linewise);
+        if (sel y.err) { ret res[Applied, A.Error].err{y.err}; }
+        val st: err[A.Error] = regs.set(rs, reg, bytes, n, linewise);
+        if (bytes != nil) { A.deallocate[u8](bs.a, bytes, n + 1); }
+        if (sel st.err) { ret res[Applied, A.Error].err{st.err}; }
+    }
+    if (op == mode.OP_DELETE || op == mode.OP_CHANGE) {
+        val d: err[A.Error] = delete_span(bs, id, s);
+        if (sel d.err) { ret res[Applied, A.Error].err{d.err}; }
+        done.insert = op == mode.OP_CHANGE;
+    }
+    or (op == mode.OP_LOWER || op == mode.OP_UPPER || op == mode.OP_TOGGLE) {
+        val c: err[A.Error] = case_span(bs, id, s, op);
+        if (sel c.err) { ret res[Applied, A.Error].err{c.err}; }
+    }
+    or (op == mode.OP_INDENT || op == mode.OP_DEDENT || op == mode.OP_FORMAT) {
+        var add: bool = op != mode.OP_DEDENT;
+        val c: err[A.Error] = indent_span(bs, id, s, shift, add);
+        if (sel c.err) { ret res[Applied, A.Error].err{c.err}; }
+    }
+    val after: opt[*buffer.Buffer] = buffer.get(bs, id);
+    if (sel after.some) {
+        done.row = after.some.row;
+        done.col = after.some.col;
+    }
+    done.ok = true;
+    ret res[Applied, A.Error].ok{done};
+}
+
+# insert bytes at the cursor, splitting on newlines; records one undo edit
+pub fun insert_text(bs: *buffer.Buffers, id: i64, src: *u8, n: usize) err[A.Error] {
+    val g: opt[*buffer.Buffer] = buffer.get(bs, id);
+    if (!sel g.some) { ret err[A.Error].err{A.Error.invalid{}}; }
+    val buf: *buffer.Buffer = g.some;
+    var ln: i64 = 0;
+    val p: *u8 = line_bytes(?buf.text, buf.row, ?ln);
+    var built: *u8 = nil;
+    var blen: usize = 0;
+    var bcap: usize = 0;
+    var col: i64 = buf.col;
+    if (col > ln) { col = ln; }
+    if (col < 0) { col = 0; }
+    if (col > 0 && p != nil) {
+        val ap: err[A.Error] = util.append(bs.a, ?built, ?blen, ?bcap, p, col::usize);
+        if (sel ap.err) { ret ap; }
+    }
+    if (n > 0 && src != nil) {
+        val ap: err[A.Error] = util.append(bs.a, ?built, ?blen, ?bcap, src, n);
+        if (sel ap.err) { ret ap; }
+    }
+    if (col < ln && p != nil) {
+        val ap: err[A.Error] = util.append(bs.a, ?built, ?blen, ?bcap, (p::usize + col::usize)::*u8, (ln - col)::usize);
+        if (sel ap.err) { ret ap; }
+    }
+    # split built on newlines via text.load into a side buffer, then splice
+    val side: res[text.Text, A.Error] = text.init(bs.a);
+    if (sel side.err) { ret err[A.Error].err{side.err}; }
+    var tmp: text.Text = side.ok;
+    val loaded: err[A.Error] = text.load(?tmp, built, blen);
+    if (built != nil) { A.deallocate[u8](bs.a, built, bcap + 1); }
+    if (sel loaded.err) {
+        text.dnit(?tmp);
+        ret loaded;
+    }
+    val count: i64 = text.line_count(?tmp);
+    val ps: res[**u8, A.Error] = A.allocate[*u8](bs.a, count::usize);
+    if (sel ps.err) {
+        text.dnit(?tmp);
+        ret err[A.Error].err{ps.err};
+    }
+    val ls: res[*usize, A.Error] = A.allocate[usize](bs.a, count::usize);
+    if (sel ls.err) {
+        A.deallocate[*u8](bs.a, ps.ok, count::usize);
+        text.dnit(?tmp);
+        ret err[A.Error].err{ls.err};
+    }
+    var i: i64 = 0;
+    for (i < count) {
+        val line: opt[*text.Line] = text.line_at(?tmp, i);
+        if (sel line.some) {
+            ps.ok[i::usize] = line.some.data;
+            ls.ok[i::usize] = line.some.len;
+        }
+        or {
+            ps.ok[i::usize] = nil;
+            ls.ok[i::usize] = 0;
+        }
+        i = i + 1;
+    }
+    val sp: err[A.Error] = buffer.splice(bs, id, buf.row, buf.row + 1, ps.ok, ls.ok, count, true);
+    A.deallocate[*u8](bs.a, ps.ok, count::usize);
+    A.deallocate[usize](bs.a, ls.ok, count::usize);
+    text.dnit(?tmp);
+    if (sel sp.err) { ret sp; }
+    buf.row = buf.row + count - 1;
+    buf.col = col + n::i64;
+    # if the insert contained newlines the column is the tail length; clamp fixes it
+    buffer.clamp_col(buf);
+    ret err[A.Error].ok{};
+}
+
+# open a line below or above and leave the cursor on it
+pub fun open_line(bs: *buffer.Buffers, id: i64, below: bool) err[A.Error] {
+    val g: opt[*buffer.Buffer] = buffer.get(bs, id);
+    if (!sel g.some) { ret err[A.Error].err{A.Error.invalid{}}; }
+    var at: i64 = g.some.row;
+    if (below) { at = at + 1; }
+    var srcs: [1]*u8;
+    var lens: [1]usize;
+    srcs[0] = nil;
+    lens[0] = 0;
+    val sp: err[A.Error] = buffer.splice(bs, id, at, at, ?srcs[0], ?lens[0], 1, true);
+    if (sel sp.err) { ret sp; }
+    g.some.row = at;
+    g.some.col = 0;
+    ret err[A.Error].ok{};
+}
+
+# join the current line with the next, with a single space
+pub fun join_line(bs: *buffer.Buffers, id: i64) err[A.Error] {
+    val g: opt[*buffer.Buffer] = buffer.get(bs, id);
+    if (!sel g.some) { ret err[A.Error].err{A.Error.invalid{}}; }
+    if (g.some.row + 1 >= text.line_count(?g.some.text)) { ret err[A.Error].ok{}; }
+    var n1: i64 = 0;
+    var n2: i64 = 0;
+    val a: *u8 = line_bytes(?g.some.text, g.some.row, ?n1);
+    val b: *u8 = line_bytes(?g.some.text, g.some.row + 1, ?n2);
+    var built: *u8 = nil;
+    var blen: usize = 0;
+    var bcap: usize = 0;
+    if (n1 > 0 && a != nil) {
+        val ap: err[A.Error] = util.append(bs.a, ?built, ?blen, ?bcap, a, n1::usize);
+        if (sel ap.err) { ret ap; }
+    }
+    var skip: i64 = 0;
+    for (skip < n2 && b != nil) {
+        val ch: u8 = b[skip::usize];
+        if (ch != ' ' && ch != '\t') { brk; }
+        skip = skip + 1;
+    }
+    if (n1 > 0 && skip < n2) {
+        val spc: err[A.Error] = util.append_byte(bs.a, ?built, ?blen, ?bcap, ' ');
+        if (sel spc.err) { ret spc; }
+    }
+    if (skip < n2 && b != nil) {
+        val ap: err[A.Error] = util.append(bs.a, ?built, ?blen, ?bcap, (b::usize + skip::usize)::*u8, (n2 - skip)::usize);
+        if (sel ap.err) { ret ap; }
+    }
+    var srcs: [1]*u8;
+    var lens: [1]usize;
+    srcs[0] = built;
+    lens[0] = blen;
+    val sp: err[A.Error] = buffer.splice(bs, id, g.some.row, g.some.row + 2, ?srcs[0], ?lens[0], 1, true);
+    if (built != nil) { A.deallocate[u8](bs.a, built, bcap + 1); }
+    if (sel sp.err) { ret sp; }
+    g.some.col = n1;
+    buffer.clamp_col(g.some);
+    ret err[A.Error].ok{};
+}
+
+# put the register before or after the cursor
+pub fun put(bs: *buffer.Buffers, id: i64, rs: *regs.Registers, reg: u8, after: bool) err[A.Error] {
+    var n: usize = 0;
+    val data: *u8 = regs.get(rs, reg, ?n);
+    if (data == nil || n == 0) { ret err[A.Error].ok{}; }
+    val g: opt[*buffer.Buffer] = buffer.get(bs, id);
+    if (!sel g.some) { ret err[A.Error].err{A.Error.invalid{}}; }
+    if (regs.is_linewise(rs, reg)) {
+        var at: i64 = g.some.row;
+        if (after) { at = at + 1; }
+        val side: res[text.Text, A.Error] = text.init(bs.a);
+        if (sel side.err) { ret err[A.Error].err{side.err}; }
+        var tmp: text.Text = side.ok;
+        val loaded: err[A.Error] = text.load(?tmp, data, n);
+        if (sel loaded.err) {
+            text.dnit(?tmp);
+            ret loaded;
+        }
+        val count: i64 = text.line_count(?tmp);
+        val ps: res[**u8, A.Error] = A.allocate[*u8](bs.a, count::usize);
+        if (sel ps.err) {
+            text.dnit(?tmp);
+            ret err[A.Error].err{ps.err};
+        }
+        val ls: res[*usize, A.Error] = A.allocate[usize](bs.a, count::usize);
+        if (sel ls.err) {
+            A.deallocate[*u8](bs.a, ps.ok, count::usize);
+            text.dnit(?tmp);
+            ret err[A.Error].err{ls.err};
+        }
+        var i: i64 = 0;
+        for (i < count) {
+            val line: opt[*text.Line] = text.line_at(?tmp, i);
+            if (sel line.some) {
+                ps.ok[i::usize] = line.some.data;
+                ls.ok[i::usize] = line.some.len;
+            }
+            or {
+                ps.ok[i::usize] = nil;
+                ls.ok[i::usize] = 0;
+            }
+            i = i + 1;
+        }
+        val sp: err[A.Error] = buffer.splice(bs, id, at, at, ps.ok, ls.ok, count, true);
+        A.deallocate[*u8](bs.a, ps.ok, count::usize);
+        A.deallocate[usize](bs.a, ls.ok, count::usize);
+        text.dnit(?tmp);
+        if (sel sp.err) { ret sp; }
+        g.some.row = at;
+        g.some.col = 0;
+        ret err[A.Error].ok{};
+    }
+    if (after && g.some.col < motion.line_len(?g.some.text, g.some.row)) {
+        g.some.col = g.some.col + 1;
+    }
+    ret insert_text(bs, id, data, n);
+}

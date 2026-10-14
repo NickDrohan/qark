@@ -1,0 +1,90 @@
+[
+    {
+        "case":  "create 1 text file",
+        "n":  30,
+        "wall_p50":  6.05,
+        "wall_p95":  6.49,
+        "check_p50":  0.71,
+        "commit_p50":  5.16
+    },
+    {
+        "case":  "same apply again (unchanged)",
+        "n":  30,
+        "wall_p50":  1.35,
+        "wall_p95":  1.53,
+        "check_p50":  1.17,
+        "commit_p50":  0.01
+    },
+    {
+        "case":  "create 1 python file, checked",
+        "n":  20,
+        "wall_p50":  13.82,
+        "wall_p95":  20.34,
+        "check_p50":  7.94,
+        "commit_p50":  5.53
+    },
+    {
+        "case":  "create 1 node file, checked",
+        "n":  10,
+        "wall_p50":  13.77,
+        "wall_p95":  20.52,
+        "check_p50":  7.74,
+        "commit_p50":  5.95
+    },
+    {
+        "case":  "create 1 powershell file, checked",
+        "n":  5,
+        "wall_p50":  13.76,
+        "wall_p95":  13.87,
+        "check_p50":  8.26,
+        "commit_p50":  5.55
+    },
+    {
+        "case":  "create 10 python files in one apply",
+        "n":  10,
+        "wall_p50":  43.8,
+        "wall_p95":  47.11,
+        "check_p50":  9.33,
+        "commit_p50":  33.95
+    },
+    {
+        "case":  "fan 1 template to 50 python files",
+        "n":  5,
+        "wall_p50":  186.31,
+        "wall_p95":  186.31,
+        "check_p50":  17.06,
+        "commit_p50":  165.96
+    },
+    {
+        "case":  "fan to 50 files, check off",
+        "n":  5,
+        "wall_p50":  175.74,
+        "wall_p95":  177.15,
+        "check_p50":  0,
+        "commit_p50":  174.45
+    },
+    {
+        "case":  "find/replace edit, checked",
+        "n":  20,
+        "wall_p50":  13.77,
+        "wall_p95":  19.36,
+        "check_p50":  7.13,
+        "commit_p50":  5.75
+    },
+    {
+        "case":  "read 1 file with sha256",
+        "n":  30,
+        "wall_p50":  0.97,
+        "wall_p95":  1.09,
+        "check_p50":  0,
+        "commit_p50":  0
+    },
+    {
+        "case":  "create 117 KB file, check off",
+        "n":  5,
+        "wall_p50":  11.09,
+        "wall_p95":  11.31,
+        "check_p50":  0,
+        "commit_p50":  5.92
+    }
+]

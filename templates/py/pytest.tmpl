@@ -1,0 +1,9 @@
+{{!-- pytest cases for one function: each case calls it with args and compares to expect.
+vars: module (import path); function; cases [{name, args [values], expect}] --}}
+from {{module}} import {{function|ident}}
+{{#each cases}}
+
+
+def test_{{name|snake}}():
+    assert {{function}}(*{{args|py}}) == {{expect|py}}
+{{/each}}

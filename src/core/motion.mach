@@ -1,0 +1,365 @@
+# cursor motions over a line store
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.option.opt;
+use std.types.size.usize;
+
+use text: qark.core.text;
+
+# a cursor position; col may sit one past the last byte
+pub rec Pos {
+    row: i64;
+    col: i64;
+}
+
+pub val CLASS_SPACE: u8 = 0;
+pub val CLASS_WORD:  u8 = 1;
+pub val CLASS_OTHER: u8 = 2;
+
+# byte class used by word motions
+pub fun class_of(b: u8) u8 {
+    if (b == ' ' || b == '\t' || b == '\n' || b == '\r') { ret CLASS_SPACE; }
+    if (b >= 'a' && b <= 'z') { ret CLASS_WORD; }
+    if (b >= 'A' && b <= 'Z') { ret CLASS_WORD; }
+    if (b >= '0' && b <= '9') { ret CLASS_WORD; }
+    if (b == '_') { ret CLASS_WORD; }
+    ret CLASS_OTHER;
+}
+
+# length of a line, or 0 when the row is outside
+pub fun line_len(t: *text.Text, row: i64) i64 {
+    val g: opt[*text.Line] = text.line_at(t, row);
+    if (!sel g.some) { ret 0; }
+    ret g.some.len::i64;
+}
+
+# byte at row/col, or 0 when outside the line
+pub fun byte_at(t: *text.Text, row: i64, col: i64) u8 {
+    val g: opt[*text.Line] = text.line_at(t, row);
+    if (!sel g.some) { ret 0; }
+    if (col < 0 || col >= g.some.len::i64) { ret 0; }
+    ret g.some.data[col::usize];
+}
+
+# clamp a position into the text
+pub fun clamp(t: *text.Text, p: Pos) Pos {
+    var out: Pos = p;
+    val n: i64 = text.line_count(t);
+    if (out.row < 0) { out.row = 0; }
+    if (n == 0) { out.row = 0; }
+    or (out.row >= n) { out.row = n - 1; }
+    val len: i64 = line_len(t, out.row);
+    if (out.col < 0) { out.col = 0; }
+    if (out.col > len) { out.col = len; }
+    ret out;
+}
+
+# move left by count bytes
+pub fun left(t: *text.Text, p: Pos, count: i64) Pos {
+    var out: Pos = clamp(t, p);
+    var n: i64 = count;
+    if (n < 1) { n = 1; }
+    for (n > 0 && out.col > 0) {
+        out.col = out.col - 1;
+        n = n - 1;
+    }
+    ret out;
+}
+
+# move right by count bytes, not past the line
+pub fun right(t: *text.Text, p: Pos, count: i64) Pos {
+    var out: Pos = clamp(t, p);
+    var n: i64 = count;
+    if (n < 1) { n = 1; }
+    val len: i64 = line_len(t, out.row);
+    for (n > 0 && out.col < len) {
+        out.col = out.col + 1;
+        n = n - 1;
+    }
+    ret out;
+}
+
+# move up, keeping the column when the line is long enough
+pub fun up(t: *text.Text, p: Pos, count: i64) Pos {
+    var out: Pos = clamp(t, p);
+    var n: i64 = count;
+    if (n < 1) { n = 1; }
+    for (n > 0 && out.row > 0) {
+        out.row = out.row - 1;
+        n = n - 1;
+    }
+    ret clamp(t, out);
+}
+
+# move down
+pub fun down(t: *text.Text, p: Pos, count: i64) Pos {
+    var out: Pos = clamp(t, p);
+    var n: i64 = count;
+    if (n < 1) { n = 1; }
+    val last: i64 = text.line_count(t) - 1;
+    for (n > 0 && out.row < last) {
+        out.row = out.row + 1;
+        n = n - 1;
+    }
+    ret clamp(t, out);
+}
+
+fun norm_class(b: u8, big: bool) u8 {
+    var cls: u8 = class_of(b);
+    if (big && cls != CLASS_SPACE) { cls = CLASS_WORD; }
+    ret cls;
+}
+
+fun skip_class(t: *text.Text, p: *Pos, cls: u8, forward: bool, big: bool) {
+    for {
+        val len: i64 = line_len(t, p.row);
+        if (forward) {
+            if (p.col >= len) { ret; }
+            if (norm_class(byte_at(t, p.row, p.col), big) != cls) { ret; }
+            p.col = p.col + 1;
+        }
+        or {
+            if (p.col <= 0) { ret; }
+            if (norm_class(byte_at(t, p.row, p.col - 1), big) != cls) { ret; }
+            p.col = p.col - 1;
+        }
+    }
+}
+
+# `w` / `W`; big treats every non-space run as a word
+pub fun word_forward(t: *text.Text, p: Pos, count: i64, big: bool) Pos {
+    var out: Pos = clamp(t, p);
+    var n: i64 = count;
+    if (n < 1) { n = 1; }
+    for (n > 0) {
+        val len: i64 = line_len(t, out.row);
+        if (out.col >= len) {
+            if (out.row + 1 >= text.line_count(t)) { ret out; }
+            out.row = out.row + 1;
+            out.col = 0;
+        }
+        or {
+            val b: u8 = byte_at(t, out.row, out.col);
+            var cls: u8 = class_of(b);
+            if (big && cls != CLASS_SPACE) { cls = CLASS_WORD; }
+            if (cls != CLASS_SPACE) { skip_class(t, ?out, cls, true, big); }
+            var guard: i64 = 0;
+            for (out.col < line_len(t, out.row) && class_of(byte_at(t, out.row, out.col)) == CLASS_SPACE && guard < 10000) {
+                out.col = out.col + 1;
+                guard = guard + 1;
+            }
+        }
+        n = n - 1;
+    }
+    ret clamp(t, out);
+}
+
+# `b` / `B`
+pub fun word_back(t: *text.Text, p: Pos, count: i64, big: bool) Pos {
+    var out: Pos = clamp(t, p);
+    var n: i64 = count;
+    if (n < 1) { n = 1; }
+    for (n > 0) {
+        if (out.col == 0) {
+            if (out.row == 0) { ret out; }
+            out.row = out.row - 1;
+            out.col = line_len(t, out.row);
+        }
+        for (out.col > 0 && class_of(byte_at(t, out.row, out.col - 1)) == CLASS_SPACE) {
+            out.col = out.col - 1;
+        }
+        if (out.col > 0) {
+            val b: u8 = byte_at(t, out.row, out.col - 1);
+            var cls: u8 = class_of(b);
+            if (big && cls != CLASS_SPACE) { cls = CLASS_WORD; }
+            skip_class(t, ?out, cls, false, big);
+        }
+        n = n - 1;
+    }
+    ret clamp(t, out);
+}
+
+# `e` / `E`, landing on the last byte of the word
+pub fun word_end(t: *text.Text, p: Pos, count: i64, big: bool) Pos {
+    var out: Pos = clamp(t, p);
+    var n: i64 = count;
+    if (n < 1) { n = 1; }
+    for (n > 0) {
+        val len: i64 = line_len(t, out.row);
+        if (out.col + 1 >= len) {
+            if (out.row + 1 >= text.line_count(t)) { ret out; }
+            out.row = out.row + 1;
+            out.col = 0;
+        }
+        or { out.col = out.col + 1; }
+        for (out.col < line_len(t, out.row) && class_of(byte_at(t, out.row, out.col)) == CLASS_SPACE) {
+            out.col = out.col + 1;
+        }
+        if (out.col < line_len(t, out.row)) {
+            val b: u8 = byte_at(t, out.row, out.col);
+            var cls: u8 = class_of(b);
+            if (big && cls != CLASS_SPACE) { cls = CLASS_WORD; }
+            skip_class(t, ?out, cls, true, big);
+            if (out.col > 0) { out.col = out.col - 1; }
+        }
+        n = n - 1;
+    }
+    ret clamp(t, out);
+}
+
+# column 0
+pub fun line_start(p: Pos) Pos {
+    var out: Pos = p;
+    out.col = 0;
+    ret out;
+}
+
+# first non-blank column
+pub fun line_first(t: *text.Text, p: Pos) Pos {
+    var out: Pos = clamp(t, p);
+    out.col = 0;
+    val len: i64 = line_len(t, out.row);
+    for (out.col < len) {
+        val b: u8 = byte_at(t, out.row, out.col);
+        if (b != ' ' && b != '\t') { brk; }
+        out.col = out.col + 1;
+    }
+    ret out;
+}
+
+# one past the last byte, which is where `$` sits before an operator
+pub fun line_end(t: *text.Text, p: Pos) Pos {
+    var out: Pos = clamp(t, p);
+    out.col = line_len(t, out.row);
+    ret out;
+}
+
+# first line
+pub fun file_top(t: *text.Text) Pos {
+    ret line_first(t, Pos{row: 0, col: 0});
+}
+
+# `G`: a count is a 1-based line, otherwise the last line
+pub fun file_line(t: *text.Text, count: i64, has_count: bool) Pos {
+    var row: i64 = text.line_count(t) - 1;
+    if (has_count) {
+        row = count - 1;
+        if (row < 0) { row = 0; }
+    }
+    if (row < 0) { row = 0; }
+    ret line_first(t, Pos{row: row, col: 0});
+}
+
+# `f` `F` `t` `T`
+pub fun find_char(t: *text.Text, p: Pos, ch: u8, forward: bool, till: bool, count: i64) Pos {
+    var out: Pos = clamp(t, p);
+    var n: i64 = count;
+    if (n < 1) { n = 1; }
+    var found: bool = false;
+    for (n > 0) {
+        found = false;
+        if (forward) {
+            var c: i64 = out.col + 1;
+            val len: i64 = line_len(t, out.row);
+            for (c < len) {
+                if (byte_at(t, out.row, c) == ch) {
+                    out.col = c;
+                    found = true;
+                    brk;
+                }
+                c = c + 1;
+            }
+        }
+        or {
+            var c: i64 = out.col - 1;
+            for (c >= 0) {
+                if (byte_at(t, out.row, c) == ch) {
+                    out.col = c;
+                    found = true;
+                    brk;
+                }
+                c = c - 1;
+            }
+        }
+        if (!found) { ret clamp(t, p); }
+        n = n - 1;
+    }
+    if (till) {
+        if (forward && out.col > 0) { out.col = out.col - 1; }
+        if (!forward) { out.col = out.col + 1; }
+    }
+    ret out;
+}
+
+# `%` jumps between () [] {}
+pub fun match_pair(t: *text.Text, p: Pos) Pos {
+    var out: Pos = clamp(t, p);
+    val open: u8 = byte_at(t, out.row, out.col);
+    var close: u8 = 0;
+    var forward: bool = true;
+    if (open == '(') { close = ')'; }
+    or (open == '[') { close = ']'; }
+    or (open == '{') { close = '}'; }
+    or (open == ')') { close = '('; forward = false; }
+    or (open == ']') { close = '['; forward = false; }
+    or (open == '}') { close = '{'; forward = false; }
+    or { ret out; }
+    var depth: i64 = 0;
+    var row: i64 = out.row;
+    var col: i64 = out.col;
+    var guard: i64 = 0;
+    for (guard < 100000) {
+        guard = guard + 1;
+        val b: u8 = byte_at(t, row, col);
+        if (b == open) { depth = depth + 1; }
+        if (b == close) {
+            depth = depth - 1;
+            if (depth == 0) { ret Pos{row: row, col: col}; }
+        }
+        if (forward) {
+            col = col + 1;
+            if (col >= line_len(t, row)) {
+                row = row + 1;
+                col = 0;
+                if (row >= text.line_count(t)) { ret out; }
+            }
+        }
+        or {
+            col = col - 1;
+            if (col < 0) {
+                row = row - 1;
+                if (row < 0) { ret out; }
+                col = line_len(t, row) - 1;
+                if (col < 0) { col = 0; }
+            }
+        }
+    }
+    ret out;
+}
+
+# `{` and `}` move by blank-line paragraphs
+pub fun paragraph(t: *text.Text, p: Pos, count: i64, backward: bool) Pos {
+    var out: Pos = clamp(t, p);
+    var n: i64 = count;
+    if (n < 1) { n = 1; }
+    for (n > 0) {
+        if (backward) {
+            if (out.row == 0) { out.col = 0; ret out; }
+            out.row = out.row - 1;
+            for (out.row > 0 && line_len(t, out.row) == 0) { out.row = out.row - 1; }
+            for (out.row > 0 && line_len(t, out.row) != 0) { out.row = out.row - 1; }
+        }
+        or {
+            val last: i64 = text.line_count(t) - 1;
+            if (out.row >= last) { ret Pos{row: last, col: 0}; }
+            out.row = out.row + 1;
+            for (out.row < last && line_len(t, out.row) != 0) { out.row = out.row + 1; }
+            for (out.row < last && line_len(t, out.row) == 0) { out.row = out.row + 1; }
+        }
+        out.col = 0;
+        n = n - 1;
+    }
+    ret out;
+}

@@ -1,0 +1,1161 @@
+# edits applied to a file's current text: exact replacements, line ranges, and vim commands
+#
+# every edit names what it expects to find. a find that matches nothing or more
+# than it should is refused with the lines involved, and a line range outside
+# the file is refused with the file's length, so a stale edit never lands in
+# the wrong place. find_re matches the qark regex dialect and expands \0..\9
+# captures in the replacement. an edit's "within" limits where it looks — a
+# [first, last] line range, a string, or {find|find_re:..., occurrence:N} —
+# and "occurrence" picks one hit by number, negative from the end.
+
+use std.collections.vector;
+use std.data.json;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_contains;
+use std.types.string.str_len;
+
+use A: std.allocator;
+use eng: qark.core.engine;
+use jw: qark.rpc.jw;
+use re: qark.core.regex;
+use util: qark.util;
+
+# matches a single edit may gather before it is refused as too broad
+val MAX_HITS: usize = 32768;
+
+# why an edit was refused
+# ---
+# code:  static code such as edit_not_found
+# msg:   message owned by the edit allocator
+# index: which edit in the list, 0-based
+# line:  1-based line the message is about, 0 when none
+pub rec Err {
+    code:  str;
+    msg:   str;
+    index: i64;
+    line:  i64;
+}
+
+rec Text {
+    p:      *u8;
+    n:      usize;
+    crlf:   bool;
+    normed: bool;
+    mixed:  bool;
+}
+
+fun fail(e: *Err, code: str, msg: str, line: i64) bool {
+    e.code = code;
+    e.msg = msg;
+    e.line = line;
+    ret false;
+}
+
+fun get_str(a: *A.Allocator, obj: *json.Value, key: str, out: **u8, n: *usize) i64 {
+    val f: opt[*json.Value] = json.value_find(obj, key);
+    if (!sel f.some) { ret 0; }
+    if (!json.value_is_string(f.some)) { ret -1; }
+    var raw_n: usize = 0;
+    json.value_string(f.some, ?raw_n);
+    val got: res[*u8, A.Error] = A.allocate[u8](a, raw_n + 1);
+    if (sel got.err) { ret -2; }
+    val dec: res[usize, json.JsonError] = json.value_string_decode(f.some, got.ok, raw_n + 1);
+    if (sel dec.err) { ret -1; }
+    if (dec.ok > raw_n) { ret -1; }
+    got.ok[dec.ok] = 0;
+    @out = got.ok;
+    @n = dec.ok;
+    ret 1;
+}
+
+fun get_int(obj: *json.Value, key: str, out: *i64) i64 {
+    val f: opt[*json.Value] = json.value_find(obj, key);
+    if (!sel f.some) { ret 0; }
+    if (!json.value_is_number(f.some) || json.value_is_float(f.some)) { ret -1; }
+    @out = json.value_number(f.some);
+    ret 1;
+}
+
+fun get_bool(obj: *json.Value, key: str) bool {
+    val f: opt[*json.Value] = json.value_find(obj, key);
+    if (!sel f.some) { ret false; }
+    if (!json.value_is_bool(f.some)) { ret false; }
+    ret json.value_bool(f.some);
+}
+
+fun eol(t: *Text) str {
+    if (t.crlf) { ret "\r\n"; }
+    ret "\n";
+}
+
+# s with its line endings conformed to the file's: a lone \n becomes \r\n on a
+# crlf file and \r\n becomes \n on an lf one; changed is false when nothing did
+fun norm_text(a: *A.Allocator, t: *Text, s: *u8, sn: usize, out: **u8, on: *usize, changed: *bool) bool {
+    if (t.mixed) {
+        @changed = false;
+        @out = s;
+        @on = sn;
+        ret true;
+    }
+    var w: jw.Jw = jw.init(a);
+    var ch: bool = false;
+    var i: usize = 0;
+    for (i < sn) {
+        if (t.crlf && s[i] == '\n' && (i == 0 || s[i - 1] != '\r')) {
+            jw.raw(?w, "\r\n");
+            ch = true;
+            i = i + 1;
+        }
+        or (!t.crlf && s[i] == '\r' && i + 1 < sn && s[i + 1] == '\n') {
+            jw.byte(?w, '\n');
+            ch = true;
+            i = i + 2;
+        }
+        or {
+            jw.byte(?w, s[i]);
+            i = i + 1;
+        }
+    }
+    @changed = ch;
+    if (!ch) {
+        @out = s;
+        @on = sn;
+        ret true;
+    }
+    if (w.failed || w.buf == nil) { ret false; }
+    @out = w.buf;
+    @on = w.len;
+    ret true;
+}
+
+fun matches_at(p: *u8, n: usize, at: usize, q: *u8, qn: usize) bool {
+    if (at + qn > n) { ret false; }
+    var i: usize = 0;
+    for (i < qn) {
+        if (p[at + i] != q[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun line_of(p: *u8, at: usize) i64 {
+    var line: i64 = 1;
+    var i: usize = 0;
+    for (i < at) {
+        if (p[i] == '\n') { line = line + 1; }
+        i = i + 1;
+    }
+    ret line;
+}
+
+fun count_lines(t: *Text) usize {
+    if (t.n == 0) { ret 0; }
+    var lines: usize = 0;
+    var i: usize = 0;
+    for (i < t.n) {
+        if (t.p[i] == '\n') { lines = lines + 1; }
+        i = i + 1;
+    }
+    if (t.p[t.n - 1] != '\n') { lines = lines + 1; }
+    ret lines;
+}
+
+# byte offset where 1-based line k starts; lines past the end start at n
+fun line_start(t: *Text, k: usize) usize {
+    if (k <= 1) { ret 0; }
+    var line: usize = 1;
+    var i: usize = 0;
+    for (i < t.n) {
+        if (t.p[i] == '\n') {
+            line = line + 1;
+            if (line == k) { ret i + 1; }
+        }
+        i = i + 1;
+    }
+    ret t.n;
+}
+
+fun splice(a: *A.Allocator, t: *Text, from: usize, to: usize, ins: *u8, insn: usize) bool {
+    var w: jw.Jw = jw.init(a);
+    jw.bytes(?w, t.p, from);
+    jw.bytes(?w, ins, insn);
+    jw.bytes(?w, (t.p::usize + to)::*u8, t.n - to);
+    if (w.failed) { ret false; }
+    if (w.buf == nil) {
+        val empty: res[str, A.Error] = util.dup(a, "");
+        if (sel empty.err) { ret false; }
+        t.p = empty.ok;
+        t.n = 0;
+        ret true;
+    }
+    t.p = w.buf;
+    t.n = w.len;
+    ret true;
+}
+
+# the replacement lines for a range edit, each ending in the file's line ending
+fun with_lines(a: *A.Allocator, t: *Text, obj: *json.Value, out: **u8, n: *usize) bool {
+    var w: jw.Jw = jw.init(a);
+    val f: opt[*json.Value] = json.value_find(obj, "with");
+    if (!sel f.some) { ret false; }
+    if (sel f.some) {
+        if (json.value_is_array(f.some)) {
+            var i: usize = 0;
+            for (i < json.value_count(f.some)) {
+                val g: opt[*json.Value] = json.value_get(f.some, i);
+                if (sel g.some) {
+                    if (!json.value_is_string(g.some)) { ret false; }
+                    var raw_n: usize = 0;
+                    json.value_string(g.some, ?raw_n);
+                    val got: res[*u8, A.Error] = A.allocate[u8](a, raw_n + 1);
+                    if (sel got.err) { ret false; }
+                    val dec: res[usize, json.JsonError] = json.value_string_decode(g.some, got.ok, raw_n + 1);
+                    if (sel dec.err) { ret false; }
+                    jw.bytes(?w, got.ok, dec.ok);
+                    jw.raw(?w, eol(t));
+                }
+                i = i + 1;
+            }
+        }
+        or (json.value_is_string(f.some)) {
+            var p: *u8 = nil;
+            var pn: usize = 0;
+            if (get_str(a, obj, "with", ?p, ?pn) != 1) { ret false; }
+            var p2: *u8 = nil;
+            var p2n: usize = 0;
+            var ch: bool = false;
+            if (!norm_text(a, t, p, pn, ?p2, ?p2n, ?ch)) { ret false; }
+            if (ch) { p = p2; pn = p2n; t.normed = true; }
+            jw.bytes(?w, p, pn);
+            if (pn > 0 && p[pn - 1] != '\n') { jw.raw(?w, eol(t)); }
+        }
+        or { ret false; }
+    }
+    if (w.failed) { ret false; }
+    @out = w.buf;
+    @n = w.len;
+    ret true;
+}
+
+fun is_hspace(c: u8) bool {
+    ret c == ' ' || c == '\t';
+}
+
+# copy src with runs of spaces and tabs folded to one space; returns the folded length
+fun fold_space(src: *u8, n: usize, out: *u8, cap: usize) usize {
+    var i: usize = 0;
+    var o: usize = 0;
+    var gap: bool = false;
+    for (i < n && o + 1 < cap) {
+        if (is_hspace(src[i])) { gap = o > 0; }
+        or {
+            if (gap && o + 1 < cap) {
+                out[o] = ' ';
+                o = o + 1;
+                gap = false;
+            }
+            if (o + 1 < cap) {
+                out[o] = src[i];
+                o = o + 1;
+            }
+        }
+        i = i + 1;
+    }
+    if (o < cap) { out[o] = 0; }
+    ret o;
+}
+
+fun contains_at(hay: *u8, hn: usize, needle: *u8, nn: usize) bool {
+    if (nn == 0 || nn > hn) { ret false; }
+    var i: usize = 0;
+    for (i + nn <= hn) {
+        if (matches_at(hay, hn, i, needle, nn)) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# the 1-based line whose text matches the find's first line once extra spaces are ignored
+fun near_space(file: *u8, n: usize, first: *u8, fn_: usize) i64 {
+    var needle: [256]u8;
+    val nn: usize = fold_space(first, fn_, ?needle[0], 256);
+    if (nn == 0) { ret 0; }
+    var line: i64 = 1;
+    var start: usize = 0;
+    var i: usize = 0;
+    for (i <= n) {
+        if (i == n || file[i] == '\n') {
+            var end: usize = i;
+            if (end > start && file[end - 1] == '\r') { end = end - 1; }
+            var folded: [512]u8;
+            val hn: usize = fold_space((file::usize + start)::*u8, end - start, ?folded[0], 512);
+            if (contains_at(?folded[0], hn, ?needle[0], nn)) { ret line; }
+            line = line + 1;
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    ret 0;
+}
+
+# every span the needle covers in t.p[lo,hi): (start,end) pairs into out.
+# a regex needle searches the slice, so a match never strays past hi.
+# 1 collected, 0 none, -1 bad pattern, -2 over MAX_HITS
+fun collect(a: *A.Allocator, t: *Text, lo: usize, hi: usize, q: *u8, qn: usize, is_re: bool, out: *vector.Vector[usize]) i64 {
+    var hits: i64 = 0;
+    if (is_re) {
+        val prog: res[re.Prog, A.Error] = re.compile(a, q, qn);
+        if (sel prog.err) { ret -1; }
+        var at: i64 = 0;
+        for (at <= (hi - lo)::i64) {
+            val m: re.Match = re.find(?prog.ok, (t.p::usize + lo)::*u8, (hi - lo)::i64, at);
+            if (!m.ok) { brk; }
+            vector.push[usize](out, lo + m.start::usize);
+            vector.push[usize](out, lo + m.end::usize);
+            hits = hits + 1;
+            if (hits >= MAX_HITS::i64) { ret -2; }
+            if (m.end <= at) { at = at + 1; }
+            or { at = m.end; }
+        }
+        ret 1;
+    }
+    var at: usize = lo;
+    for (at + qn <= hi) {
+        if (matches_at(t.p, hi, at, q, qn)) {
+            vector.push[usize](out, at);
+            vector.push[usize](out, at + qn);
+            hits = hits + 1;
+            if (hits >= MAX_HITS::i64) { ret -2; }
+            at = at + qn;
+        }
+        or { at = at + 1; }
+    }
+    ret 1;
+}
+
+# the line sharing the longest common prefix with the needle's first line and
+# the column where it first differs; false when nothing is close
+fun near_miss(t: *Text, q: *u8, qn: usize, line: *i64, col: *i64) bool {
+    var fn_: usize = 0;
+    for (fn_ < qn && q[fn_] != '\n' && q[fn_] != '\r') { fn_ = fn_ + 1; }
+    if (fn_ < 4) { ret false; }
+    var best: i64 = 0;
+    var bc: usize = 0;
+    var l: i64 = 1;
+    var start: usize = 0;
+    var i: usize = 0;
+    for (i <= t.n) {
+        if (i == t.n || t.p[i] == '\n') {
+            var end: usize = i;
+            if (end > start && t.p[end - 1] == '\r') { end = end - 1; }
+            var cap: usize = end - start;
+            if (cap > fn_) { cap = fn_; }
+            if (cap > 512) { cap = 512; }
+            var c: usize = 0;
+            for (c < cap && t.p[start + c] == q[c]) { c = c + 1; }
+            if (c > bc) {
+                bc = c;
+                best = l;
+            }
+            l = l + 1;
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    if (best == 0 || bc * 2 < fn_) { ret false; }
+    @line = best;
+    @col = (bc + 1)::i64;
+    ret true;
+}
+
+# report a not-found or ambiguous needle with the hit lines involved
+fun hit_err(a: *A.Allocator, t: *Text, hits: *vector.Vector[usize], what: str, q: *u8, qn: usize, e: *Err) bool {
+    val n: usize = hits.len / 2;
+    if (n == 0) {
+        var ml: i64 = 0;
+        var mc: i64 = 0;
+        var w: jw.Jw = jw.init(a);
+        jw.raw(?w, what);
+        if (q != nil && near_miss(t, q, qn, ?ml, ?mc)) {
+            jw.raw(?w, " text not found; the closest line is the reported line, and they differ at column ");
+            var num: [24]u8;
+            val k: usize = util.fmt_i64(?num[0], 24, mc);
+            jw.bytes(?w, ?num[0], k);
+        }
+        or {
+            jw.raw(?w, " text not found; read the file again and copy the text exactly");
+        }
+        if (w.failed || w.buf == nil) { ret fail(e, "edit_not_found", "text not found", 0); }
+        ret fail(e, "edit_not_found", w.buf, ml);
+    }
+    var w: jw.Jw = jw.init(a);
+    jw.raw(?w, what);
+    jw.raw(?w, " text matches ");
+    var num: [24]u8;
+    val k: usize = util.fmt_i64(?num[0], 24, n::i64);
+    jw.bytes(?w, ?num[0], k);
+    jw.raw(?w, " times (lines");
+    var i: usize = 0;
+    for (i < n && i < 5) {
+        jw.raw(?w, " ");
+        val m: usize = util.fmt_i64(?num[0], 24, line_of(t.p, hits.data[i * 2]));
+        jw.bytes(?w, ?num[0], m);
+        i = i + 1;
+    }
+    jw.raw(?w, "); include surrounding lines to make it unique, set occurrence, set count, or set all to true");
+    if (w.failed || w.buf == nil) { ret fail(e, "edit_ambiguous", "text matches more than once", line_of(t.p, hits.data[0])); }
+    ret fail(e, "edit_ambiguous", w.buf, line_of(t.p, hits.data[0]));
+}
+
+# the byte span an edit's "within" limits it to; the whole file when absent.
+# a within is [first, last] lines, a string, or {find|find_re, occurrence}
+fun scope(a: *A.Allocator, t: *Text, obj: *json.Value, sa: *usize, sb: *usize, e: *Err) bool {
+    @sa = 0;
+    @sb = t.n;
+    val f: opt[*json.Value] = json.value_find(obj, "within");
+    if (!sel f.some) { ret true; }
+    if (json.value_is_array(f.some)) {
+        if (json.value_count(f.some) != 2) {
+            ret fail(e, "edit_bad", "within as a list must be [first, last], both 1-based and inclusive", 0);
+        }
+        var lo: i64 = 0;
+        var hi: i64 = 0;
+        val g0: opt[*json.Value] = json.value_get(f.some, 0);
+        val g1: opt[*json.Value] = json.value_get(f.some, 1);
+        if (sel g0.some) {
+            if (json.value_is_number(g0.some)) { lo = json.value_number(g0.some); }
+        }
+        if (sel g1.some) {
+            if (json.value_is_number(g1.some)) { hi = json.value_number(g1.some); }
+        }
+        val total: i64 = count_lines(t)::i64;
+        if (lo < 1 || hi < lo || hi > total) {
+            ret fail(e, "edit_range", "within lines are outside the file", 0);
+        }
+        @sa = line_start(t, lo::usize);
+        @sb = line_start(t, (hi + 1)::usize);
+        ret true;
+    }
+    var wp: *u8 = nil;
+    var wpn: usize = 0;
+    var wre: bool = false;
+    var wocc: i64 = 0;
+    if (json.value_is_string(f.some)) {
+        if (get_str(a, obj, "within", ?wp, ?wpn) != 1 || wpn == 0) {
+            ret fail(e, "edit_bad", "within must be a non-empty string, {find|find_re:...}, or [first, last]", 0);
+        }
+    }
+    or (json.value_is_object(f.some)) {
+        val wf: opt[*json.Value] = json.value_find(f.some, "find");
+        val wr: opt[*json.Value] = json.value_find(f.some, "find_re");
+        if (sel wf.some) {
+            if (get_str(a, f.some, "find", ?wp, ?wpn) != 1 || wpn == 0) {
+                ret fail(e, "edit_bad", "within find must be a non-empty string", 0);
+            }
+        }
+        or (sel wr.some) {
+            if (get_str(a, f.some, "find_re", ?wp, ?wpn) != 1 || wpn == 0) {
+                ret fail(e, "edit_bad", "within find_re must be a non-empty string", 0);
+            }
+            wre = true;
+        }
+        or { ret fail(e, "edit_bad", "within needs find or find_re", 0); }
+        if (get_int(f.some, "occurrence", ?wocc) == -1) {
+            ret fail(e, "edit_bad", "occurrence must be an integer", 0);
+        }
+    }
+    or { ret fail(e, "edit_bad", "within must be a string, {find|find_re:...}, or [first, last]", 0); }
+    if (!wre) {
+        var w2: *u8 = nil;
+        var w2n: usize = 0;
+        var nrm: bool = false;
+        if (!norm_text(a, t, wp, wpn, ?w2, ?w2n, ?nrm)) { ret fail(e, "oom", "out of memory", 0); }
+        if (nrm) { wp = w2; wpn = w2n; t.normed = true; }
+    }
+    var hits: vector.Vector[usize] = vector.init[usize](a);
+    val r: i64 = collect(a, t, 0, t.n, wp, wpn, wre, ?hits);
+    if (r == -1) { ret fail(e, "edit_bad", "within pattern failed to compile", 0); }
+    if (r == -2) { ret fail(e, "edit_too_many", "within matches too many times; narrow it", 0); }
+    if (wocc == 0 && hits.len / 2 != 1) { ret hit_err(a, t, ?hits, "within", wp, wpn, e); }
+    if (hits.len == 0) { ret hit_err(a, t, ?hits, "within", wp, wpn, e); }
+    var ms: usize = 0;
+    var me: usize = 0;
+    if (wocc != 0) {
+        var at: i64 = wocc - 1;
+        if (wocc < 0) { at = (hits.len / 2)::i64 + wocc; }
+        if (at < 0 || at >= (hits.len / 2)::i64) {
+            ret fail(e, "edit_not_found", "within occurrence is outside the matches", line_of(t.p, hits.data[0]));
+        }
+        ms = hits.data[at::usize * 2];
+        me = hits.data[at::usize * 2 + 1];
+    }
+    or {
+        ms = hits.data[0];
+        me = hits.data[1];
+    }
+    @sa = ms;
+    @sb = me;
+    ret true;
+}
+
+fun find_edit(a: *A.Allocator, t: *Text, obj: *json.Value, e: *Err) bool {
+    var sa: usize = 0;
+    var sb: usize = 0;
+    if (!scope(a, t, obj, ?sa, ?sb, e)) { ret false; }
+    var q: *u8 = nil;
+    var qn: usize = 0;
+    if (get_str(a, obj, "find", ?q, ?qn) != 1 || qn == 0) { ret fail(e, "edit_bad", "find must be a non-empty string", 0); }
+    var q2: *u8 = nil;
+    var q2n: usize = 0;
+    var nrm: bool = false;
+    if (!norm_text(a, t, q, qn, ?q2, ?q2n, ?nrm)) { ret fail(e, "oom", "out of memory", 0); }
+    if (nrm) { q = q2; qn = q2n; t.normed = true; }
+    var rp: *u8 = nil;
+    var rn: usize = 0;
+    val rs: i64 = get_str(a, obj, "replace", ?rp, ?rn);
+    if (rs == -1) { ret fail(e, "edit_bad", "replace must be a string", 0); }
+    if (rs == 0) { rp = ""; }
+    var rp2: *u8 = nil;
+    var rn2: usize = 0;
+    var rch: bool = false;
+    if (!norm_text(a, t, rp, rn, ?rp2, ?rn2, ?rch)) { ret fail(e, "oom", "out of memory", 0); }
+    if (rch) { rp = rp2; rn = rn2; t.normed = true; }
+    val all: bool = get_bool(obj, "all");
+    var want: i64 = 1;
+    if (get_int(obj, "count", ?want) == -1 || want < 1) { ret fail(e, "edit_bad", "count must be a positive integer", 0); }
+    var occ: i64 = 0;
+    if (get_int(obj, "occurrence", ?occ) == -1) { ret fail(e, "edit_bad", "occurrence must be an integer", 0); }
+    var hits: vector.Vector[usize] = vector.init[usize](a);
+    val rc: i64 = collect(a, t, sa, sb, q, qn, false, ?hits);
+    if (rc == -2) { ret fail(e, "edit_too_many", "find text matches too many times; scope it with within", 0); }
+    val n: usize = hits.len / 2;
+    if (n == 0) {
+        var first: usize = 0;
+        for (first < qn && q[first] != '\n') { first = first + 1; }
+        var s: usize = 0;
+        for (s < first && (q[s] == ' ' || q[s] == '\t')) { s = s + 1; }
+        var near: i64 = 0;
+        if (first > s) {
+            var k: usize = 0;
+            for (k + (first - s) <= t.n && near == 0) {
+                if (matches_at(t.p, t.n, k, (q::usize + s)::*u8, first - s)) { near = line_of(t.p, k); }
+                k = k + 1;
+            }
+        }
+        if (near > 0) {
+            ret fail(e, "edit_not_found", "find text not found; its first line appears at the reported line, so check indentation, whitespace, and the lines after it", near);
+        }
+        val spaced: i64 = near_space(t.p, t.n, q, first);
+        if (spaced > 0) {
+            ret fail(e, "edit_not_found", "find text not found; the reported line matches once extra spaces are removed", spaced);
+        }
+        var ml: i64 = 0;
+        var mc: i64 = 0;
+        if (near_miss(t, q, qn, ?ml, ?mc)) {
+            var w3: jw.Jw = jw.init(a);
+            jw.raw(?w3, "find text not found; the closest line is the reported line, and they differ at column ");
+            var num: [24]u8;
+            val mk: usize = util.fmt_i64(?num[0], 24, mc);
+            jw.bytes(?w3, ?num[0], mk);
+            if (w3.failed || w3.buf == nil) { ret fail(e, "edit_not_found", "text not found", 0); }
+            ret fail(e, "edit_not_found", w3.buf, ml);
+        }
+        ret fail(e, "edit_not_found", "find text not found in the file; read the file again and copy the text exactly", 0);
+    }
+    if (occ != 0) {
+        var at: i64 = occ - 1;
+        if (occ < 0) { at = n::i64 + occ; }
+        if (at < 0 || at >= n::i64) {
+            ret fail(e, "edit_not_found", "occurrence is outside the matches", line_of(t.p, hits.data[0]));
+        }
+        if (!splice(a, t, hits.data[at::usize * 2], hits.data[at::usize * 2 + 1], rp, rn)) {
+            ret fail(e, "oom", "out of memory", 0);
+        }
+        ret true;
+    }
+    if (!all && n != want::usize) {
+        ret hit_err(a, t, ?hits, "find", q, qn, e);
+    }
+    var w: jw.Jw = jw.init(a);
+    jw.bytes(?w, t.p, sa);
+    var i: usize = sa;
+    var run: usize = sa;
+    for (i + qn <= sb) {
+        if (matches_at(t.p, sb, i, q, qn)) {
+            jw.bytes(?w, (t.p::usize + run)::*u8, i - run);
+            jw.bytes(?w, rp, rn);
+            i = i + qn;
+            run = i;
+        }
+        or { i = i + 1; }
+    }
+    jw.bytes(?w, (t.p::usize + run)::*u8, t.n - run);
+    if (w.failed) { ret fail(e, "oom", "out of memory", 0); }
+    if (w.buf == nil) {
+        t.p = "";
+        t.n = 0;
+    }
+    or {
+        t.p = w.buf;
+        t.n = w.len;
+    }
+    ret true;
+}
+
+# write the replacement with \0..\9 expanded from the match's captures;
+# \\ stays a backslash, any other \c keeps both bytes
+fun expand_repl(w: *jw.Jw, p: *u8, r: *u8, rn: usize, m: *re.Match, base: usize) {
+    var i: usize = 0;
+    for (i < rn) {
+        if (r[i] == '\\' && i + 1 < rn) {
+            val c: u8 = r[i + 1];
+            if (c >= '0' && c <= '9') {
+                val gi: usize = (c - '0')::usize;
+                if (m.cs[gi] >= 0 && m.ce[gi] >= m.cs[gi]) {
+                    jw.bytes(w, (p::usize + base + m.cs[gi]::usize)::*u8, (m.ce[gi] - m.cs[gi])::usize);
+                }
+                i = i + 2;
+                cnt;
+            }
+            if (c == '\\') {
+                jw.byte(w, '\\');
+                i = i + 2;
+                cnt;
+            }
+        }
+        jw.byte(w, r[i]);
+        i = i + 1;
+    }
+}
+
+# find_re: the qark regex dialect — . [] () | * + ? {} ^ $ \< \> \d \w \s —
+# with captures \0..\9 in the replacement and all/count/occurrence/within
+fun re_edit(a: *A.Allocator, t: *Text, obj: *json.Value, e: *Err) bool {
+    var sa: usize = 0;
+    var sb: usize = 0;
+    if (!scope(a, t, obj, ?sa, ?sb, e)) { ret false; }
+    var q: *u8 = nil;
+    var qn: usize = 0;
+    if (get_str(a, obj, "find_re", ?q, ?qn) != 1 || qn == 0) { ret fail(e, "edit_bad", "find_re must be a non-empty string", 0); }
+    var rp: *u8 = nil;
+    var rn: usize = 0;
+    val rs: i64 = get_str(a, obj, "replace", ?rp, ?rn);
+    if (rs == -1) { ret fail(e, "edit_bad", "replace must be a string", 0); }
+    if (rs == 0) { rp = ""; }
+    var rp2: *u8 = nil;
+    var rn2: usize = 0;
+    var rch: bool = false;
+    if (!norm_text(a, t, rp, rn, ?rp2, ?rn2, ?rch)) { ret fail(e, "oom", "out of memory", 0); }
+    if (rch) { rp = rp2; rn = rn2; t.normed = true; }
+    val all: bool = get_bool(obj, "all");
+    var want: i64 = 1;
+    if (get_int(obj, "count", ?want) == -1 || want < 1) { ret fail(e, "edit_bad", "count must be a positive integer", 0); }
+    var occ: i64 = 0;
+    if (get_int(obj, "occurrence", ?occ) == -1) { ret fail(e, "edit_bad", "occurrence must be an integer", 0); }
+    val prog: res[re.Prog, A.Error] = re.compile(a, q, qn);
+    if (sel prog.err) { ret fail(e, "edit_bad", "find_re pattern failed to compile", 0); }
+    var progv: re.Prog = prog.ok;
+    var hits: vector.Vector[re.Match] = vector.init[re.Match](a);
+    var spans: vector.Vector[usize] = vector.init[usize](a);
+    var at: i64 = 0;
+    for (at <= (sb - sa)::i64) {
+        val m: re.Match = re.find(?progv, (t.p::usize + sa)::*u8, (sb - sa)::i64, at);
+        if (!m.ok) { brk; }
+        vector.push[re.Match](?hits, m);
+        vector.push[usize](?spans, sa + m.start::usize);
+        vector.push[usize](?spans, sa + m.end::usize);
+        if (hits.len >= MAX_HITS) {
+            re.dnit(?progv);
+            ret fail(e, "edit_too_many", "find_re matches too many times; narrow it or scope it with within", 0);
+        }
+        if (m.end <= at) { at = at + 1; }
+        or { at = m.end; }
+    }
+    val n: usize = hits.len;
+    if (n == 0) {
+        re.dnit(?progv);
+        if (t.crlf) {
+            ret fail(e, "edit_not_found", "find_re pattern matched nothing; the file uses CRLF line endings, so a newline in the pattern needs \\r\\n", 0);
+        }
+        ret fail(e, "edit_not_found", "find_re pattern matched nothing; check the dialect or read the file again", 0);
+    }
+    var occ_at: i64 = -1;
+    if (occ != 0) {
+        occ_at = occ - 1;
+        if (occ < 0) { occ_at = n::i64 + occ; }
+        if (occ_at < 0 || occ_at >= n::i64) {
+            re.dnit(?progv);
+            ret fail(e, "edit_not_found", "occurrence is outside the matches", line_of(t.p, spans.data[0]));
+        }
+    }
+    or (!all && n != want::usize) {
+        re.dnit(?progv);
+        ret hit_err(a, t, ?spans, "find_re", nil, 0, e);
+    }
+    var w: jw.Jw = jw.init(a);
+    jw.bytes(?w, t.p, sa);
+    var run: usize = sa;
+    var i: usize = 0;
+    for (i < n) {
+        if (occ_at < 0 || i::i64 == occ_at) {
+            val m: re.Match = hits.data[i];
+            val ms: usize = sa + m.start::usize;
+            jw.bytes(?w, (t.p::usize + run)::*u8, ms - run);
+            expand_repl(?w, t.p, rp, rn, ?hits.data[i], sa);
+            run = sa + m.end::usize;
+        }
+        i = i + 1;
+    }
+    jw.bytes(?w, (t.p::usize + run)::*u8, t.n - run);
+    re.dnit(?progv);
+    if (w.failed) { ret fail(e, "oom", "out of memory", 0); }
+    if (w.buf == nil) {
+        t.p = "";
+        t.n = 0;
+    }
+    or {
+        t.p = w.buf;
+        t.n = w.len;
+    }
+    ret true;
+}
+
+fun range_edit(a: *A.Allocator, t: *Text, obj: *json.Value, e: *Err) bool {
+    val f: opt[*json.Value] = json.value_find(obj, "lines");
+    if (!sel f.some) { ret fail(e, "edit_bad", "lines must be [first, last]", 0); }
+    if (!json.value_is_array(f.some) || json.value_count(f.some) != 2) { ret fail(e, "edit_bad", "lines must be [first, last], both 1-based and inclusive", 0); }
+    var lo: i64 = 0;
+    var hi: i64 = 0;
+    val g0: opt[*json.Value] = json.value_get(f.some, 0);
+    val g1: opt[*json.Value] = json.value_get(f.some, 1);
+    if (sel g0.some) {
+        if (json.value_is_number(g0.some)) { lo = json.value_number(g0.some); }
+    }
+    if (sel g1.some) {
+        if (json.value_is_number(g1.some)) { hi = json.value_number(g1.some); }
+    }
+    val total: i64 = count_lines(t)::i64;
+    if (lo < 1 || hi < lo || hi > total) {
+        var w: jw.Jw = jw.init(a);
+        jw.raw(?w, "lines is outside the file, which has ");
+        var num: [24]u8;
+        val k: usize = util.fmt_i64(?num[0], 24, total);
+        jw.bytes(?w, ?num[0], k);
+        jw.raw(?w, " lines");
+        if (w.buf == nil) { ret fail(e, "edit_range", "lines is outside the file", 0); }
+        ret fail(e, "edit_range", w.buf, 0);
+    }
+    var ins: *u8 = nil;
+    var insn: usize = 0;
+    if (!with_lines(a, t, obj, ?ins, ?insn)) { ret fail(e, "edit_bad", "a lines edit needs a with — a string or a list of strings", 0); }
+    val from: usize = line_start(t, lo::usize);
+    val to: usize = line_start(t, (hi + 1)::usize);
+    if (to == t.n && t.n > 0 && t.p[t.n - 1] != '\n' && insn > 0) {
+        var trim: usize = insn;
+        if (trim > 0 && ins[trim - 1] == '\n') { trim = trim - 1; }
+        if (trim > 0 && ins[trim - 1] == '\r') { trim = trim - 1; }
+        insn = trim;
+    }
+    if (!splice(a, t, from, to, ins, insn)) { ret fail(e, "oom", "out of memory", 0); }
+    ret true;
+}
+
+# the 1-based line an insert anchor names: the line containing the match,
+# or the one after its last line when the insert goes after
+fun anchor_line(a: *A.Allocator, t: *Text, obj: *json.Value, key: str, after: bool, e: *Err) i64 {
+    var sa: usize = 0;
+    var sb: usize = 0;
+    if (!scope(a, t, obj, ?sa, ?sb, e)) { ret -1; }
+    var wp: *u8 = nil;
+    var wpn: usize = 0;
+    var wre: bool = false;
+    var wocc: i64 = 0;
+    val f: opt[*json.Value] = json.value_find(obj, key);
+    if (!sel f.some) {
+        fail(e, "edit_bad", "insert_before and insert_after take a 1-based line number or an anchor", 0);
+        ret -1;
+    }
+    if (json.value_is_string(f.some)) {
+        if (get_str(a, obj, key, ?wp, ?wpn) != 1 || wpn == 0) {
+            fail(e, "edit_bad", "insert anchors take a non-empty string, {find|find_re:...}, or a line number", 0);
+            ret -1;
+        }
+    }
+    or (json.value_is_object(f.some)) {
+        val wf: opt[*json.Value] = json.value_find(f.some, "find");
+        val wr: opt[*json.Value] = json.value_find(f.some, "find_re");
+        if (sel wf.some) {
+            if (get_str(a, f.some, "find", ?wp, ?wpn) != 1 || wpn == 0) {
+                fail(e, "edit_bad", "insert anchor find must be a non-empty string", 0);
+                ret -1;
+            }
+        }
+        or (sel wr.some) {
+            if (get_str(a, f.some, "find_re", ?wp, ?wpn) != 1 || wpn == 0) {
+                fail(e, "edit_bad", "insert anchor find_re must be a non-empty string", 0);
+                ret -1;
+            }
+            wre = true;
+        }
+        or {
+            fail(e, "edit_bad", "insert anchor needs find or find_re", 0);
+            ret -1;
+        }
+        if (get_int(f.some, "occurrence", ?wocc) == -1) {
+            fail(e, "edit_bad", "occurrence must be an integer", 0);
+            ret -1;
+        }
+    }
+    or {
+        fail(e, "edit_bad", "insert_before and insert_after take a 1-based line number or an anchor", 0);
+        ret -1;
+    }
+    if (!wre) {
+        var w2: *u8 = nil;
+        var w2n: usize = 0;
+        var nrm: bool = false;
+        if (!norm_text(a, t, wp, wpn, ?w2, ?w2n, ?nrm)) { fail(e, "oom", "out of memory", 0); ret -1; }
+        if (nrm) { wp = w2; wpn = w2n; t.normed = true; }
+    }
+    var hits: vector.Vector[usize] = vector.init[usize](a);
+    val rc: i64 = collect(a, t, sa, sb, wp, wpn, wre, ?hits);
+    if (rc == -1) {
+        fail(e, "edit_bad", "insert anchor pattern failed to compile", 0);
+        ret -1;
+    }
+    if (rc == -2) {
+        fail(e, "edit_too_many", "insert anchor matches too many times; scope it with within", 0);
+        ret -1;
+    }
+    val n: usize = hits.len / 2;
+    if (n == 0) {
+        hit_err(a, t, ?hits, "insert anchor", wp, wpn, e);
+        ret -1;
+    }
+    var at: usize = 0;
+    if (wocc != 0) {
+        var pick: i64 = wocc - 1;
+        if (wocc < 0) { pick = n::i64 + wocc; }
+        if (pick < 0 || pick >= n::i64) {
+            fail(e, "edit_not_found", "occurrence is outside the matches", line_of(t.p, hits.data[0]));
+            ret -1;
+        }
+        at = pick::usize;
+    }
+    or (n != 1) {
+        hit_err(a, t, ?hits, "insert anchor", wp, wpn, e);
+        ret -1;
+    }
+    if (!after) { ret line_of(t.p, hits.data[at * 2]); }
+    var last: usize = hits.data[at * 2 + 1];
+    if (last > 0) { last = last - 1; }
+    ret line_of(t.p, last) + 1;
+}
+
+fun insert_edit(a: *A.Allocator, t: *Text, obj: *json.Value, after: bool, e: *Err) bool {
+    var key: str = "insert_before";
+    if (after) { key = "insert_after"; }
+    var at_line: i64 = 0;
+    val f: opt[*json.Value] = json.value_find(obj, key);
+    if (sel f.some && json.value_is_number(f.some)) {
+        var n: i64 = 0;
+        if (get_int(obj, key, ?n) != 1) { ret fail(e, "edit_bad", "insert_before and insert_after take a 1-based line number", 0); }
+        if (after) {
+            if (n < 0) { ret fail(e, "edit_range", "insert position is outside the file", 0); }
+            at_line = n + 1;
+        }
+        or { at_line = n; }
+    }
+    or {
+        at_line = anchor_line(a, t, obj, key, after, e);
+        if (at_line < 0) { ret false; }
+    }
+    val total: i64 = count_lines(t)::i64;
+    if (at_line < 1 || at_line > total + 1) {
+        ret fail(e, "edit_range", "insert position is outside the file", 0);
+    }
+    var ins: *u8 = nil;
+    var insn: usize = 0;
+    if (!with_lines(a, t, obj, ?ins, ?insn)) { ret fail(e, "edit_bad", "insert_before and insert_after need a with — a string or a list of strings", 0); }
+    val at: usize = line_start(t, at_line::usize);
+    if (at == t.n && t.n > 0 && t.p[t.n - 1] != '\n') {
+        var w: jw.Jw = jw.init(a);
+        jw.raw(?w, eol(t));
+        jw.bytes(?w, ins, insn);
+        if (w.failed) { ret fail(e, "oom", "out of memory", 0); }
+        if (insn > 0) {
+            var trim: usize = w.len;
+            if (trim > 0 && w.buf[trim - 1] == '\n') { trim = trim - 1; }
+            if (trim > 0 && w.buf[trim - 1] == '\r') { trim = trim - 1; }
+            if (!splice(a, t, at, at, w.buf, trim)) { ret fail(e, "oom", "out of memory", 0); }
+        }
+        ret true;
+    }
+    if (!splice(a, t, at, at, ins, insn)) { ret fail(e, "oom", "out of memory", 0); }
+    ret true;
+}
+
+# run an ex command or normal-mode keys over the text in a sandboxed editor
+fun vim_edit(a: *A.Allocator, name: str, t: *Text, src: *u8, is_ex: bool, e: *Err) bool {
+    val made: res[eng.Engine, A.Error] = eng.init(a);
+    if (sel made.err) { ret fail(e, "oom", "out of memory", 0); }
+    var ed: eng.Engine = made.ok;
+    ed.sandbox = true;
+    val had_final: bool = t.n == 0 || t.p[t.n - 1] == '\n';
+    val loaded: err[A.Error] = eng.load_current(?ed, name, t.p, t.n);
+    if (sel loaded.err) {
+        eng.dnit(?ed);
+        ret fail(e, "oom", "out of memory", 0);
+    }
+    var ran: err[A.Error] = err[A.Error].ok{};
+    if (is_ex) { ran = eng.command(?ed, src); }
+    or { ran = eng.feed(?ed, src); }
+    if (sel ran.err) {
+        var code: str = "edit_keys";
+        var msg: str = "the key sequence could not be parsed";
+        if (is_ex) {
+            code = "edit_ex";
+            msg = "the ex command was refused; only substitute, global, delete, normal, and set run inside an edit";
+        }
+        if (ed.msg != nil) {
+            msg = ed.msg;
+            ed.msg = nil;
+            if (str_contains(msg, "count is above")) { code = "edit_count"; }
+            if (str_contains(msg, "macro nested")) { code = "edit_macro"; }
+        }
+        eng.dnit(?ed);
+        ret fail(e, code, msg, 0);
+    }
+    if (is_ex && ed.msg != nil && util.eq(ed.msg, "unknown command")) {
+        eng.dnit(?ed);
+        ret fail(e, "edit_ex", "unknown ex command", 0);
+    }
+    val joined: res[str, A.Error] = eng.current_text(?ed);
+    eng.dnit(?ed);
+    if (sel joined.err) { ret fail(e, "oom", "out of memory", 0); }
+    var p: *u8 = joined.ok;
+    var n: usize = str_len(p);
+    if (!had_final && n > 0 && p[n - 1] == '\n') { n = n - 1; }
+    if (t.crlf) {
+        var w: jw.Jw = jw.init(a);
+        var i: usize = 0;
+        for (i < n) {
+            if (p[i] == '\n') { jw.raw(?w, "\r\n"); }
+            or { jw.byte(?w, p[i]); }
+            i = i + 1;
+        }
+        if (w.failed) { ret fail(e, "oom", "out of memory", 0); }
+        if (w.buf != nil) {
+            p = w.buf;
+            n = w.len;
+        }
+    }
+    t.p = p;
+    t.n = n;
+    ret true;
+}
+
+# apply a json list of edits to text[0,n); the result comes from a
+pub fun apply(a: *A.Allocator, name: str, text: *u8, n: usize, edits: *json.Value, out: **u8, out_len: *usize, e: *Err, norm: *bool, mixed: *bool) bool {
+    e.code = nil;
+    e.msg = nil;
+    e.index = -1;
+    e.line = 0;
+    @norm = false;
+    @mixed = false;
+    if (!json.value_is_array(edits) || json.value_count(edits) == 0) {
+        ret fail(e, "edit_bad", "edits must be a non-empty list", 0);
+    }
+    var t: Text;
+    t.p = text;
+    t.n = n;
+    t.crlf = false;
+    t.normed = false;
+    t.mixed = false;
+    var i: usize = 0;
+    var first_done: bool = false;
+    for (i < n) {
+        if (text[i] == '\n') {
+            val is_crlf: bool = i > 0 && text[i - 1] == '\r';
+            if (!first_done) { t.crlf = is_crlf; first_done = true; }
+            or {
+                if (is_crlf != t.crlf) { t.mixed = true; brk; }
+            }
+        }
+        i = i + 1;
+    }
+    var k: usize = 0;
+    for (k < json.value_count(edits)) {
+        e.index = k::i64;
+        val g: opt[*json.Value] = json.value_get(edits, k);
+        if (!sel g.some) { ret fail(e, "edit_bad", "missing edit", 0); }
+        val obj: *json.Value = g.some;
+        if (!json.value_is_object(obj)) { ret fail(e, "edit_bad", "each edit must be an object", 0); }
+        var ok: bool = false;
+        val has_find: opt[*json.Value] = json.value_find(obj, "find");
+        val has_find_re: opt[*json.Value] = json.value_find(obj, "find_re");
+        val has_lines: opt[*json.Value] = json.value_find(obj, "lines");
+        val has_before: opt[*json.Value] = json.value_find(obj, "insert_before");
+        val has_after: opt[*json.Value] = json.value_find(obj, "insert_after");
+        val has_append: opt[*json.Value] = json.value_find(obj, "append");
+        val has_prepend: opt[*json.Value] = json.value_find(obj, "prepend");
+        val has_ex: opt[*json.Value] = json.value_find(obj, "ex");
+        val has_keys: opt[*json.Value] = json.value_find(obj, "keys");
+        if (sel has_find_re.some) { ok = re_edit(a, ?t, obj, e); }
+        or (sel has_find.some) { ok = find_edit(a, ?t, obj, e); }
+        or (sel has_lines.some) { ok = range_edit(a, ?t, obj, e); }
+        or (sel has_before.some) { ok = insert_edit(a, ?t, obj, false, e); }
+        or (sel has_after.some) { ok = insert_edit(a, ?t, obj, true, e); }
+        or (sel has_append.some || sel has_prepend.some) {
+            var p: *u8 = nil;
+            var pn: usize = 0;
+            val is_append: bool = sel has_append.some;
+            var key: str = "prepend";
+            if (is_append) { key = "append"; }
+            if (get_str(a, obj, key, ?p, ?pn) != 1) { ret fail(e, "edit_bad", "append and prepend take a string", 0); }
+            var p2: *u8 = nil;
+            var p2n: usize = 0;
+            var ch: bool = false;
+            if (!norm_text(a, ?t, p, pn, ?p2, ?p2n, ?ch)) { ret fail(e, "oom", "out of memory", 0); }
+            if (ch) { p = p2; pn = p2n; t.normed = true; }
+            if (is_append) { ok = splice(a, ?t, t.n, t.n, p, pn); }
+            or { ok = splice(a, ?t, 0, 0, p, pn); }
+            if (!ok) { ret fail(e, "oom", "out of memory", 0); }
+        }
+        or (sel has_ex.some || sel has_keys.some) {
+            val is_ex: bool = sel has_ex.some;
+            var key: str = "keys";
+            if (is_ex) { key = "ex"; }
+            var p: *u8 = nil;
+            var pn: usize = 0;
+            if (get_str(a, obj, key, ?p, ?pn) != 1 || pn == 0) { ret fail(e, "edit_bad", "ex and keys take a non-empty string", 0); }
+            ok = vim_edit(a, name, ?t, p, is_ex, e);
+        }
+        or {
+            ret fail(e, "edit_bad", "an edit needs one of find, find_re, lines, insert_before, insert_after, append, prepend, ex, or keys", 0);
+        }
+        if (!ok) { ret false; }
+        k = k + 1;
+    }
+    @norm = t.normed;
+    @mixed = t.mixed;
+    @out = t.p;
+    @out_len = t.n;
+    ret true;
+}
+
+use std.system.capability;
+
+$if (capability.HOSTED) {
+    use page: std.allocator.page;
+
+    fun same(got: *u8, gn: usize, want: str) bool {
+        if (gn != str_len(want)) { ret false; }
+        var i: usize = 0;
+        for (i < gn) {
+            if (got[i] != want[i]) { ret false; }
+            i = i + 1;
+        }
+        ret true;
+    }
+
+    fun run(a: *A.Allocator, src: str, spec: str, out: **u8, on: *usize, e: *Err, norm: *bool) bool {
+        val pj: res[json.Value, json.JsonError] = json.parse(spec, str_len(spec), a);
+        if (sel pj.err) { ret false; }
+        var arr: json.Value = pj.ok;
+        var mx: bool = false;
+        ret apply(a, "f.txt", src, str_len(src), ?arr, out, on, e, norm, ?mx);
+    }
+
+    test edit__lf_find_on_crlf {
+        var a: A.Allocator;
+        val made: err[A.Error] = page.make(?a);
+        if (sel made.err) { ret 1; }
+        var out: *u8 = nil;
+        var on: usize = 0;
+        var e: Err;
+        var norm: bool = false;
+        if (!run(?a, "alpha\r\nbeta\r\ngamma\r\n", "[{\"find\":\"beta\\ngamma\",\"replace\":\"B\\nG\"}]", ?out, ?on, ?e, ?norm)) { ret 2; }
+        if (!norm) { ret 3; }
+        if (!same(out, on, "alpha\r\nB\r\nG\r\n")) { ret 4; }
+        ret 0;
+    }
+
+    test edit__crlf_find_on_lf {
+        var a: A.Allocator;
+        val made: err[A.Error] = page.make(?a);
+        if (sel made.err) { ret 1; }
+        var out: *u8 = nil;
+        var on: usize = 0;
+        var e: Err;
+        var norm: bool = false;
+        if (!run(?a, "one\ntwo\nthree\n", "[{\"find\":\"one\\r\\ntwo\",\"replace\":\"ONE\\r\\nTWO\"}]", ?out, ?on, ?e, ?norm)) { ret 2; }
+        if (!norm) { ret 3; }
+        if (!same(out, on, "ONE\nTWO\nthree\n")) { ret 4; }
+        ret 0;
+    }
+
+    test edit__within_and_anchor_norm {
+        var a: A.Allocator;
+        val made: err[A.Error] = page.make(?a);
+        if (sel made.err) { ret 1; }
+        var out: *u8 = nil;
+        var on: usize = 0;
+        var e: Err;
+        var norm: bool = false;
+        if (!run(?a, "alpha\r\nbeta\r\ngamma\r\n", "[{\"find\":\"beta\",\"replace\":\"BETA\",\"within\":\"beta\\ngamma\"},{\"insert_after\":\"alpha\",\"with\":\"mid\\n\"}]", ?out, ?on, ?e, ?norm)) { ret 2; }
+        if (!norm) { ret 3; }
+        if (!same(out, on, "alpha\r\nmid\r\nBETA\r\ngamma\r\n")) { ret 4; }
+        ret 0;
+    }
+
+    test edit__no_norm_when_matching {
+        var a: A.Allocator;
+        val made: err[A.Error] = page.make(?a);
+        if (sel made.err) { ret 1; }
+        var out: *u8 = nil;
+        var on: usize = 0;
+        var e: Err;
+        var norm: bool = false;
+        if (!run(?a, "one\ntwo\n", "[{\"find\":\"two\",\"replace\":\"TWO\"}]", ?out, ?on, ?e, ?norm)) { ret 2; }
+        if (norm) { ret 3; }
+        if (!same(out, on, "one\nTWO\n")) { ret 4; }
+        ret 0;
+    }
+
+    test edit__near_miss_reports_line_and_col {
+        var a: A.Allocator;
+        val made: err[A.Error] = page.make(?a);
+        if (sel made.err) { ret 1; }
+        var out: *u8 = nil;
+        var on: usize = 0;
+        var e: Err;
+        var norm: bool = false;
+        if (run(?a, "one\ntwo\nthree\n", "[{\"find\":\"threE\",\"replace\":\"x\"}]", ?out, ?on, ?e, ?norm)) { ret 2; }
+        if (e.code == nil || !str_contains(e.code, "edit_not_found")) { ret 3; }
+        if (e.line != 3) { ret 4; }
+        if (e.msg == nil || !str_contains(e.msg, "column 5")) { ret 5; }
+        ret 0;
+    }
+
+    test edit__re_crlf_hint {
+        var a: A.Allocator;
+        val made: err[A.Error] = page.make(?a);
+        if (sel made.err) { ret 1; }
+        var out: *u8 = nil;
+        var on: usize = 0;
+        var e: Err;
+        var norm: bool = false;
+        if (run(?a, "alpha\r\nbeta\r\n", "[{\"find_re\":\"alpha\\nbeta\",\"replace\":\"X\"}]", ?out, ?on, ?e, ?norm)) { ret 2; }
+        if (e.code == nil || !str_contains(e.code, "edit_not_found")) { ret 3; }
+        if (e.msg == nil || !str_contains(e.msg, "\\r\\n")) { ret 4; }
+        ret 0;
+    }
+}

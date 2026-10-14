@@ -1,0 +1,5 @@
+﻿function doubleSum(n) {
+    return 2 * (n * (n + 1) / 2);
+}
+
+console.log(doubleSum(10));

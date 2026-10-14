@@ -1,0 +1,1723 @@
+# handlebars-style templates rendered against json values
+#
+#   {{name}} {{a.b}} {{items.0}} {{.}} {{this.x}} {{@index}} {{@first}} {{@last}} {{@key}}
+#   {{x|filter|filter:arg}}
+#   {{#each xs}}..{{else}}..{{/each}}  {{#if x}}..{{else}}..{{/if}}
+#   {{#unless x}}..{{/unless}}  {{#with x}}..{{/with}}  {{> partial}}
+#   {{! comment }}  {{!-- comment with }} inside --}}
+#
+# filters on values: json py js ps sh (literals for that language), count, join:SEP, default:TEXT
+# filters on text:   upper lower trim snake camel pascal kebab const ident indent:N
+#
+# a block, comment, or partial tag alone on its line takes the whole line with
+# it, so templates can be laid out like the code they produce. an unknown
+# variable is an error naming its line, unless it is an #if/#unless condition
+# or a default filter supplies text.
+
+use std.collections.vector;
+use std.data.json;
+use std.io.writer;
+use std.io.writer.WriteError;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+
+use A: std.allocator;
+use ident: qark.gen.validate;
+use util: qark.util;
+
+pub val T_TEXT:    u8 = 0;
+pub val T_VAR:     u8 = 1;
+pub val T_OPEN:    u8 = 2;
+pub val T_ELSE:    u8 = 3;
+pub val T_CLOSE:   u8 = 4;
+pub val T_COMMENT: u8 = 5;
+pub val T_PARTIAL: u8 = 6;
+
+val S_EACH:   u8 = 1;
+val S_IF:     u8 = 2;
+val S_UNLESS: u8 = 3;
+val S_WITH:   u8 = 4;
+
+val V_MISSING: u8 = 0;
+val V_JSON:    u8 = 1;
+val V_INT:     u8 = 2;
+val V_BOOL:    u8 = 3;
+val V_TEXT:    u8 = 4;
+
+val MAX_SCOPES:  usize = 32;
+val MAX_PARTIAL: i64   = 8;
+
+# one lexed piece of a template
+# ---
+# start, len: TEXT span, or a tag's expression
+# head, keep: TEXT bytes dropped from the front, and kept from the start, by standalone tags
+# pair:       OPEN and ELSE: index of the CLOSE
+# els:        OPEN: index of its ELSE, 0 for none
+pub rec Tok {
+    kind:       u8;
+    sect:       u8;
+    start:      usize;
+    len:        usize;
+    head:       usize;
+    keep:       usize;
+    line:       i64;
+    pair:       usize;
+    els:        usize;
+    standalone: bool;
+    ind_start:  usize;
+    ind_len:    usize;
+}
+
+# why a render stopped
+# ---
+# code:  static code such as tmpl_var
+# msg:   message owned by the render allocator
+# line:  1-based line in the template named by tname
+pub rec Err {
+    code:  str;
+    msg:   str;
+    line:  i64;
+    tname: str;
+}
+
+# how {{> name}} finds another template
+pub rec Lib {
+    ctx:  *u8;
+    find: fun(*u8, str, **u8, *usize, *str) bool;
+}
+
+rec Scope {
+    v:     *json.Value;
+    each:  bool;
+    index: i64;
+    count: i64;
+    key:   *u8;
+    keyn:  usize;
+}
+
+# the variables a render can see, innermost last
+pub rec Ctx {
+    scopes: [32]Scope;
+    n:      usize;
+}
+
+rec Val {
+    kind: u8;
+    v:    *json.Value;
+    n:    i64;
+    p:    *u8;
+    len:  usize;
+}
+
+# one parsed filter: name and argument spans
+rec Filter {
+    name: [16]u8;
+    arg:  *u8;
+    argn: usize;
+}
+
+# a {{expr|filters}} tag, parsed once when the template is compiled
+rec Slot {
+    on:      bool;
+    code:    bool;
+    ps:      usize;
+    pend:    usize;
+    filters: [12]Filter;
+    nf:      usize;
+}
+
+# a template compiled to tokens; render walks this instead of lexing again
+pub rec Prog {
+    body:  *u8;
+    len:   usize;
+    toks:  *Tok;
+    ntok:  usize;
+    slots: *Slot;
+    ready: bool;
+}
+
+rec Held {
+    body: *u8;
+    len:  usize;
+    prog: Prog;
+}
+
+# templates compiled during one apply, keyed by the body pointer
+pub rec Cache {
+    items: vector.Vector[Held];
+}
+
+rec Buf {
+    a:      *A.Allocator;
+    p:      *u8;
+    len:    usize;
+    cap:    usize;
+    failed: bool;
+}
+
+rec R {
+    a:     *A.Allocator;
+    body:  *u8;
+    toks:  *Tok;
+    ntok:  usize;
+    out:   Buf;
+    ctx:   *Ctx;
+    lang:  str;
+    name:  str;
+    lib:   *Lib;
+    depth:  i64;
+    err:    *Err;
+    slots:  *Slot;
+    slot_i: usize;
+    cache:  *Cache;
+}
+
+pub fun ctx_init(c: *Ctx) {
+    c.n = 0;
+}
+
+pub fun ctx_push(c: *Ctx, v: *json.Value) bool {
+    if (c.n >= MAX_SCOPES || v == nil) { ret false; }
+    var s: Scope;
+    s.v = v;
+    c.scopes[c.n] = s;
+    c.n = c.n + 1;
+    ret true;
+}
+
+pub fun ctx_push_item(c: *Ctx, v: *json.Value, index: i64, count: i64, key: *u8, keyn: usize) bool {
+    if (c.n >= MAX_SCOPES || v == nil) { ret false; }
+    var s: Scope;
+    s.v = v;
+    s.each = true;
+    s.index = index;
+    s.count = count;
+    s.key = key;
+    s.keyn = keyn;
+    c.scopes[c.n] = s;
+    c.n = c.n + 1;
+    ret true;
+}
+
+pub fun ctx_pop(c: *Ctx) {
+    if (c.n > 0) { c.n = c.n - 1; }
+}
+
+fun buf_bytes(b: *Buf, p: *u8, n: usize) {
+    if (b.failed || n == 0) { ret; }
+    val ap: err[A.Error] = util.append(b.a, ?b.p, ?b.len, ?b.cap, p, n);
+    if (sel ap.err) { b.failed = true; }
+}
+
+fun buf_str(b: *Buf, s: str) {
+    if (s == nil) { ret; }
+    buf_bytes(b, s, str_len(s));
+}
+
+fun buf_byte(b: *Buf, c: u8) {
+    var one: [1]u8;
+    one[0] = c;
+    buf_bytes(b, ?one[0], 1);
+}
+
+fun buf_i64(b: *Buf, n: i64) {
+    var num: [32]u8;
+    val k: usize = util.fmt_i64(?num[0], 32, n);
+    buf_bytes(b, ?num[0], k);
+}
+
+fun buf_init(a: *A.Allocator) Buf {
+    var b: Buf;
+    b.a = a;
+    ret b;
+}
+
+fun sink_write(ctx: ptr, p: *u8, n: usize) res[usize, WriteError] {
+    val b: *Buf = ctx::*Buf;
+    buf_bytes(b, p, n);
+    ret res[usize, WriteError].ok{n};
+}
+
+fun buf_f64(b: *Buf, f: f64) {
+    var w: writer.Writer = writer.Writer{ctx: b::ptr, f_write: sink_write};
+    json.value_f64(?w, f);
+}
+
+# a message built from two literal parts around one byte span, cut to 80 bytes and one line
+fun say(a: *A.Allocator, p1: str, mid: *u8, n: usize, p2: str) str {
+    var b: Buf = buf_init(a);
+    buf_str(?b, p1);
+    var k: usize = 0;
+    var cut: bool = false;
+    for (k < n && k < 80) {
+        if (mid[k] == '\n' || mid[k] == '\r') {
+            cut = true;
+            brk;
+        }
+        k = k + 1;
+    }
+    buf_bytes(?b, mid, k);
+    if (cut || k < n) { buf_str(?b, "..."); }
+    buf_str(?b, p2);
+    if (b.failed || b.p == nil) { ret p1; }
+    ret b.p;
+}
+
+fun fail(a: *A.Allocator, e: *Err, code: str, msg: str, line: i64) bool {
+    e.code = code;
+    e.msg = msg;
+    e.line = line;
+    ret false;
+}
+
+fun is_hspace(c: u8) bool {
+    ret c == ' ' || c == '\t' || c == '\r';
+}
+
+fun is_space(c: u8) bool {
+    ret c == ' ' || c == '\t' || c == '\r' || c == '\n';
+}
+
+fun count_nl(body: *u8, from: usize, to: usize) i64 {
+    var n: i64 = 0;
+    var i: usize = from;
+    for (i < to) {
+        if (body[i] == '\n') { n = n + 1; }
+        i = i + 1;
+    }
+    ret n;
+}
+
+fun find_pair(body: *u8, n: usize, from: usize, c: u8) usize {
+    var i: usize = from;
+    for (i + 1 < n) {
+        if (body[i] == c && body[i + 1] == c) { ret i; }
+        i = i + 1;
+    }
+    ret n;
+}
+
+fun find_comment_end(body: *u8, n: usize, from: usize) usize {
+    var i: usize = from;
+    for (i + 3 < n) {
+        if (body[i] == '-' && body[i + 1] == '-' && body[i + 2] == '}' && body[i + 3] == '}') { ret i; }
+        i = i + 1;
+    }
+    ret n;
+}
+
+fun word_is(body: *u8, start: usize, n: usize, w: str) bool {
+    if (n != str_len(w)) { ret false; }
+    var i: usize = 0;
+    for (i < n) {
+        if (body[start + i] != w[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun sect_of(body: *u8, start: usize, n: usize) u8 {
+    if (word_is(body, start, n, "each")) { ret S_EACH; }
+    if (word_is(body, start, n, "if")) { ret S_IF; }
+    if (word_is(body, start, n, "unless")) { ret S_UNLESS; }
+    if (word_is(body, start, n, "with")) { ret S_WITH; }
+    ret 0;
+}
+
+fun sect_name(s: u8) str {
+    if (s == S_EACH) { ret "each"; }
+    if (s == S_IF) { ret "if"; }
+    if (s == S_UNLESS) { ret "unless"; }
+    ret "with";
+}
+
+fun push_tok(toks: *vector.Vector[Tok], kind: u8, sect: u8, start: usize, len: usize, line: i64) bool {
+    var t: Tok;
+    t.kind = kind;
+    t.sect = sect;
+    t.start = start;
+    t.len = len;
+    t.keep = len;
+    t.line = line;
+    val pushed: res[usize, A.Error] = vector.push[Tok](toks, t);
+    if (sel pushed.err) { ret false; }
+    ret true;
+}
+
+# split a template into text spans and tags
+fun lex(a: *A.Allocator, body: *u8, n: usize, toks: *vector.Vector[Tok], e: *Err) bool {
+    var i: usize = 0;
+    var line: i64 = 1;
+    for (i < n) {
+        val j: usize = find_pair(body, n, i, '{');
+        if (j < n && j > 0 && body[j - 1] == '\\') {
+            if (j - 1 > i) {
+                if (!push_tok(toks, T_TEXT, 0, i, j - 1 - i, line)) { ret fail(a, e, "oom", "out of memory", line); }
+            }
+            if (!push_tok(toks, T_TEXT, 0, j, 2, line)) { ret fail(a, e, "oom", "out of memory", line); }
+            line = line + count_nl(body, i, j + 2);
+            i = j + 2;
+            cnt;
+        }
+        if (j > i) {
+            if (!push_tok(toks, T_TEXT, 0, i, j - i, line)) { ret fail(a, e, "oom", "out of memory", line); }
+            line = line + count_nl(body, i, j);
+        }
+        if (j >= n) { brk; }
+        var open_len: usize = 2;
+        if (j + 2 < n && body[j + 2] == '{') { open_len = 3; }
+        val c0: usize = j + open_len;
+        var k: usize = n;
+        var close_len: usize = 2;
+        var is_long_comment: bool = false;
+        if (c0 + 2 < n && body[c0] == '!' && body[c0 + 1] == '-' && body[c0 + 2] == '-') {
+            k = find_comment_end(body, n, c0 + 3);
+            close_len = 4;
+            is_long_comment = true;
+        }
+        or {
+            k = find_pair(body, n, c0, '}');
+            if (open_len == 3 && k + 2 < n && body[k + 2] == '}') { close_len = 3; }
+        }
+        if (k >= n) { ret fail(a, e, "tmpl_syntax", "a {{ tag is never closed with }}", line); }
+        val tag_line: i64 = line;
+        line = line + count_nl(body, j, k + close_len);
+        var cs: usize = c0;
+        var ce: usize = k;
+        for (cs < ce && is_space(body[cs])) { cs = cs + 1; }
+        for (ce > cs && is_space(body[ce - 1])) { ce = ce - 1; }
+        if (is_long_comment || (cs < ce && body[cs] == '!')) {
+            if (!push_tok(toks, T_COMMENT, 0, cs, ce - cs, tag_line)) { ret fail(a, e, "oom", "out of memory", tag_line); }
+        }
+        or (cs >= ce) {
+            ret fail(a, e, "tmpl_syntax", "empty {{ }} tag", tag_line);
+        }
+        or (body[cs] == '#' || body[cs] == '/') {
+            val opening: bool = body[cs] == '#';
+            var ws: usize = cs + 1;
+            var we: usize = ws;
+            for (we < ce && !is_space(body[we])) { we = we + 1; }
+            val sect: u8 = sect_of(body, ws, we - ws);
+            if (sect == 0) {
+                ret fail(a, e, "tmpl_syntax", say(a, "unknown block {{", (body::usize + cs)::*u8, we - cs, "}}; use #each, #if, #unless, or #with"), tag_line);
+            }
+            if (opening) {
+                var xs: usize = we;
+                for (xs < ce && is_space(body[xs])) { xs = xs + 1; }
+                if (xs >= ce) {
+                    ret fail(a, e, "tmpl_syntax", say(a, "{{#", (body::usize + ws)::*u8, we - ws, "}} needs a variable, as in {{#each items}}"), tag_line);
+                }
+                if (!push_tok(toks, T_OPEN, sect, xs, ce - xs, tag_line)) { ret fail(a, e, "oom", "out of memory", tag_line); }
+            }
+            or {
+                if (!push_tok(toks, T_CLOSE, sect, ws, we - ws, tag_line)) { ret fail(a, e, "oom", "out of memory", tag_line); }
+            }
+        }
+        or (word_is(body, cs, ce - cs, "else")) {
+            if (!push_tok(toks, T_ELSE, 0, cs, ce - cs, tag_line)) { ret fail(a, e, "oom", "out of memory", tag_line); }
+        }
+        or (body[cs] == '>') {
+            var ps: usize = cs + 1;
+            for (ps < ce && is_space(body[ps])) { ps = ps + 1; }
+            if (ps >= ce) { ret fail(a, e, "tmpl_syntax", "{{> }} needs a template name", tag_line); }
+            if (!push_tok(toks, T_PARTIAL, 0, ps, ce - ps, tag_line)) { ret fail(a, e, "oom", "out of memory", tag_line); }
+        }
+        or {
+            if (!push_tok(toks, T_VAR, 0, cs, ce - cs, tag_line)) { ret fail(a, e, "oom", "out of memory", tag_line); }
+        }
+        i = k + close_len;
+    }
+    ret true;
+}
+
+# match every block with its else and close
+fun pair(a: *A.Allocator, body: *u8, toks: *Tok, ntok: usize, e: *Err) bool {
+    var stack: [64]usize;
+    var sp: usize = 0;
+    var i: usize = 0;
+    for (i < ntok) {
+        val t: *Tok = ?toks[i];
+        if (t.kind == T_OPEN) {
+            if (sp >= 64) { ret fail(a, e, "tmpl_syntax", "blocks nest deeper than 64", t.line); }
+            stack[sp] = i;
+            sp = sp + 1;
+        }
+        or (t.kind == T_ELSE) {
+            if (sp == 0) { ret fail(a, e, "tmpl_syntax", "{{else}} is outside any block", t.line); }
+            val top: *Tok = ?toks[stack[sp - 1]];
+            if (top.sect == S_WITH) { ret fail(a, e, "tmpl_syntax", "{{else}} cannot be used inside {{#with}}", t.line); }
+            if (top.els != 0) { ret fail(a, e, "tmpl_syntax", "a block has two {{else}} tags", t.line); }
+            top.els = i;
+        }
+        or (t.kind == T_CLOSE) {
+            if (sp == 0) {
+                ret fail(a, e, "tmpl_syntax", say(a, "{{/", sect_name(t.sect), str_len(sect_name(t.sect)), "}} has no matching opening block"), t.line);
+            }
+            val top: *Tok = ?toks[stack[sp - 1]];
+            if (top.sect != t.sect) {
+                ret fail(a, e, "tmpl_syntax", say(a, "{{/", sect_name(t.sect), str_len(sect_name(t.sect)), "}} closes a different block than the one still open"), t.line);
+            }
+            top.pair = i;
+            if (top.els != 0) { toks[top.els].pair = i; }
+            sp = sp - 1;
+        }
+        i = i + 1;
+    }
+    if (sp > 0) {
+        val open: *Tok = ?toks[stack[sp - 1]];
+        ret fail(a, e, "tmpl_syntax", say(a, "{{#", sect_name(open.sect), str_len(sect_name(open.sect)), "}} is never closed"), open.line);
+    }
+    ret true;
+}
+
+fun line_tag(kind: u8) bool {
+    ret kind == T_OPEN || kind == T_ELSE || kind == T_CLOSE || kind == T_COMMENT || kind == T_PARTIAL;
+}
+
+# mark tags alone on their line, then trim the whitespace and newline around them
+fun standalone(body: *u8, toks: *Tok, ntok: usize) {
+    var k: usize = 0;
+    for (k < ntok) {
+        val t: *Tok = ?toks[k];
+        if (line_tag(t.kind)) {
+            var before: bool = false;
+            var ind_s: usize = 0;
+            var ind_n: usize = 0;
+            if (k == 0) { before = true; }
+            or (toks[k - 1].kind == T_TEXT) {
+                val p: *Tok = ?toks[k - 1];
+                var q: usize = p.start + p.len;
+                for (q > p.start && is_hspace(body[q - 1])) { q = q - 1; }
+                if (q == p.start) {
+                    before = k - 1 == 0;
+                    ind_s = p.start;
+                    ind_n = p.len;
+                }
+                or (body[q - 1] == '\n') {
+                    before = true;
+                    ind_s = q;
+                    ind_n = p.start + p.len - q;
+                }
+            }
+            var after: bool = false;
+            if (before) {
+                if (k + 1 == ntok) { after = true; }
+                or (toks[k + 1].kind == T_TEXT) {
+                    val nx: *Tok = ?toks[k + 1];
+                    var r: usize = nx.start;
+                    val end: usize = nx.start + nx.len;
+                    for (r < end && is_hspace(body[r])) { r = r + 1; }
+                    if (r == end) { after = k + 2 == ntok; }
+                    or (body[r] == '\n') { after = true; }
+                }
+            }
+            if (before && after) {
+                t.standalone = true;
+                t.ind_start = ind_s;
+                t.ind_len = ind_n;
+            }
+        }
+        k = k + 1;
+    }
+    k = 0;
+    for (k < ntok) {
+        val t: *Tok = ?toks[k];
+        if (t.standalone) {
+            if (k > 0 && toks[k - 1].kind == T_TEXT) {
+                val p: *Tok = ?toks[k - 1];
+                var q: usize = p.start + p.len;
+                for (q > p.start && body[q - 1] != '\n') { q = q - 1; }
+                p.keep = q - p.start;
+            }
+            if (k + 1 < ntok && toks[k + 1].kind == T_TEXT) {
+                val nx: *Tok = ?toks[k + 1];
+                var r: usize = nx.start;
+                val end: usize = nx.start + nx.len;
+                for (r < end && body[r] != '\n') { r = r + 1; }
+                if (r < end) { nx.head = r + 1 - nx.start; }
+                or { nx.head = nx.len; }
+            }
+        }
+        k = k + 1;
+    }
+}
+
+fun innermost(r: *R) *Scope {
+    if (r.ctx.n == 0) { ret nil; }
+    ret ?r.ctx.scopes[r.ctx.n - 1];
+}
+
+fun nearest_each(r: *R) *Scope {
+    var i: usize = r.ctx.n;
+    for (i > 0) {
+        i = i - 1;
+        if (r.ctx.scopes[i].each) { ret ?r.ctx.scopes[i]; }
+    }
+    ret nil;
+}
+
+fun missing() Val {
+    var v: Val;
+    v.kind = V_MISSING;
+    ret v;
+}
+
+fun json_val(v: *json.Value) Val {
+    var out: Val;
+    out.kind = V_JSON;
+    out.v = v;
+    ret out;
+}
+
+fun digits(p: *u8, n: usize, out: *usize) bool {
+    if (n == 0 || n > 18) { ret false; }
+    var x: usize = 0;
+    var i: usize = 0;
+    for (i < n) {
+        if (p[i] < '0' || p[i] > '9') { ret false; }
+        x = x * 10 + (p[i] - '0')::usize;
+        i = i + 1;
+    }
+    @out = x;
+    ret true;
+}
+
+fun child(v: *json.Value, p: *u8, n: usize) *json.Value {
+    if (json.value_is_object(v)) {
+        if (n >= 256) { ret nil; }
+        var k: [256]u8;
+        var i: usize = 0;
+        for (i < n) {
+            k[i] = p[i];
+            i = i + 1;
+        }
+        k[n] = 0;
+        val f: opt[*json.Value] = json.value_find(v, ?k[0]);
+        if (sel f.some) { ret f.some; }
+        ret nil;
+    }
+    if (json.value_is_array(v)) {
+        var idx: usize = 0;
+        if (!digits(p, n, ?idx)) { ret nil; }
+        val g: opt[*json.Value] = json.value_get(v, idx);
+        if (sel g.some) { ret g.some; }
+    }
+    ret nil;
+}
+
+# resolve a dotted path against the scopes, innermost first
+fun lookup(r: *R, p: *u8, n: usize) Val {
+    if (n == 0) { ret missing(); }
+    if (n == 1 && p[0] == '.') {
+        val s: *Scope = innermost(r);
+        if (s == nil) { ret missing(); }
+        ret json_val(s.v);
+    }
+    if (p[0] == '@') {
+        val s: *Scope = nearest_each(r);
+        if (s == nil) { ret missing(); }
+        var v: Val;
+        if (word_is(p, 1, n - 1, "index")) {
+            v.kind = V_INT;
+            v.n = s.index;
+            ret v;
+        }
+        if (word_is(p, 1, n - 1, "first")) {
+            v.kind = V_BOOL;
+            v.n = 0;
+            if (s.index == 0) { v.n = 1; }
+            ret v;
+        }
+        if (word_is(p, 1, n - 1, "last")) {
+            v.kind = V_BOOL;
+            v.n = 0;
+            if (s.index == s.count - 1) { v.n = 1; }
+            ret v;
+        }
+        if (word_is(p, 1, n - 1, "key") && s.key != nil) {
+            v.kind = V_TEXT;
+            v.p = s.key;
+            v.len = s.keyn;
+            ret v;
+        }
+        ret missing();
+    }
+    var seg_end: usize = 0;
+    for (seg_end < n && p[seg_end] != '.') { seg_end = seg_end + 1; }
+    var cur: *json.Value = nil;
+    if (word_is(p, 0, seg_end, "this")) {
+        val s: *Scope = innermost(r);
+        if (s == nil) { ret missing(); }
+        cur = s.v;
+    }
+    or {
+        var i: usize = r.ctx.n;
+        for (i > 0 && cur == nil) {
+            i = i - 1;
+            cur = child(r.ctx.scopes[i].v, p, seg_end);
+        }
+        if (cur == nil) { ret missing(); }
+    }
+    var pos: usize = seg_end;
+    for (pos < n) {
+        val s0: usize = pos + 1;
+        var s1: usize = s0;
+        for (s1 < n && p[s1] != '.') { s1 = s1 + 1; }
+        cur = child(cur, (p::usize + s0)::*u8, s1 - s0);
+        if (cur == nil) { ret missing(); }
+        pos = s1;
+    }
+    ret json_val(cur);
+}
+
+fun truthy(v: Val) bool {
+    if (v.kind == V_MISSING) { ret false; }
+    if (v.kind == V_INT || v.kind == V_BOOL) { ret v.n != 0; }
+    if (v.kind == V_TEXT) { ret v.len > 0; }
+    val j: *json.Value = v.v;
+    if (json.value_is_null(j)) { ret false; }
+    if (json.value_is_bool(j)) { ret json.value_bool(j); }
+    if (json.value_is_number(j)) {
+        if (json.value_is_float(j)) { ret json.value_float(j) != 0.0; }
+        ret json.value_number(j) != 0;
+    }
+    if (json.value_is_string(j)) {
+        var raw_n: usize = 0;
+        json.value_string(j, ?raw_n);
+        ret raw_n > 0;
+    }
+    ret json.value_count(j) > 0;
+}
+
+# the names visible in scope, for an unknown-variable hint
+fun known_names(r: *R) str {
+    var b: Buf = buf_init(r.a);
+    var shown: usize = 0;
+    var i: usize = r.ctx.n;
+    for (i > 0 && shown < 16) {
+        i = i - 1;
+        val v: *json.Value = r.ctx.scopes[i].v;
+        if (json.value_is_object(v)) {
+            var k: usize = 0;
+            for (k < json.value_count(v) && shown < 16) {
+                val key: opt[str] = json.value_key(v, k);
+                if (sel key.some) {
+                    if (shown > 0) { buf_str(?b, ", "); }
+                    buf_bytes(?b, key.some, json.value_key_len(v, k));
+                    shown = shown + 1;
+                }
+                k = k + 1;
+            }
+        }
+    }
+    val each: *Scope = nearest_each(r);
+    if (each != nil) {
+        if (shown > 0) { buf_str(?b, ", "); }
+        buf_str(?b, "@index, @first, @last");
+        if (each.key != nil) { buf_str(?b, ", @key (this item's name)"); }
+        if (!json.value_is_object(each.v)) { buf_str(?b, ", and {{.}} for the current item itself, which is a value rather than an object with fields"); }
+    }
+    if (b.p == nil) { ret "(nothing)"; }
+    ret b.p;
+}
+
+fun looks_like_code(p: *u8, n: usize) bool {
+    var i: usize = 0;
+    for (i < n) {
+        val c: u8 = p[i];
+        if (c == '(' || c == ')' || c == '[' || c == '+' || c == '*' || c == ' ' || c == ',' || c == '=') { ret true; }
+        if (c == '"' || c == '\'' || c == ';' || c == '{' || c == '}' || c == '\n' || c == ':' || c == '<' || c == '>') { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# a tag whose name part could never be a variable is code that happens to contain {{
+fun code_tag(r: *R, t: *Tok, p: *u8, n: usize) bool {
+    var b: Buf = buf_init(r.a);
+    buf_str(?b, "{{ starts a template tag, but {{");
+    var k: usize = 0;
+    for (k < n && k < 60 && p[k] != '\n') { k = k + 1; }
+    buf_bytes(?b, p, k);
+    if (k < n) { buf_str(?b, "..."); }
+    buf_str(?b, " is code, not a variable. templates do not run code: name a variable and use filters such as {{columns|count}} or {{x|py}}. if the generated file itself needs {{, write \\{{ in the template to keep the braces");
+    if (b.p == nil) { ret fail(r.a, r.err, "tmpl_code", "a template tag holds code", t.line); }
+    ret fail(r.a, r.err, "tmpl_code", b.p, t.line);
+}
+
+# decode a json string into the render allocator
+fun decoded(a: *A.Allocator, v: *json.Value, out: **u8, n: *usize) bool {
+    var raw_n: usize = 0;
+    json.value_string(v, ?raw_n);
+    val got: res[*u8, A.Error] = A.allocate[u8](a, raw_n + 1);
+    if (sel got.err) { ret false; }
+    val dec: res[usize, json.JsonError] = json.value_string_decode(v, got.ok, raw_n + 1);
+    if (sel dec.err) { ret false; }
+    if (dec.ok > raw_n) { ret false; }
+    got.ok[dec.ok] = 0;
+    @out = got.ok;
+    @n = dec.ok;
+    ret true;
+}
+
+fun expr_fail(r: *R, t: *Tok, code: str, p1: str, p2: str) bool {
+    ret fail(r.a, r.err, code, say(r.a, p1, (r.body::usize + t.start)::*u8, t.len, p2), t.line);
+}
+
+# the plain text of a scalar; arrays, objects, and null need a block or a literal filter
+fun plain(r: *R, t: *Tok, v: Val, b: *Buf) bool {
+    if (v.kind == V_TEXT) {
+        buf_bytes(b, v.p, v.len);
+        ret true;
+    }
+    if (v.kind == V_INT) {
+        buf_i64(b, v.n);
+        ret true;
+    }
+    if (v.kind == V_BOOL) {
+        if (v.n != 0) { buf_str(b, "true"); }
+        or { buf_str(b, "false"); }
+        ret true;
+    }
+    val j: *json.Value = v.v;
+    if (json.value_is_string(j)) {
+        var p: *u8 = nil;
+        var n: usize = 0;
+        if (!decoded(r.a, j, ?p, ?n)) { ret fail(r.a, r.err, "tmpl_value", "a string value could not be decoded", t.line); }
+        buf_bytes(b, p, n);
+        ret true;
+    }
+    if (json.value_is_number(j)) {
+        if (json.value_is_float(j)) { buf_f64(b, json.value_float(j)); }
+        or { buf_i64(b, json.value_number(j)); }
+        ret true;
+    }
+    if (json.value_is_bool(j)) {
+        if (json.value_bool(j)) { buf_str(b, "true"); }
+        or { buf_str(b, "false"); }
+        ret true;
+    }
+    if (json.value_is_null(j)) {
+        ret expr_fail(r, t, "tmpl_type", "{{", "}} is null; guard it with {{#if}} or add |default:TEXT");
+    }
+    ret expr_fail(r, t, "tmpl_type", "{{", "}} is a list or object; loop with {{#each}} or use a literal filter such as |json or |py");
+}
+
+fun hex_digit(n: u8) u8 {
+    if (n < 10) { ret '0' + n; }
+    ret 'a' + n - 10;
+}
+
+# a double-quoted literal for python, javascript, or json
+fun quote_c(b: *Buf, p: *u8, n: usize, style: u8) {
+    buf_byte(b, '"');
+    var i: usize = 0;
+    for (i < n) {
+        val c: u8 = p[i];
+        if (c == '"') { buf_str(b, "\\\""); }
+        or (c == '\\') { buf_str(b, "\\\\"); }
+        or (c == '\n') { buf_str(b, "\\n"); }
+        or (c == '\r') { buf_str(b, "\\r"); }
+        or (c == '\t') { buf_str(b, "\\t"); }
+        or (c < 0x20 || c == 0x7f) {
+            if (style == 'j') { buf_str(b, "\\u00"); }
+            or { buf_str(b, "\\x"); }
+            buf_byte(b, hex_digit(c >> 4));
+            buf_byte(b, hex_digit(c & 15));
+        }
+        or (style == 's' && c == 0xe2 && i + 2 < n && p[i + 1] == 0x80 && (p[i + 2] == 0xa8 || p[i + 2] == 0xa9)) {
+            if (p[i + 2] == 0xa8) { buf_str(b, "\\u2028"); }
+            or { buf_str(b, "\\u2029"); }
+            i = i + 2;
+        }
+        or { buf_byte(b, c); }
+        i = i + 1;
+    }
+    buf_byte(b, '"');
+}
+
+# a powershell single-quoted literal; typographic single quotes are doubled too
+fun quote_ps(b: *Buf, p: *u8, n: usize) {
+    buf_byte(b, '\'');
+    var i: usize = 0;
+    for (i < n) {
+        val c: u8 = p[i];
+        if (c == '\'') { buf_str(b, "''"); }
+        or (c == 0xe2 && i + 2 < n && p[i + 1] == 0x80 && p[i + 2] >= 0x98 && p[i + 2] <= 0x9b) {
+            buf_bytes(b, (p::usize + i)::*u8, 3);
+            buf_bytes(b, (p::usize + i)::*u8, 3);
+            i = i + 2;
+        }
+        or { buf_byte(b, c); }
+        i = i + 1;
+    }
+    buf_byte(b, '\'');
+}
+
+# a posix shell single-quoted literal
+fun quote_sh(b: *Buf, p: *u8, n: usize) {
+    buf_byte(b, '\'');
+    var i: usize = 0;
+    for (i < n) {
+        val c: u8 = p[i];
+        if (c == '\'') { buf_str(b, "'\\''"); }
+        or { buf_byte(b, c); }
+        i = i + 1;
+    }
+    buf_byte(b, '\'');
+}
+
+fun quote_text(b: *Buf, p: *u8, n: usize, lang: u8) {
+    if (lang == 'p') { quote_c(b, p, n, 'p'); }
+    or (lang == 'j') { quote_c(b, p, n, 'j'); }
+    or (lang == 's') { quote_c(b, p, n, 's'); }
+    or (lang == 'w') { quote_ps(b, p, n); }
+    or { quote_sh(b, p, n); }
+}
+
+# a literal of v in one language: p python, s javascript, j json, w powershell, h shell
+fun literal(r: *R, t: *Tok, j: *json.Value, lang: u8, b: *Buf) bool {
+    if (json.value_is_string(j)) {
+        if (lang == 'j') {
+            var raw_n: usize = 0;
+            val raw: *u8 = json.value_string(j, ?raw_n);
+            buf_byte(b, '"');
+            buf_bytes(b, raw, raw_n);
+            buf_byte(b, '"');
+            ret true;
+        }
+        var p: *u8 = nil;
+        var n: usize = 0;
+        if (!decoded(r.a, j, ?p, ?n)) { ret fail(r.a, r.err, "tmpl_value", "a string value could not be decoded", t.line); }
+        quote_text(b, p, n, lang);
+        ret true;
+    }
+    if (json.value_is_number(j)) {
+        if (json.value_is_float(j)) { buf_f64(b, json.value_float(j)); }
+        or { buf_i64(b, json.value_number(j)); }
+        ret true;
+    }
+    if (json.value_is_bool(j)) {
+        val on: bool = json.value_bool(j);
+        if (lang == 'p') {
+            if (on) { buf_str(b, "True"); }
+            or { buf_str(b, "False"); }
+        }
+        or (lang == 'w') {
+            if (on) { buf_str(b, "$true"); }
+            or { buf_str(b, "$false"); }
+        }
+        or {
+            if (on) { buf_str(b, "true"); }
+            or { buf_str(b, "false"); }
+        }
+        ret true;
+    }
+    if (json.value_is_null(j)) {
+        if (lang == 'p') { buf_str(b, "None"); }
+        or (lang == 'w') { buf_str(b, "$null"); }
+        or (lang == 'h') { buf_str(b, "''"); }
+        or { buf_str(b, "null"); }
+        ret true;
+    }
+    val count: usize = json.value_count(j);
+    if (json.value_is_array(j)) {
+        if (lang == 'w') { buf_str(b, "@("); }
+        or (lang != 'h') { buf_byte(b, '['); }
+        var i: usize = 0;
+        for (i < count) {
+            if (i > 0) {
+                if (lang == 'h') { buf_byte(b, ' '); }
+                or (lang == 'j') { buf_byte(b, ','); }
+                or { buf_str(b, ", "); }
+            }
+            val g: opt[*json.Value] = json.value_get(j, i);
+            if (sel g.some) {
+                if (!literal(r, t, g.some, lang, b)) { ret false; }
+            }
+            i = i + 1;
+        }
+        if (lang == 'w') { buf_byte(b, ')'); }
+        or (lang != 'h') { buf_byte(b, ']'); }
+        ret true;
+    }
+    if (lang == 'h') {
+        ret expr_fail(r, t, "tmpl_type", "{{", "}} is an object, which has no shell literal");
+    }
+    if (lang == 'w') { buf_str(b, "[ordered]@{"); }
+    or { buf_byte(b, '{'); }
+    var i: usize = 0;
+    for (i < count) {
+        val key: opt[str] = json.value_key(j, i);
+        val g: opt[*json.Value] = json.value_get(j, i);
+        if (sel key.some) {
+            if (i > 0) {
+                if (lang == 'w') { buf_str(b, "; "); }
+                or (lang == 'j') { buf_byte(b, ','); }
+                or { buf_str(b, ", "); }
+            }
+            val kn: usize = json.value_key_len(j, i);
+            if (lang == 'j') {
+                buf_byte(b, '"');
+                buf_bytes(b, key.some, kn);
+                buf_byte(b, '"');
+            }
+            or (lang == 'w') { quote_ps(b, key.some, kn); }
+            or { quote_c(b, key.some, kn, lang); }
+            if (lang == 'w') { buf_str(b, " = "); }
+            or (lang == 'j') { buf_byte(b, ':'); }
+            or { buf_str(b, ": "); }
+            if (sel g.some) {
+                if (!literal(r, t, g.some, lang, b)) { ret false; }
+            }
+        }
+        i = i + 1;
+    }
+    buf_byte(b, '}');
+    ret true;
+}
+
+fun is_upper(c: u8) bool { ret c >= 'A' && c <= 'Z'; }
+fun is_lower(c: u8) bool { ret c >= 'a' && c <= 'z'; }
+fun is_digit(c: u8) bool { ret c >= '0' && c <= '9'; }
+fun is_alnum(c: u8) bool { ret is_upper(c) || is_lower(c) || is_digit(c); }
+fun to_upper(c: u8) u8 {
+    if (is_lower(c)) { ret c - 32; }
+    ret c;
+}
+fun to_lower(c: u8) u8 {
+    if (is_upper(c)) { ret c + 32; }
+    ret c;
+}
+
+# re-case words: 's' snake, 'k' kebab, 'c' camel, 'p' pascal, 'C' constant
+fun recase(b: *Buf, p: *u8, n: usize, style: u8) {
+    var word: usize = 0;
+    var i: usize = 0;
+    for (i < n) {
+        if (!is_alnum(p[i])) {
+            i = i + 1;
+            cnt;
+        }
+        var j: usize = i + 1;
+        for (j < n && is_alnum(p[j])) {
+            val prev: u8 = p[j - 1];
+            val c: u8 = p[j];
+            if (is_upper(c) && (is_lower(prev) || is_digit(prev))) { brk; }
+            if (is_upper(c) && is_upper(prev) && j + 1 < n && is_lower(p[j + 1])) { brk; }
+            j = j + 1;
+        }
+        if (word > 0) {
+            if (style == 's' || style == 'C') { buf_byte(b, '_'); }
+            or (style == 'k') { buf_byte(b, '-'); }
+        }
+        var k: usize = i;
+        for (k < j) {
+            val c: u8 = p[k];
+            if (style == 'C') { buf_byte(b, to_upper(c)); }
+            or ((style == 'p' || (style == 'c' && word > 0)) && k == i) { buf_byte(b, to_upper(c)); }
+            or { buf_byte(b, to_lower(c)); }
+            k = k + 1;
+        }
+        word = word + 1;
+        i = j;
+    }
+}
+
+fun indent_text(b: *Buf, p: *u8, n: usize, width: usize) {
+    var i: usize = 0;
+    for (i < n) {
+        buf_byte(b, p[i]);
+        if (p[i] == '\n' && i + 1 < n && p[i + 1] != '\n' && p[i + 1] != '\r') {
+            var k: usize = 0;
+            for (k < width) {
+                buf_byte(b, ' ');
+                k = k + 1;
+            }
+        }
+        i = i + 1;
+    }
+}
+
+fun lang_code(name: str) u8 {
+    if (util.eq(name, "py")) { ret 'p'; }
+    if (util.eq(name, "js")) { ret 's'; }
+    if (util.eq(name, "json")) { ret 'j'; }
+    if (util.eq(name, "ps")) { ret 'w'; }
+    if (util.eq(name, "sh")) { ret 'h'; }
+    ret 0;
+}
+
+fun parse_filter(p: *u8, n: usize, f: *Filter) bool {
+    var s: usize = 0;
+    var e: usize = n;
+    for (s < e && is_space(p[s])) { s = s + 1; }
+    for (e > s && is_space(p[e - 1])) { e = e - 1; }
+    var colon: usize = s;
+    for (colon < e && p[colon] != ':') { colon = colon + 1; }
+    var ne: usize = colon;
+    for (ne > s && is_space(p[ne - 1])) { ne = ne - 1; }
+    if (ne - s == 0 || ne - s >= 16) { ret false; }
+    var i: usize = 0;
+    for (i < ne - s) {
+        f.name[i] = p[s + i];
+        i = i + 1;
+    }
+    f.name[ne - s] = 0;
+    f.arg = nil;
+    f.argn = 0;
+    if (colon < e) {
+        var vs: usize = colon + 1;
+        var ve: usize = e;
+        if (ve - vs >= 2 && (p[vs] == '"' || p[vs] == '\'') && p[ve - 1] == p[vs]) {
+            vs = vs + 1;
+            ve = ve - 1;
+        }
+        or {
+            for (vs < ve && is_space(p[vs])) { vs = vs + 1; }
+        }
+        f.arg = (p::usize + vs)::*u8;
+        f.argn = ve - vs;
+    }
+    ret true;
+}
+
+fun parse_usize(p: *u8, n: usize, fallback: usize) usize {
+    var v: usize = 0;
+    if (!digits(p, n, ?v)) { ret fallback; }
+    ret v;
+}
+
+fun lang_for_ident(lang: str) str {
+    if (util.eq(lang, "node")) { ret "javascript"; }
+    ret lang;
+}
+
+# parse one {{expr|filters}} tag into a slot. code-looking names are flagged, not refused, so the render error stays the same.
+fun fill_slot(body: *u8, t: *Tok, s: *Slot, a: *A.Allocator, e: *Err) bool {
+    val p: *u8 = (body::usize + t.start)::*u8;
+    val n: usize = t.len;
+    var pe: usize = 0;
+    for (pe < n && p[pe] != '|') { pe = pe + 1; }
+    var ps: usize = 0;
+    var pend: usize = pe;
+    for (ps < pend && is_space(p[ps])) { ps = ps + 1; }
+    for (pend > ps && is_space(p[pend - 1])) { pend = pend - 1; }
+    s.on = true;
+    s.ps = ps;
+    s.pend = pend;
+    s.nf = 0;
+    s.code = looks_like_code((p::usize + ps)::*u8, pend - ps);
+    if (s.code) { ret true; }
+    var pos: usize = pe;
+    for (pos < n) {
+        val fs: usize = pos + 1;
+        var fe: usize = fs;
+        for (fe < n && p[fe] != '|') { fe = fe + 1; }
+        if (s.nf >= 12) { ret fail(a, e, "tmpl_filter", "too many filters on one tag", t.line); }
+        if (!parse_filter((p::usize + fs)::*u8, fe - fs, ?s.filters[s.nf])) {
+            ret fail(a, e, "tmpl_filter", say(a, "malformed filter in {{", p, n, "}}"), t.line);
+        }
+        s.nf = s.nf + 1;
+        pos = fe;
+    }
+    ret true;
+}
+
+# lex and pair body once. out holds pointers into a, and into body, so both must outlive the renders.
+pub fun prepare(a: *A.Allocator, body: *u8, n: usize, out: *Prog, e: *Err) bool {
+    e.code = nil;
+    e.msg = nil;
+    e.line = 0;
+    e.tname = nil;
+    var toks: vector.Vector[Tok] = vector.init[Tok](a);
+    if (!lex(a, body, n, ?toks, e)) { ret false; }
+    if (!pair(a, body, toks.data, toks.len, e)) { ret false; }
+    standalone(body, toks.data, toks.len);
+    out.body = body;
+    out.len = n;
+    out.toks = toks.data;
+    out.ntok = toks.len;
+    out.slots = nil;
+    out.ready = true;
+    if (toks.len == 0) { ret true; }
+    val slots: res[*Slot, A.Error] = A.allocate[Slot](a, toks.len);
+    if (sel slots.err) { ret fail(a, e, "oom", "out of memory", 0); }
+    var i: usize = 0;
+    for (i < toks.len) {
+        slots.ok[i].on = false;
+        if (toks.data[i].kind == T_VAR) {
+            if (!fill_slot(body, ?toks.data[i], ?slots.ok[i], a, e)) { ret false; }
+        }
+        i = i + 1;
+    }
+    out.slots = slots.ok;
+    ret true;
+}
+
+pub fun cache_init(c: *Cache, a: *A.Allocator) {
+    c.items = vector.init[Held](a);
+}
+
+# return a compiled prog for this body, compiling it the first time it is seen
+pub fun cache_prepare(c: *Cache, a: *A.Allocator, body: *u8, n: usize, out: *Prog, e: *Err) bool {
+    if (c != nil) {
+        var i: usize = 0;
+        for (i < c.items.len) {
+            if (c.items.data[i].body == body && c.items.data[i].len == n && c.items.data[i].prog.ready) {
+                @out = c.items.data[i].prog;
+                ret true;
+            }
+            i = i + 1;
+        }
+    }
+    if (!prepare(a, body, n, out, e)) { ret false; }
+    if (c != nil) {
+        var h: Held;
+        h.body = body;
+        h.len = n;
+        h.prog.body = out.body;
+        h.prog.len = out.len;
+        h.prog.toks = out.toks;
+        h.prog.ntok = out.ntok;
+        h.prog.slots = out.slots;
+        h.prog.ready = out.ready;
+        vector.push[Held](?c.items, h);
+    }
+    ret true;
+}
+
+# render one {{expr|filters}} tag
+fun render_var(r: *R, t: *Tok) bool {
+    val p: *u8 = (r.body::usize + t.start)::*u8;
+    val n: usize = t.len;
+    var pe: usize = 0;
+    var ps: usize = 0;
+    var pend: usize = 0;
+    var filters: [12]Filter;
+    var nf: usize = 0;
+    var parsed: bool = false;
+    if (r.slots != nil) {
+        val s: *Slot = ?r.slots[r.slot_i];
+        if (s.on) {
+            if (s.code) { ret code_tag(r, t, (p::usize + s.ps)::*u8, n - s.ps); }
+            ps = s.ps;
+            pend = s.pend;
+            nf = s.nf;
+            var c: usize = 0;
+            for (c < nf) {
+                filters[c] = s.filters[c];
+                c = c + 1;
+            }
+            parsed = true;
+        }
+    }
+    if (!parsed) {
+        for (pe < n && p[pe] != '|') { pe = pe + 1; }
+        pend = pe;
+        for (ps < pend && is_space(p[ps])) { ps = ps + 1; }
+        for (pend > ps && is_space(p[pend - 1])) { pend = pend - 1; }
+        if (looks_like_code((p::usize + ps)::*u8, pend - ps)) { ret code_tag(r, t, (p::usize + ps)::*u8, n - ps); }
+    }
+    var pos: usize = pe;
+    if (!parsed) {
+    for (pos < n) {
+        val fs: usize = pos + 1;
+        var fe: usize = fs;
+        for (fe < n && p[fe] != '|') { fe = fe + 1; }
+        if (nf >= 12) { ret fail(r.a, r.err, "tmpl_filter", "too many filters on one tag", t.line); }
+        if (!parse_filter((p::usize + fs)::*u8, fe - fs, ?filters[nf])) {
+            ret fail(r.a, r.err, "tmpl_filter", say(r.a, "malformed filter in {{", p, n, "}}"), t.line);
+        }
+        nf = nf + 1;
+        pos = fe;
+    }
+    }
+    var v: Val = lookup(r, (p::usize + ps)::*u8, pend - ps);
+    var text: Buf = buf_init(r.a);
+    var is_text: bool = false;
+    if (v.kind == V_MISSING) {
+        var k: usize = 0;
+        var defaulted: bool = false;
+        for (k < nf && !defaulted) {
+            if (util.eq(?filters[k].name[0], "default")) {
+                buf_bytes(?text, filters[k].arg, filters[k].argn);
+                defaulted = true;
+            }
+            k = k + 1;
+        }
+        if (!defaulted) {
+            var b: Buf = buf_init(r.a);
+            buf_str(?b, "unknown variable {{");
+            buf_bytes(?b, (p::usize + ps)::*u8, pend - ps);
+            buf_str(?b, "}}; visible here: ");
+            buf_str(?b, known_names(r));
+            if (b.p == nil) { ret fail(r.a, r.err, "tmpl_var", "unknown variable", t.line); }
+            ret fail(r.a, r.err, "tmpl_var", b.p, t.line);
+        }
+        is_text = true;
+    }
+    var k: usize = 0;
+    for (k < nf) {
+        val f: *Filter = ?filters[k];
+        val name: str = ?f.name[0];
+        val lc: u8 = lang_code(name);
+        if (util.eq(name, "default")) {
+            k = k + 1;
+            cnt;
+        }
+        if (lc != 0) {
+            var b: Buf = buf_init(r.a);
+            if (is_text) { quote_text(?b, text.p, text.len, lc); }
+            or (v.kind == V_JSON) {
+                if (!literal(r, t, v.v, lc, ?b)) { ret false; }
+            }
+            or {
+                var s: Buf = buf_init(r.a);
+                if (!plain(r, t, v, ?s)) { ret false; }
+                if (v.kind == V_INT) { buf_bytes(?b, s.p, s.len); }
+                or (v.kind == V_BOOL && lc == 'p') {
+                    if (v.n != 0) { buf_str(?b, "True"); }
+                    or { buf_str(?b, "False"); }
+                }
+                or (v.kind == V_BOOL && lc == 'w') {
+                    if (v.n != 0) { buf_str(?b, "$true"); }
+                    or { buf_str(?b, "$false"); }
+                }
+                or (v.kind == V_BOOL) { buf_bytes(?b, s.p, s.len); }
+                or { quote_text(?b, s.p, s.len, lc); }
+            }
+            text = b;
+            is_text = true;
+            k = k + 1;
+            cnt;
+        }
+        if (util.eq(name, "count")) {
+            var b: Buf = buf_init(r.a);
+            if (is_text) { buf_i64(?b, text.len::i64); }
+            or (v.kind == V_JSON && (json.value_is_array(v.v) || json.value_is_object(v.v))) { buf_i64(?b, json.value_count(v.v)::i64); }
+            or {
+                var s: Buf = buf_init(r.a);
+                if (!plain(r, t, v, ?s)) { ret false; }
+                buf_i64(?b, s.len::i64);
+            }
+            text = b;
+            is_text = true;
+            k = k + 1;
+            cnt;
+        }
+        if (util.eq(name, "join")) {
+            if (is_text || v.kind != V_JSON || !json.value_is_array(v.v)) {
+                ret expr_fail(r, t, "tmpl_filter", "|join needs a list in {{", "}}");
+            }
+            var b: Buf = buf_init(r.a);
+            var i: usize = 0;
+            for (i < json.value_count(v.v)) {
+                if (i > 0) { buf_bytes(?b, f.arg, f.argn); }
+                val g: opt[*json.Value] = json.value_get(v.v, i);
+                if (sel g.some) {
+                    if (!plain(r, t, json_val(g.some), ?b)) { ret false; }
+                }
+                i = i + 1;
+            }
+            text = b;
+            is_text = true;
+            k = k + 1;
+            cnt;
+        }
+        if (!is_text) {
+            var s: Buf = buf_init(r.a);
+            if (!plain(r, t, v, ?s)) { ret false; }
+            text = s;
+            is_text = true;
+        }
+        var b: Buf = buf_init(r.a);
+        if (util.eq(name, "upper")) {
+            var i: usize = 0;
+            for (i < text.len) {
+                buf_byte(?b, to_upper(text.p[i]));
+                i = i + 1;
+            }
+        }
+        or (util.eq(name, "lower")) {
+            var i: usize = 0;
+            for (i < text.len) {
+                buf_byte(?b, to_lower(text.p[i]));
+                i = i + 1;
+            }
+        }
+        or (util.eq(name, "trim")) {
+            var s: usize = 0;
+            var e: usize = text.len;
+            for (s < e && is_space(text.p[s])) { s = s + 1; }
+            for (e > s && is_space(text.p[e - 1])) { e = e - 1; }
+            buf_bytes(?b, (text.p::usize + s)::*u8, e - s);
+        }
+        or (util.eq(name, "snake")) { recase(?b, text.p, text.len, 's'); }
+        or (util.eq(name, "kebab")) { recase(?b, text.p, text.len, 'k'); }
+        or (util.eq(name, "camel")) { recase(?b, text.p, text.len, 'c'); }
+        or (util.eq(name, "pascal")) { recase(?b, text.p, text.len, 'p'); }
+        or (util.eq(name, "const")) { recase(?b, text.p, text.len, 'C'); }
+        or (util.eq(name, "indent")) { indent_text(?b, text.p, text.len, parse_usize(f.arg, f.argn, 4)); }
+        or (util.eq(name, "ident")) {
+            val copy: res[str, A.Error] = util.dup_n(r.a, text.p, text.len);
+            if (sel copy.err) { ret fail(r.a, r.err, "oom", "out of memory", t.line); }
+            if (!ident.ident_ok(lang_for_ident(r.lang), copy.ok)) {
+                var m: Buf = buf_init(r.a);
+                buf_str(?m, "'");
+                buf_bytes(?m, text.p, text.len);
+                buf_str(?m, "' is not a valid ");
+                buf_str(?m, r.lang);
+                buf_str(?m, " identifier");
+                if (m.p == nil) { ret fail(r.a, r.err, "tmpl_ident", "not a valid identifier", t.line); }
+                ret fail(r.a, r.err, "tmpl_ident", m.p, t.line);
+            }
+            buf_bytes(?b, text.p, text.len);
+        }
+        or {
+            var m: Buf = buf_init(r.a);
+            buf_str(?m, "unknown filter |");
+            buf_str(?m, name);
+            buf_str(?m, "; use json py js ps sh count join default upper lower trim snake camel pascal kebab const ident indent");
+            if (m.p == nil) { ret fail(r.a, r.err, "tmpl_filter", "unknown filter", t.line); }
+            ret fail(r.a, r.err, "tmpl_filter", m.p, t.line);
+        }
+        text = b;
+        k = k + 1;
+    }
+    if (!is_text) {
+        if (!plain(r, t, v, ?r.out)) { ret false; }
+        ret true;
+    }
+    buf_bytes(?r.out, text.p, text.len);
+    ret true;
+}
+
+var range_fn: fun(*R, usize, usize) bool = nil;
+
+fun emit_indented(out: *Buf, p: *u8, n: usize, ind: *u8, indn: usize) {
+    if (indn == 0) {
+        buf_bytes(out, p, n);
+        ret;
+    }
+    var at_start: bool = true;
+    var i: usize = 0;
+    for (i < n) {
+        if (at_start && p[i] != '\n' && p[i] != '\r') { buf_bytes(out, ind, indn); }
+        buf_byte(out, p[i]);
+        at_start = p[i] == '\n';
+        i = i + 1;
+    }
+}
+
+fun render_partial(r: *R, t: *Tok) bool {
+    if (r.depth >= MAX_PARTIAL) { ret fail(r.a, r.err, "tmpl_depth", "partials nest deeper than 8", t.line); }
+    val name: res[str, A.Error] = util.dup_n(r.a, (r.body::usize + t.start)::*u8, t.len);
+    if (sel name.err) { ret fail(r.a, r.err, "oom", "out of memory", t.line); }
+    var body: *u8 = nil;
+    var blen: usize = 0;
+    var plang: str = nil;
+    if (r.lib == nil || r.lib.find == nil || !r.lib.find(r.lib.ctx, name.ok, ?body, ?blen, ?plang)) {
+        ret expr_fail(r, t, "tmpl_partial", "unknown partial {{> ", "}}");
+    }
+    var subprog: Prog;
+    if (!cache_prepare(r.cache, r.a, body, blen, ?subprog, r.err)) {
+        r.err.tname = name.ok;
+        ret false;
+    }
+    var sub: R;
+    sub.a = r.a;
+    sub.body = subprog.body;
+    sub.toks = subprog.toks;
+    sub.ntok = subprog.ntok;
+    sub.slots = subprog.slots;
+    sub.out = buf_init(r.a);
+    sub.ctx = r.ctx;
+    sub.lang = r.lang;
+    sub.name = name.ok;
+    sub.lib = r.lib;
+    sub.depth = r.depth + 1;
+    sub.err = r.err;
+    sub.cache = r.cache;
+    if (!range_fn(?sub, 0, sub.ntok)) {
+        if (r.err.tname == nil) { r.err.tname = name.ok; }
+        ret false;
+    }
+    if (sub.out.failed) { ret fail(r.a, r.err, "oom", "out of memory", t.line); }
+    if (t.standalone) {
+        emit_indented(?r.out, sub.out.p, sub.out.len, (r.body::usize + t.ind_start)::*u8, t.ind_len);
+    }
+    or { buf_bytes(?r.out, sub.out.p, sub.out.len); }
+    ret true;
+}
+
+fun render_range(r: *R, from: usize, to: usize) bool {
+    var i: usize = from;
+    for (i < to) {
+        val t: *Tok = ?r.toks[i];
+        if (t.kind == T_TEXT) {
+            if (t.keep > t.head) { buf_bytes(?r.out, (r.body::usize + t.start + t.head)::*u8, t.keep - t.head); }
+            i = i + 1;
+            cnt;
+        }
+        if (t.kind == T_VAR) {
+            r.slot_i = i;
+            if (!render_var(r, t)) {
+                if (r.err.tname == nil) { r.err.tname = r.name; }
+                ret false;
+            }
+            i = i + 1;
+            cnt;
+        }
+        if (t.kind == T_PARTIAL) {
+            if (!render_partial(r, t)) { ret false; }
+            i = i + 1;
+            cnt;
+        }
+        if (t.kind == T_OPEN) {
+            val close: usize = t.pair;
+            var then_end: usize = close;
+            if (t.els != 0) { then_end = t.els; }
+            val v: Val = lookup(r, (r.body::usize + t.start)::*u8, t.len);
+            if (t.sect == S_IF || t.sect == S_UNLESS) {
+                var on: bool = truthy(v);
+                if (t.sect == S_UNLESS) { on = !on; }
+                if (on) {
+                    if (!render_range(r, i + 1, then_end)) { ret false; }
+                }
+                or (t.els != 0) {
+                    if (!render_range(r, t.els + 1, close)) { ret false; }
+                }
+            }
+            or (t.sect == S_WITH) {
+                if (v.kind != V_JSON) {
+                    r.err.tname = r.name;
+                    ret expr_fail(r, t, "tmpl_var", "unknown variable in {{#with ", "}}");
+                }
+                if (!ctx_push(r.ctx, v.v)) { ret fail(r.a, r.err, "tmpl_depth", "scopes nest deeper than 32", t.line); }
+                val ok: bool = render_range(r, i + 1, close);
+                ctx_pop(r.ctx);
+                if (!ok) { ret false; }
+            }
+            or {
+                if (v.kind != V_JSON) {
+                    r.err.tname = r.name;
+                    var b: Buf = buf_init(r.a);
+                    buf_str(?b, "unknown variable in {{#each ");
+                    buf_bytes(?b, (r.body::usize + t.start)::*u8, t.len);
+                    buf_str(?b, "}}; visible here: ");
+                    buf_str(?b, known_names(r));
+                    if (b.p == nil) { ret fail(r.a, r.err, "tmpl_var", "unknown variable", t.line); }
+                    ret fail(r.a, r.err, "tmpl_var", b.p, t.line);
+                }
+                val list: *json.Value = v.v;
+                if (!json.value_is_array(list) && !json.value_is_object(list)) {
+                    r.err.tname = r.name;
+                    ret expr_fail(r, t, "tmpl_type", "{{#each ", "}} needs a list or an object");
+                }
+                val count: usize = json.value_count(list);
+                if (count == 0) {
+                    if (t.els != 0) {
+                        if (!render_range(r, t.els + 1, close)) { ret false; }
+                    }
+                }
+                var k: usize = 0;
+                for (k < count) {
+                    val g: opt[*json.Value] = json.value_get(list, k);
+                    if (sel g.some) {
+                        var key: *u8 = nil;
+                        var keyn: usize = 0;
+                        if (json.value_is_object(list)) {
+                            val kk: opt[str] = json.value_key(list, k);
+                            if (sel kk.some) {
+                                key = kk.some;
+                                keyn = json.value_key_len(list, k);
+                            }
+                        }
+                        if (!ctx_push_item(r.ctx, g.some, k::i64, count::i64, key, keyn)) {
+                            ret fail(r.a, r.err, "tmpl_depth", "scopes nest deeper than 32", t.line);
+                        }
+                        val ok: bool = render_range(r, i + 1, then_end);
+                        ctx_pop(r.ctx);
+                        if (!ok) { ret false; }
+                    }
+                    k = k + 1;
+                }
+            }
+            i = close + 1;
+            cnt;
+        }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# render body[0,n) against ctx; the output and any error text come from a
+# ---
+# name: template name for error messages
+# lang: target language, used by |ident
+# out:  receives the rendered bytes, nul-terminated
+# walk a compiled template. cache compiles partials the first time this render sees them.
+pub fun render_prog(a: *A.Allocator, name: str, lang: str, prog: *Prog, ctx: *Ctx, lib: *Lib, cache: *Cache, out: **u8, out_len: *usize, e: *Err) bool {
+    range_fn = render_range;
+    e.code = nil;
+    e.msg = nil;
+    e.line = 0;
+    e.tname = nil;
+    var r: R;
+    r.a = a;
+    r.body = prog.body;
+    r.toks = prog.toks;
+    r.ntok = prog.ntok;
+    r.slots = prog.slots;
+    r.out = buf_init(a);
+    r.ctx = ctx;
+    r.lang = lang;
+    r.name = name;
+    r.lib = lib;
+    r.depth = 0;
+    r.err = e;
+    r.cache = cache;
+    if (!render_range(?r, 0, prog.ntok)) { ret false; }
+    if (r.out.failed) { ret fail(a, e, "oom", "out of memory", 0); }
+    if (r.out.p == nil) {
+        val empty: res[str, A.Error] = util.dup(a, "");
+        if (sel empty.err) { ret fail(a, e, "oom", "out of memory", 0); }
+        @out = empty.ok;
+        @out_len = 0;
+        ret true;
+    }
+    @out = r.out.p;
+    @out_len = r.out.len;
+    ret true;
+}
+
+pub fun render(a: *A.Allocator, name: str, lang: str, body: *u8, n: usize, ctx: *Ctx, lib: *Lib, out: **u8, out_len: *usize, e: *Err) bool {
+    var prog: Prog;
+    if (!prepare(a, body, n, ?prog, e)) {
+        e.tname = name;
+        ret false;
+    }
+    ret render_prog(a, name, lang, ?prog, ctx, lib, nil, out, out_len, e);
+}
+
+fun seen(names: *vector.Vector[str], p: *u8, n: usize) bool {
+    var i: usize = 0;
+    for (i < names.len) {
+        val s: str = names.data[i];
+        if (str_len(s) == n) {
+            var k: usize = 0;
+            var same: bool = true;
+            for (k < n && same) {
+                if (s[k] != p[k]) { same = false; }
+                k = k + 1;
+            }
+            if (same) { ret true; }
+        }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# the top-level names a template reads, in first-use order
+pub fun names(a: *A.Allocator, body: *u8, n: usize, out: *vector.Vector[str]) bool {
+    var toks: vector.Vector[Tok] = vector.init[Tok](a);
+    var e: Err;
+    if (!lex(a, body, n, ?toks, ?e)) { ret false; }
+    var i: usize = 0;
+    for (i < toks.len) {
+        val t: *Tok = ?toks.data[i];
+        if (t.kind == T_VAR || t.kind == T_OPEN) {
+            val p: *u8 = (body::usize + t.start)::*u8;
+            var s: usize = 0;
+            for (s < t.len && is_space(p[s])) { s = s + 1; }
+            var e2: usize = s;
+            for (e2 < t.len && p[e2] != '.' && p[e2] != '|' && !is_space(p[e2])) { e2 = e2 + 1; }
+            val len: usize = e2 - s;
+            val q: *u8 = (p::usize + s)::*u8;
+            if (len > 0 && q[0] != '@' && !word_is(q, 0, len, "this") && !seen(out, q, len)) {
+                val copy: res[str, A.Error] = util.dup_n(a, q, len);
+                if (sel copy.ok) { vector.push[str](out, copy.ok); }
+            }
+        }
+        i = i + 1;
+    }
+    ret true;
+}
+
+use std.system.capability;
+
+$if (capability.HOSTED) {
+    use page: std.allocator.page;
+    use std.types.string.str_equals;
+
+    fun run(a: *A.Allocator, tmpl: str, data: str, want: str) i32 {
+        val parsed: res[json.Value, json.JsonError] = json.parse(data, str_len(data), a);
+        if (sel parsed.err) { ret 1; }
+        var v: json.Value = parsed.ok;
+        var c: Ctx;
+        ctx_init(?c);
+        ctx_push(?c, ?v);
+        var out: *u8 = nil;
+        var n: usize = 0;
+        var e: Err;
+        if (!render(a, "t", "python", tmpl, str_len(tmpl), ?c, nil, ?out, ?n, ?e)) { ret 2; }
+        if (!str_equals(out, want)) { ret 3; }
+        ret 0;
+    }
+
+    test render__vars_blocks_and_standalone_lines {
+        var a: A.Allocator;
+        val made: err[A.Error] = page.make(?a);
+        if (sel made.err) { ret 1; }
+        if (run(?a, "hi {{name}}!", "{\"name\":\"qark\"}", "hi qark!") != 0) { ret 2; }
+        if (run(?a, "{{#each xs}}\n- {{.}}\n{{/each}}\n", "{\"xs\":[\"a\",\"b\"]}", "- a\n- b\n") != 0) { ret 3; }
+        if (run(?a, "a\n{{#if on}}\nb\n{{else}}\nc\n{{/if}}\nd\n", "{\"on\":false}", "a\nc\nd\n") != 0) { ret 4; }
+        if (run(?a, "{{#each xs}}{{@index}}:{{n}}{{#unless @last}},{{/unless}}{{/each}}", "{\"xs\":[{\"n\":1},{\"n\":2}]}", "0:1,1:2") != 0) { ret 5; }
+        if (run(?a, "X = {{v|py}}", "{\"v\":[\"a\\\"b\",true,null,1.5]}", "X = [\"a\\\"b\", True, None, 1.5]") != 0) { ret 6; }
+        if (run(?a, "{{s|ps}} {{s|sh}}", "{\"s\":\"it's\"}", "'it''s' 'it'\\''s'") != 0) { ret 7; }
+        if (run(?a, "{{n|snake}} {{n|camel}} {{n|pascal}} {{n|kebab}} {{n|const}}", "{\"n\":\"HTTPServer error\"}", "http_server_error httpServerError HttpServerError http-server-error HTTP_SERVER_ERROR") != 0) { ret 8; }
+        if (run(?a, "def f():\n    {{body|indent:4}}\n", "{\"body\":\"x = 1\\nreturn x\"}", "def f():\n    x = 1\n    return x\n") != 0) { ret 9; }
+        if (run(?a, "{{missing|default:none}}", "{}", "none") != 0) { ret 10; }
+        if (run(?a, "{{xs|join:\", \"}}", "{\"xs\":[1,2,3]}", "1, 2, 3") != 0) { ret 11; }
+        if (run(?a, "{{#with o}}{{a}}{{/with}} {{o.b.0}}", "{\"o\":{\"a\":\"A\",\"b\":[\"B\"]}}", "A B") != 0) { ret 12; }
+        if (run(?a, "d = \\{{'k': {{v|py}}}}", "{\"v\":1}", "d = {{'k': 1}}") != 0) { ret 13; }
+        ret 0;
+    }
+
+    test render__strict_errors_name_the_line {
+        var a: A.Allocator;
+        val made: err[A.Error] = page.make(?a);
+        if (sel made.err) { ret 1; }
+        val data: str = "{\"table\":\"users\"}";
+        val parsed: res[json.Value, json.JsonError] = json.parse(data, str_len(data), ?a);
+        if (sel parsed.err) { ret 2; }
+        var v: json.Value = parsed.ok;
+        var c: Ctx;
+        ctx_init(?c);
+        ctx_push(?c, ?v);
+        var out: *u8 = nil;
+        var n: usize = 0;
+        var e: Err;
+        val t1: str = "ok\n{{tabel}}\n";
+        if (render(?a, "t", "python", t1, str_len(t1), ?c, nil, ?out, ?n, ?e)) { ret 3; }
+        if (!util.eq(e.code, "tmpl_var") || e.line != 2) { ret 4; }
+        val t2: str = "{{#each x}}\n{{/if}}\n";
+        if (render(?a, "t", "python", t2, str_len(t2), ?c, nil, ?out, ?n, ?e)) { ret 5; }
+        if (!util.eq(e.code, "tmpl_syntax") || e.line != 2) { ret 6; }
+        val t3: str = "{{table|ident}} {{bad|default:my-name|ident}}";
+        if (render(?a, "t", "python", t3, str_len(t3), ?c, nil, ?out, ?n, ?e)) { ret 7; }
+        if (!util.eq(e.code, "tmpl_ident")) { ret 8; }
+        val t4: str = "n = {{len(table)}}";
+        if (render(?a, "t", "python", t4, str_len(t4), ?c, nil, ?out, ?n, ?e)) { ret 9; }
+        if (!util.eq(e.code, "tmpl_code")) { ret 10; }
+        ret 0;
+    }
+}

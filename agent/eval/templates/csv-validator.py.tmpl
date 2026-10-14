@@ -1,0 +1,29 @@
+{{!-- validate one table's csv export: exact header, row count, and empty cells per column.
+vars: table; columns [name] --}}
+"""Validate a {{table}} CSV export: header, row count, and empty cells per column."""
+import csv
+import json
+import sys
+
+TABLE = {{table|py}}
+COLUMNS = {{columns|py}}
+
+
+def main(argv):
+    with open(argv[1], newline="") as f:
+        rows = list(csv.reader(f))
+    if not rows or rows[0] != COLUMNS:
+        print(json.dumps({"table": TABLE, "error": "bad header"}))
+        return 1
+    data = rows[1:]
+    empty = {c: 0 for c in COLUMNS}
+    for row in data:
+        for i, c in enumerate(COLUMNS):
+            if i >= len(row) or row[i] == "":
+                empty[c] += 1
+    print(json.dumps({"table": TABLE, "rows": len(data), "empty": empty}))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

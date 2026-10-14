@@ -1,0 +1,202 @@
+# model context protocol over stdio: json-rpc 2.0, one message per line
+#
+# the tools are the write layer's operations: qark_apply, qark_read,
+# qark_search, qark_templates, and qark_define_template. a tool result carries the same
+# json object the ndjson worker returns, once as text and once as
+# structuredContent, with isError set when the operation refused.
+
+use std.data.json;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+
+use A: std.allocator;
+use jw: qark.rpc.jw;
+use write: qark.rpc.write;
+use spec: qark.spec.spec;
+use session: qark.session;
+use util: qark.util;
+
+#[embed("../../scripts/mcp/tools.json")]
+val TOOLS: [_]u8;
+
+val LATEST: str = "2025-06-18";
+
+val INSTRUCTIONS: str = "Qark is the file writer for this workspace. Use qark_apply for every file you create, replace, edit, move, or delete: it renders templates, syntax-checks the result, and writes all files atomically or none. To change an existing file, read it with qark_read and either pass edits with exact find text or a find_re regex (\\0-\\9 captures; occurrence picks a match, within scopes), or mode replace with expect set to its sha256. To rename a file, pass move with the destination as path. To look before you write, use qark_search (literal or regex, glob-narrowed, no pattern lists files) and qark_read's outline for a file's symbols. Re-sending a request is safe; identical files report unchanged. For many similar scripts, write one template and fan it out with each, or send an expand table (@template, a header, then one row per line). A job writes a self-contained directory under jobs/<job> with manifest.json for whoever runs it.";
+
+fun known_version(v: str) bool {
+    ret util.eq(v, "2024-11-05") || util.eq(v, "2025-03-26") || util.eq(v, "2025-06-18") || util.eq(v, "2025-11-25");
+}
+
+# the request id exactly as the client sent it
+fun write_id(w: *jw.Jw, id: *json.Value) {
+    if (id == nil) {
+        jw.null_v(w);
+        ret;
+    }
+    if (json.value_is_string(id)) {
+        var n: usize = 0;
+        val p: *u8 = json.value_string(id, ?n);
+        jw.wire_str(w, p, n);
+        ret;
+    }
+    if (json.value_is_number(id) && !json.value_is_float(id)) {
+        jw.i64_v(w, json.value_number(id));
+        ret;
+    }
+    jw.null_v(w);
+}
+
+fun open_reply(w: *jw.Jw, id: *json.Value) {
+    jw.obj(w);
+    jw.f_str(w, "jsonrpc", "2.0");
+    jw.key(w, "id");
+    write_id(w, id);
+}
+
+fun rpc_error(s: *session.Session, id: *json.Value, code: i64, msg: str) res[str, A.Error] {
+    var w: jw.Jw = jw.init(?s.ra);
+    open_reply(?w, id);
+    jw.key(?w, "error");
+    jw.obj(?w);
+    jw.f_i64(?w, "code", code);
+    jw.f_str(?w, "message", msg);
+    jw.obj_end(?w);
+    jw.obj_end(?w);
+    jw.byte(?w, '\n');
+    ret jw.take(?w, s.a);
+}
+
+fun field_text(a: *A.Allocator, obj: *json.Value, key: str) str {
+    val f: opt[*json.Value] = json.value_find(obj, key);
+    if (!sel f.some) { ret nil; }
+    if (!json.value_is_string(f.some)) { ret nil; }
+    var p: *u8 = nil;
+    var n: usize = 0;
+    if (!spec.decode_pub(a, f.some, ?p, ?n)) { ret nil; }
+    ret p;
+}
+
+fun tools_json(s: *session.Session, w: *jw.Jw) bool {
+    val n: usize = $length_of(TOOLS);
+    val got: res[*u8, A.Error] = A.allocate[u8](?s.ra, n + 1);
+    if (sel got.err) { ret false; }
+    var i: usize = 0;
+    for (i < n) {
+        got.ok[i] = TOOLS[i];
+        i = i + 1;
+    }
+    got.ok[n] = 0;
+    val parsed: res[json.Value, json.JsonError] = json.parse(got.ok, n, ?s.ra);
+    if (sel parsed.err) { ret false; }
+    var doc: json.Value = parsed.ok;
+    var compact: jw.Jw = jw.init(?s.ra);
+    spec.emit_json(?compact, ?doc, false, 0);
+    if (compact.failed) { ret false; }
+    jw.raw_v(w, jw.text(?compact));
+    ret true;
+}
+
+fun call_tool(s: *session.Session, id: *json.Value, params: *json.Value) res[str, A.Error] {
+    val name: str = field_text(?s.ra, params, "name");
+    if (name == nil) { ret rpc_error(s, id, -32602, "tools/call needs params.name"); }
+    var empty: json.Value;
+    empty.kind = json.OBJECT;
+    var args: *json.Value = ?empty;
+    val af: opt[*json.Value] = json.value_find(params, "arguments");
+    if (sel af.some) {
+        if (json.value_is_object(af.some)) { args = af.some; }
+    }
+    var inner: jw.Jw = jw.init(?s.ra);
+    var ok: bool = false;
+    if (util.eq(name, "qark_apply")) { ok = write.apply(s, args, ?inner); }
+    or (util.eq(name, "qark_read")) { ok = write.read(s, args, ?inner); }
+    or (util.eq(name, "qark_search")) { ok = write.search(s, args, ?inner); }
+    or (util.eq(name, "qark_templates")) { ok = write.templates(s, args, ?inner); }
+    or (util.eq(name, "qark_define_template")) { ok = write.define(s, args, ?inner); }
+    or { ret rpc_error(s, id, -32602, "unknown tool; call tools/list"); }
+    if (inner.failed) { ret rpc_error(s, id, -32603, "out of memory while building the result"); }
+    var w: jw.Jw = jw.init(?s.ra);
+    open_reply(?w, id);
+    jw.key(?w, "result");
+    jw.obj(?w);
+    jw.key(?w, "content");
+    jw.arr(?w);
+    jw.obj(?w);
+    jw.f_str(?w, "type", "text");
+    jw.key(?w, "text");
+    jw.str_n(?w, inner.buf, inner.len);
+    jw.obj_end(?w);
+    jw.arr_end(?w);
+    jw.key(?w, "structuredContent");
+    jw.raw_vn(?w, inner.buf, inner.len);
+    jw.f_bool(?w, "isError", !ok);
+    jw.obj_end(?w);
+    jw.obj_end(?w);
+    jw.byte(?w, '\n');
+    ret jw.take(?w, s.a);
+}
+
+# handle one json-rpc line; an empty reply means the message was a notification
+pub fun handle(s: *session.Session, line: str) res[str, A.Error] {
+    session.begin_request(s);
+    val parsed: res[json.Value, json.JsonError] = json.parse(line, str_len(line), ?s.ra);
+    if (sel parsed.err) { ret rpc_error(s, nil, -32700, "parse error: send one json-rpc object per line"); }
+    var msg: json.Value = parsed.ok;
+    if (!json.value_is_object(?msg)) { ret rpc_error(s, nil, -32600, "a message must be a json object"); }
+    var id: *json.Value = nil;
+    val idf: opt[*json.Value] = json.value_find(?msg, "id");
+    if (sel idf.some) { id = idf.some; }
+    val method: str = field_text(?s.ra, ?msg, "method");
+    if (method == nil) {
+        if (id == nil) { ret util.dup(s.a, ""); }
+        ret rpc_error(s, id, -32600, "a request needs a method");
+    }
+    if (id == nil) { ret util.dup(s.a, ""); }
+    var empty: json.Value;
+    empty.kind = json.OBJECT;
+    var params: *json.Value = ?empty;
+    val pf: opt[*json.Value] = json.value_find(?msg, "params");
+    if (sel pf.some) {
+        if (json.value_is_object(pf.some)) { params = pf.some; }
+    }
+    if (util.eq(method, "tools/call")) { ret call_tool(s, id, params); }
+    var w: jw.Jw = jw.init(?s.ra);
+    open_reply(?w, id);
+    jw.key(?w, "result");
+    if (util.eq(method, "initialize")) {
+        var version: str = field_text(?s.ra, params, "protocolVersion");
+        if (version == nil || !known_version(version)) { version = LATEST; }
+        jw.obj(?w);
+        jw.f_str(?w, "protocolVersion", version);
+        jw.key(?w, "capabilities");
+        jw.raw_v(?w, "{\"tools\":{\"listChanged\":false}}");
+        jw.key(?w, "serverInfo");
+        jw.obj(?w);
+        jw.f_str(?w, "name", "qark");
+        jw.f_str(?w, "title", "Qark write layer");
+        jw.f_str(?w, "version", spec.VERSION);
+        jw.obj_end(?w);
+        jw.f_str(?w, "instructions", INSTRUCTIONS);
+        jw.obj_end(?w);
+    }
+    or (util.eq(method, "ping")) { jw.raw_v(?w, "{}"); }
+    or (util.eq(method, "tools/list")) {
+        jw.obj(?w);
+        jw.key(?w, "tools");
+        if (!tools_json(s, ?w)) { ret rpc_error(s, id, -32603, "the tool list could not be built"); }
+        jw.obj_end(?w);
+    }
+    or (util.eq(method, "resources/list")) { jw.raw_v(?w, "{\"resources\":[]}"); }
+    or (util.eq(method, "prompts/list")) { jw.raw_v(?w, "{\"prompts\":[]}"); }
+    or { ret rpc_error(s, id, -32601, "method not found"); }
+    jw.obj_end(?w);
+    jw.byte(?w, '\n');
+    ret jw.take(?w, s.a);
+}

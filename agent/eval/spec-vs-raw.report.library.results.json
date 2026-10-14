@@ -1,0 +1,58 @@
+[
+    {
+        "model":  "granite4.2:3b",
+        "mode":  "library",
+        "turns":  2,
+        "first_try":  false,
+        "applied":  false,
+        "scripts_correct":  0,
+        "of":  6,
+        "out_tokens":  418,
+        "model_ms":  36414.299999999996,
+        "qark_ms":  0.5,
+        "files_written":  0,
+        "first_error":  "spec_files"
+    },
+    {
+        "model":  "granite4.2:8b",
+        "mode":  "library",
+        "turns":  1,
+        "first_try":  true,
+        "applied":  true,
+        "scripts_correct":  6,
+        "of":  6,
+        "out_tokens":  258,
+        "model_ms":  87228.6,
+        "qark_ms":  372.9,
+        "files_written":  7,
+        "first_error":  null
+    },
+    {
+        "model":  "granite4.1:3b",
+        "mode":  "library",
+        "turns":  1,
+        "first_try":  true,
+        "applied":  true,
+        "scripts_correct":  6,
+        "of":  6,
+        "out_tokens":  167,
+        "model_ms":  35507.3,
+        "qark_ms":  78.9,
+        "files_written":  7,
+        "first_error":  null
+    },
+    {
+        "model":  "granite4.1:8b",
+        "mode":  "library",
+        "turns":  1,
+        "first_try":  true,
+        "applied":  true,
+        "scripts_correct":  6,
+        "of":  6,
+        "out_tokens":  216,
+        "model_ms":  86709.8,
+        "qark_ms":  164.1,
+        "files_written":  7,
+        "first_error":  null
+    }
+]

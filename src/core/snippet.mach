@@ -1,0 +1,159 @@
+# snippets with numbered tabstops; headless expansion resolves them in order
+
+use std.collections.vector;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+
+use A: std.allocator;
+use util: qark.util;
+
+# one tabstop in the expanded buffer
+pub rec Stop {
+    id:  i64;
+    row: i64;
+    col: i64;
+    len: i64;
+}
+
+# the active snippet, if any
+pub rec State {
+    a:      *A.Allocator;
+    active: bool;
+    stops:  vector.Vector[Stop];
+    index:  i64;
+}
+
+# no active snippet
+pub fun init(a: *A.Allocator) State {
+    var s: State;
+    s.a = a;
+    s.stops = vector.init[Stop](a);
+    s.index = 0;
+    ret s;
+}
+
+# drop tabstops
+pub fun clear(s: *State) {
+    vector.clear[Stop](?s.stops);
+    s.active = false;
+    s.index = 0;
+}
+
+# release the state
+pub fun dnit(s: *State) {
+    vector.dnit[Stop](?s.stops);
+}
+
+# expand a snippet body, writing plain text to out and recording stops
+#
+# `$1` and `${1:default}` are tabstops. `$$` is a dollar. `$0` is the final stop.
+# ---
+# ret: owned expanded text, or the allocator's refusal
+pub fun expand(s: *State, body: str, out: *str) err[A.Error] {
+    clear(s);
+    if (body == nil) {
+        val empty: res[str, A.Error] = util.dup(s.a, "");
+        if (sel empty.err) { ret err[A.Error].err{empty.err}; }
+        @out = empty.ok;
+        ret err[A.Error].ok{};
+    }
+    var buf: *u8 = nil;
+    var len: usize = 0;
+    var cap: usize = 0;
+    var i: usize = 0;
+    var col: i64 = 0;
+    var row: i64 = 0;
+    for (body[i] != 0) {
+        if (body[i] == '$' && body[i + 1] == '$') {
+            val ap: err[A.Error] = util.append_byte(s.a, ?buf, ?len, ?cap, '$');
+            if (sel ap.err) { ret ap; }
+            i = i + 2;
+            col = col + 1;
+        }
+        or (body[i] == '$' && body[i + 1] == '{') {
+            i = i + 2;
+            var id: i64 = 0;
+            for (body[i] >= '0' && body[i] <= '9') {
+                id = id * 10 + (body[i] - '0')::i64;
+                i = i + 1;
+            }
+            var def_at: usize = 0;
+            var def_n: usize = 0;
+            if (body[i] == ':') {
+                i = i + 1;
+                def_at = i;
+                for (body[i] != 0 && body[i] != '}') {
+                    def_n = def_n + 1;
+                    i = i + 1;
+                }
+            }
+            if (body[i] == '}') { i = i + 1; }
+            var stop: Stop;
+            stop.id = id;
+            stop.row = row;
+            stop.col = col;
+            stop.len = def_n::i64;
+            vector.push[Stop](?s.stops, stop);
+            if (def_n > 0) {
+                val ap: err[A.Error] = util.append(s.a, ?buf, ?len, ?cap, (body::usize + def_at)::*u8, def_n);
+                if (sel ap.err) { ret ap; }
+                col = col + def_n::i64;
+            }
+        }
+        or (body[i] == '$' && body[i + 1] >= '0' && body[i + 1] <= '9') {
+            i = i + 1;
+            var id: i64 = 0;
+            for (body[i] >= '0' && body[i] <= '9') {
+                id = id * 10 + (body[i] - '0')::i64;
+                i = i + 1;
+            }
+            var stop: Stop;
+            stop.id = id;
+            stop.row = row;
+            stop.col = col;
+            stop.len = 0;
+            vector.push[Stop](?s.stops, stop);
+        }
+        or {
+            val ap: err[A.Error] = util.append_byte(s.a, ?buf, ?len, ?cap, body[i]);
+            if (sel ap.err) { ret ap; }
+            if (body[i] == '\n') {
+                row = row + 1;
+                col = 0;
+            }
+            or { col = col + 1; }
+            i = i + 1;
+        }
+    }
+    if (s.stops.len > 0) { s.active = true; }
+    val exact: res[str, A.Error] = util.dup_n(s.a, buf, len);
+    if (buf != nil) { A.deallocate[u8](s.a, buf, cap + 1); }
+    if (sel exact.err) { ret err[A.Error].err{exact.err}; }
+    @out = exact.ok;
+    ret err[A.Error].ok{};
+}
+
+# move to the next tabstop; returns false when the snippet is done
+pub fun jump(s: *State, row: *i64, col: *i64) bool {
+    if (!s.active) { ret false; }
+    if (s.index::usize >= s.stops.len) {
+        s.active = false;
+        ret false;
+    }
+    val g: opt[*Stop] = vector.get[Stop](?s.stops, s.index::usize);
+    if (!sel g.some) {
+        s.active = false;
+        ret false;
+    }
+    @row = g.some.row;
+    @col = g.some.col;
+    s.index = s.index + 1;
+    if (s.index::usize >= s.stops.len) { s.active = false; }
+    ret true;
+}

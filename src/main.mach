@@ -1,0 +1,13 @@
+use std.runtime;
+
+use cli: qark.cli;
+
+# qark entry
+# ---
+# argc: argument count
+# argv: argument vector
+# ret:  process status
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 {
+    ret cli.run(argc, argv);
+}

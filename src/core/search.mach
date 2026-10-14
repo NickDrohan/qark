@@ -1,0 +1,100 @@
+# buffer search on top of the regex engine
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+
+use A: std.allocator;
+use motion: qark.core.motion;
+use util: qark.util;
+use re: qark.core.regex;
+use text: qark.core.text;
+
+# a hit inside the buffer
+pub rec Hit {
+    ok:  bool;
+    row: i64;
+    col: i64;
+    end: i64;
+}
+
+# next match of a compiled pattern, starting just after the cursor when forward
+pub fun next(t: *text.Text, row: i64, col: i64, prog: *re.Prog, forward: bool) Hit {
+    var h: Hit;
+    val nlines: i64 = text.line_count(t);
+    if (forward) {
+        var r: i64 = row;
+        var from: i64 = col + 1;
+        for (r < nlines) {
+            val g: opt[*text.Line] = text.line_at(t, r);
+            if (sel g.some) {
+                var start: i64 = 0;
+                if (r == row) { start = from; }
+                if (start < 0) { start = 0; }
+                val m: re.Match = re.find(prog, g.some.data, g.some.len::i64, start);
+                if (m.ok) {
+                    h.ok = true;
+                    h.row = r;
+                    h.col = m.start;
+                    h.end = m.end;
+                    ret h;
+                }
+            }
+            r = r + 1;
+        }
+        ret h;
+    }
+    var r: i64 = row;
+    for (r >= 0) {
+        val g: opt[*text.Line] = text.line_at(t, r);
+        if (sel g.some) {
+            var best: re.Match;
+            var from: i64 = 0;
+            var limit: i64 = g.some.len::i64;
+            if (r == row) { limit = col; }
+            for (from <= limit) {
+                val m: re.Match = re.find(prog, g.some.data, g.some.len::i64, from);
+                if (!m.ok || m.start >= limit) { brk; }
+                best = m;
+                if (m.end <= from) { from = from + 1; }
+                or { from = m.end; }
+                if (from == 0) { brk; }
+            }
+            if (best.ok) {
+                h.ok = true;
+                h.row = r;
+                h.col = best.start;
+                h.end = best.end;
+                ret h;
+            }
+        }
+        r = r - 1;
+    }
+    ret h;
+}
+
+# the word under the cursor, copied into an owned string
+pub fun word_under(a: *A.Allocator, t: *text.Text, row: i64, col: i64) res[str, A.Error] {
+    val len: i64 = motion.line_len(t, row);
+    var c: i64 = col;
+    if (c >= len && c > 0) { c = c - 1; }
+    if (len == 0 || motion.class_of(motion.byte_at(t, row, c)) != motion.CLASS_WORD) {
+        ret util.dup(a, "");
+    }
+    var c1: i64 = c;
+    for (c1 > 0 && motion.class_of(motion.byte_at(t, row, c1 - 1)) == motion.CLASS_WORD) {
+        c1 = c1 - 1;
+    }
+    var c2: i64 = c;
+    for (c2 < len && motion.class_of(motion.byte_at(t, row, c2)) == motion.CLASS_WORD) {
+        c2 = c2 + 1;
+    }
+    val g: opt[*text.Line] = text.line_at(t, row);
+    if (!sel g.some) { ret util.dup(a, ""); }
+    ret util.dup_n(a, (g.some.data::usize + c1::usize)::*u8, (c2 - c1)::usize);
+}

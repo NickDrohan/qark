@@ -1,0 +1,106 @@
+# windows console: virtual-terminal output and decoded keys
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.size.isize;
+use std.types.size.usize;
+
+use keys: qark.core.keys;
+
+$if ($mach.build.os == $mach.os.windows) {
+    use std.system.os;
+}
+$or {
+    $error("qark.term.windows needs windows");
+}
+
+#[library("kernel32.dll")]
+ext fun GetStdHandle(kind: u32) isize;
+#[library("kernel32.dll")]
+ext fun GetConsoleMode(handle: isize, mode: *u32) i32;
+#[library("kernel32.dll")]
+ext fun SetConsoleMode(handle: isize, mode: u32) i32;
+#[library("kernel32.dll")]
+ext fun GetConsoleScreenBufferInfo(handle: isize, info: *Screen) i32;
+#[library("kernel32.dll")]
+ext fun WriteFile(handle: isize, buf: *u8, n: u32, wrote: *u32, ov: *u8) i32;
+
+val STD_INPUT:  u32 = (0 - 10)::i32::u32;
+val STD_OUTPUT: u32 = (0 - 11)::i32::u32;
+val ENABLE_VT:  u32 = 0x0004;
+val ENABLE_WRAP: u32 = 0x0001;
+
+rec Screen {
+    size_x: i16;
+    size_y: i16;
+    cursor_x: i16;
+    cursor_y: i16;
+    attr: u16;
+    win_left: i16;
+    win_top: i16;
+    win_right: i16;
+    win_bottom: i16;
+    max_x: i16;
+    max_y: i16;
+}
+
+var in_h: isize = 0;
+var out_h: isize = 0;
+var in_mode: u32 = 0;
+var out_mode: u32 = 0;
+var active: bool = false;
+
+fun out() isize {
+    if (out_h == 0) { out_h = GetStdHandle(STD_OUTPUT); }
+    ret out_h;
+}
+
+fun inp() isize {
+    if (in_h == 0) { in_h = GetStdHandle(STD_INPUT); }
+    ret in_h;
+}
+
+# enable processed VT output; raw input is std.terminal's job
+pub fun enable() bool {
+    var mode: u32 = 0;
+    if (GetConsoleMode(out(), ?mode) == 0) { ret false; }
+    out_mode = mode;
+    val next: u32 = mode | ENABLE_VT | ENABLE_WRAP;
+    if (SetConsoleMode(out(), next) == 0) { ret false; }
+    if (GetConsoleMode(inp(), ?in_mode) != 0) { active = true; }
+    ret true;
+}
+
+# restore the output mode captured by enable
+pub fun disable() {
+    if (out_mode != 0) { SetConsoleMode(out(), out_mode); }
+    active = false;
+}
+
+# console window size in cells; 80x24 when the call fails
+pub fun size(cols: *i64, rows: *i64) {
+    var info: Screen;
+    if (GetConsoleScreenBufferInfo(out(), ?info) == 0) {
+        @cols = 80;
+        @rows = 24;
+        ret;
+    }
+    @cols = (info.win_right - info.win_left + 1)::i64;
+    @rows = (info.win_bottom - info.win_top + 1)::i64;
+    if (@cols < 1) { @cols = 80; }
+    if (@rows < 1) { @rows = 24; }
+}
+
+# write bytes to the console
+pub fun write_bytes(data: *u8, n: usize) {
+    var wrote: u32 = 0;
+    if (n > 0) { WriteFile(out(), data, n::u32, ?wrote, nil); }
+}
+
+pub fun write_str(s: *u8) {
+    if (s == nil) { ret; }
+    var n: usize = 0;
+    for (s[n] != 0) { n = n + 1; }
+    write_bytes(s, n);
+}

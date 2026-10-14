@@ -1,0 +1,7 @@
+{{!-- a bash script in strict mode.
+vars: description; body --}}
+#!/usr/bin/env bash
+# {{description}}
+set -euo pipefail
+
+{{body|default:"echo ok"}}

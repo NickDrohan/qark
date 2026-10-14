@@ -1,0 +1,58 @@
+[
+    {
+        "model":  "granite4.2:3b",
+        "mode":  "library",
+        "turns":  2,
+        "first_try":  false,
+        "applied":  false,
+        "scripts_correct":  0,
+        "of":  6,
+        "out_tokens":  892,
+        "model_ms":  34950.9,
+        "qark_ms":  0.89999999999999991,
+        "files_written":  0,
+        "first_error":  "spec_each_path"
+    },
+    {
+        "model":  "granite4.2:8b",
+        "mode":  "library",
+        "turns":  1,
+        "first_try":  true,
+        "applied":  true,
+        "scripts_correct":  6,
+        "of":  6,
+        "out_tokens":  258,
+        "model_ms":  110545.4,
+        "qark_ms":  322.2,
+        "files_written":  7,
+        "first_error":  null
+    },
+    {
+        "model":  "granite4.1:3b",
+        "mode":  "library",
+        "turns":  2,
+        "first_try":  false,
+        "applied":  false,
+        "scripts_correct":  0,
+        "of":  6,
+        "out_tokens":  452,
+        "model_ms":  40927,
+        "qark_ms":  0.5,
+        "files_written":  0,
+        "first_error":  "spec_each_path"
+    },
+    {
+        "model":  "granite4.1:8b",
+        "mode":  "library",
+        "turns":  1,
+        "first_try":  true,
+        "applied":  true,
+        "scripts_correct":  6,
+        "of":  6,
+        "out_tokens":  198,
+        "model_ms":  82956,
+        "qark_ms":  38.3,
+        "files_written":  7,
+        "first_error":  null
+    }
+]

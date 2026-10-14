@@ -1,0 +1,696 @@
+# workspace scanning: walk a subtree, grep lines, and pull symbol outlines
+#
+# search walks the root (or a subtree), skips the usual caches and checkouts,
+# matches each line against a literal or a qark regex, and reports matches
+# grouped by file with the file's sha256 so an agent can edit against it.
+# with no pattern it lists the matching paths instead. outline scans one file
+# for the shapes each language declares a symbol with, and reports the line
+# each symbol starts and ends on so an agent can read or edit exactly that.
+
+use std.collections.vector;
+use std.filesystem;
+use io_error: std.io.error;
+use std.text.utf8;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+
+use A: std.allocator;
+use commit: qark.gen.commit;
+use pathx: qark.gen.pathx;
+use jw: qark.rpc.jw;
+use re: qark.core.regex;
+use spec: qark.spec.spec;
+use util: qark.util;
+
+# directories the walk never enters unless the caller sets all
+val SKIP: [8]str = [8]str{".git", ".qark", ".svn", ".hg", "node_modules", "__pycache__", ".venv", "venv"};
+
+# files larger than this are skipped rather than grepped
+pub val MAX_SCAN_BYTES: usize = 4194304;
+
+# a match line's text is cut here, at a utf-8 boundary
+val LINE_MAX: usize = 512;
+
+# most matches reported for one file before it reports more
+val FILE_MAX: usize = 512;
+
+pub rec Opts {
+    pat:       str;
+    patn:      usize;
+    is_re:     bool;
+    icase:     bool;
+    glob:      str;
+    path:      str;
+    ctx:       i64;
+    max:       i64;
+    max_files: i64;
+    all:       bool;
+}
+
+fun skipped(name: str) bool {
+    var i: usize = 0;
+    for (i < 8) {
+        if (util.eq(name, SKIP[i])) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+fun lower(c: u8) u8 {
+    if (c >= 'A' && c <= 'Z') { ret c + 32; }
+    ret c;
+}
+
+# glob matching: * is any run not containing '/', ** is any run, ? is one
+# byte other than '/'. case-insensitive, matching windows path semantics.
+fun gm(g: *u8, gn: usize, gi: usize, t: *u8, tn: usize, ti: usize) bool {
+    var i: usize = gi;
+    var j: usize = ti;
+    for (i < gn) {
+        if (g[i] == '*') {
+            val two: bool = i + 1 < gn && g[i + 1] == '*';
+            i = i + 1;
+            if (two) { i = i + 1; }
+            var k: usize = j;
+            for {
+                if (gm(g, gn, i, t, tn, k)) { ret true; }
+                if (k >= tn || (!two && t[k] == '/')) { ret false; }
+                k = k + 1;
+            }
+        }
+        if (j >= tn) { ret false; }
+        if (g[i] == '?') {
+            if (t[j] == '/') { ret false; }
+        }
+        or (lower(g[i]) != lower(t[j])) { ret false; }
+        i = i + 1;
+        j = j + 1;
+    }
+    ret j == tn;
+}
+
+pub fun glob_match(g: *u8, gn: usize, t: *u8, tn: usize) bool {
+    ret gm(g, gn, 0, t, tn, 0);
+}
+
+# a glob with no '/' matches the basename; a glob with one matches the path
+fun glob_ok(glob: str, rel: str) bool {
+    if (glob == nil || glob[0] == 0) { ret true; }
+    val gn: usize = str_len(glob);
+    val tn: usize = str_len(rel);
+    var has_slash: bool = false;
+    var i: usize = 0;
+    for (i < gn) {
+        if (glob[i] == '/') { has_slash = true; }
+        i = i + 1;
+    }
+    if (!has_slash) {
+        var base: usize = 0;
+        i = 0;
+        for (i < tn) {
+            if (rel[i] == '/') { base = i + 1; }
+            i = i + 1;
+        }
+        ret glob_match(glob, gn, (rel::usize + base)::*u8, tn - base);
+    }
+    ret glob_match(glob, gn, rel, tn);
+}
+
+# append every matching file's rel path beneath dir_rel, depth-bounded
+fun walk(a: *A.Allocator, root: str, dir_rel: str, o: *Opts, out: *vector.Vector[str], depth: i64) {
+    if (depth > 64 || out.len >= o.max_files::usize) { ret; }
+    var full: str = root;
+    if (dir_rel != nil && dir_rel[0] != 0) {
+        val j: res[str, A.Error] = pathx.native(a, root, dir_rel);
+        if (sel j.err) { ret; }
+        full = j.ok;
+    }
+    val names: res[vector.Vector[str], filesystem.FsError] = filesystem.read_dir(a, full);
+    if (sel names.err) { ret; }
+    var i: usize = 0;
+    for (i < names.ok.len && out.len < o.max_files::usize) {
+        val name: str = names.ok.data[i];
+        var rel: str = name;
+        if (dir_rel != nil && dir_rel[0] != 0) {
+            val jn: res[str, A.Error] = pathx.join(a, dir_rel, name);
+            if (sel jn.ok) { rel = jn.ok; }
+        }
+        val child: res[str, A.Error] = pathx.native(a, root, rel);
+        if (sel child.ok) {
+            val m: res[filesystem.Metadata, io_error.Error] = filesystem.metadata_link(child.ok);
+            if (sel m.ok) {
+                if (m.ok.kind == filesystem.KIND_DIR) {
+                    if (o.all || !skipped(name)) { walk(a, root, rel, o, out, depth + 1); }
+                }
+                or (m.ok.kind == filesystem.KIND_FILE) {
+                    if (glob_ok(o.glob, rel)) { vector.push[str](out, rel); }
+                }
+            }
+        }
+        i = i + 1;
+    }
+}
+
+fun rel_lt(a: str, b: str) bool {
+    var i: usize = 0;
+    for (a[i] != 0 && b[i] != 0 && lower(a[i]) == lower(b[i])) { i = i + 1; }
+    ret lower(a[i]) < lower(b[i]);
+}
+
+fun sort_rels(v: *vector.Vector[str]) {
+    var i: usize = 1;
+    for (i < v.len) {
+        var j: usize = i;
+        for (j > 0 && rel_lt(v.data[j], v.data[j - 1])) {
+            val t: str = v.data[j];
+            v.data[j] = v.data[j - 1];
+            v.data[j - 1] = t;
+            j = j - 1;
+        }
+        i = i + 1;
+    }
+}
+
+# cut a line at LINE_MAX without splitting a utf-8 sequence
+fun line_cut(p: *u8, n: usize) usize {
+    if (n <= LINE_MAX) { ret n; }
+    var k: usize = LINE_MAX;
+    for (k > 0 && k < n && (p[k] & 0xc0) == 0x80) { k = k - 1; }
+    if (k == 0) { ret LINE_MAX; }
+    ret k;
+}
+
+# split into line spans; spans keep the trailing '\n' when there is one
+fun split_lines(p: *u8, n: usize, out: *vector.Vector[usize]) {
+    var i: usize = 0;
+    var start: usize = 0;
+    for (i < n) {
+        if (p[i] == '\n') {
+            vector.push[usize](out, start);
+            vector.push[usize](out, i + 1 - start);
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    if (start < n) {
+        vector.push[usize](out, start);
+        vector.push[usize](out, n - start);
+    }
+}
+
+# a line span's text without the trailing \r\n, optionally folded lowercase
+fun view_fold(a: *A.Allocator, p: *u8, off: usize, n: usize, icase: bool, out: *usize) *u8 {
+    var len: usize = n;
+    if (len > 0 && p[off + len - 1] == '\n') { len = len - 1; }
+    if (len > 0 && p[off + len - 1] == '\r') { len = len - 1; }
+    @out = len;
+    if (!icase) { ret (p::usize + off)::*u8; }
+    val cp: res[*u8, A.Error] = A.allocate[u8](a, len + 1);
+    if (sel cp.err) {
+        @out = 0;
+        ret nil;
+    }
+    var i: usize = 0;
+    for (i < len) {
+        cp.ok[i] = lower(p[off + i]);
+        i = i + 1;
+    }
+    cp.ok[len] = 0;
+    ret cp.ok;
+}
+
+fun lit_hit(p: *u8, n: usize, q: *u8, qn: usize) i64 {
+    if (qn == 0 || qn > n) { ret -1; }
+    var i: usize = 0;
+    for (i + qn <= n) {
+        if (p[i] == q[0]) {
+            var j: usize = 1;
+            for (j < qn && p[i + j] == q[j]) { j = j + 1; }
+            if (j == qn) { ret i::i64; }
+        }
+        i = i + 1;
+    }
+    ret -1;
+}
+
+# grep one file's lines and emit its file object, or nothing when it missed
+# ---
+# returns: -1 unreadable or binary, 0 scanned with no match, 1 emitted matches
+fun grep_file(a: *A.Allocator, root: str, rel: str, o: *Opts, prog: *re.Prog, w: *jw.Jw, budget: *i64) i64 {
+    val full: res[str, A.Error] = pathx.native(a, root, rel);
+    if (sel full.err) { ret -1; }
+    val m: res[filesystem.Metadata, io_error.Error] = filesystem.metadata_link(full.ok);
+    if (sel m.ok) {
+        if (m.ok.size > MAX_SCAN_BYTES) { ret -1; }
+    }
+    val got: res[vector.Vector[u8], filesystem.FsError] = filesystem.read_bytes(a, full.ok);
+    if (sel got.err) { ret -1; }
+    val p: *u8 = got.ok.data;
+    val n: usize = got.ok.len;
+    if (n > 0 && !utf8.validate(p, n)) { ret -1; }
+    var lines: vector.Vector[usize] = vector.init[usize](a);
+    split_lines(p, n, ?lines);
+    val nl: usize = lines.len / 2;
+    var needle: *u8 = o.pat;
+    if (o.icase && !o.is_re) {
+        val cp: res[*u8, A.Error] = A.allocate[u8](a, o.patn + 1);
+        if (sel cp.ok) {
+            var i: usize = 0;
+            for (i < o.patn) {
+                cp.ok[i] = lower(o.pat[i]);
+                i = i + 1;
+            }
+            cp.ok[o.patn] = 0;
+            needle = cp.ok;
+        }
+    }
+    var matches: vector.Vector[usize] = vector.init[usize](a);
+    var i: usize = 0;
+    for (i < nl && matches.len < 2 * FILE_MAX) {
+        var vn: usize = 0;
+        val v: *u8 = view_fold(a, p, lines.data[i * 2], lines.data[i * 2 + 1], o.icase && !o.is_re, ?vn);
+        if (v != nil) {
+            var col: i64 = -1;
+            if (o.is_re) {
+                val hit: re.Match = re.find(prog, v, vn::i64, 0);
+                if (hit.ok) { col = hit.start; }
+            }
+            or { col = lit_hit(v, vn, needle, o.patn); }
+            if (col >= 0) {
+                vector.push[usize](?matches, i);
+                vector.push[usize](?matches, col::usize);
+            }
+        }
+        i = i + 1;
+    }
+    if (matches.len == 0) { ret 0; }
+    var hex: [65]u8;
+    commit.hash_hex(p, n, ?hex[0]);
+    jw.obj(w);
+    jw.f_str(w, "path", rel);
+    jw.f_str(w, "sha256", ?hex[0]);
+    jw.f_i64(w, "lines", nl::i64);
+    jw.key(w, "matches");
+    jw.arr(w);
+    var k: usize = 0;
+    for (k < matches.len / 2 && @budget > 0) {
+        val li: usize = matches.data[k * 2];
+        val col: usize = matches.data[k * 2 + 1];
+        jw.obj(w);
+        jw.f_i64(w, "line", (li + 1)::i64);
+        jw.f_i64(w, "col", (col + 1)::i64);
+        var vn: usize = 0;
+        val v: *u8 = view_fold(a, p, lines.data[li * 2], lines.data[li * 2 + 1], false, ?vn);
+        jw.f_strn(w, "text", v, line_cut(v, vn));
+        if (o.ctx > 0) {
+            jw.key(w, "before");
+            jw.arr(w);
+            var c: i64 = o.ctx;
+            for (c > 0) {
+                if (li::i64 >= c) {
+                    val ci: usize = li - c::usize;
+                    var cn: usize = 0;
+                    val cv: *u8 = view_fold(a, p, lines.data[ci * 2], lines.data[ci * 2 + 1], false, ?cn);
+                    jw.str_n(w, cv, line_cut(cv, cn));
+                }
+                c = c - 1;
+            }
+            jw.arr_end(w);
+            jw.key(w, "after");
+            jw.arr(w);
+            c = 1;
+            for (c <= o.ctx && li + c::usize < nl) {
+                var cn: usize = 0;
+                val cv: *u8 = view_fold(a, p, lines.data[(li + c::usize) * 2], lines.data[(li + c::usize) * 2 + 1], false, ?cn);
+                jw.str_n(w, cv, line_cut(cv, cn));
+                c = c + 1;
+            }
+            jw.arr_end(w);
+        }
+        jw.obj_end(w);
+        @budget = @budget - 1;
+        k = k + 1;
+    }
+    jw.arr_end(w);
+    if (matches.len / 2 > k) { jw.f_bool(w, "more", true); }
+    jw.obj_end(w);
+    ret 1;
+}
+
+# grep or list the workspace under o.path; emits {files:[...]} or {paths:[...]}
+# ---
+# returns false when the regex fails to compile; the caller reports it
+pub fun run(a: *A.Allocator, root: str, o: *Opts, w: *jw.Jw) bool {
+    var files: vector.Vector[str] = vector.init[str](a);
+    walk(a, root, o.path, o, ?files, 0);
+    sort_rels(?files);
+    jw.obj(w);
+    if (o.pat == nil || o.patn == 0) {
+        jw.key(w, "paths");
+        jw.arr(w);
+        var i: usize = 0;
+        for (i < files.len) {
+            jw.str_v(w, files.data[i]);
+            i = i + 1;
+        }
+        jw.arr_end(w);
+        if (files.len >= o.max_files::usize) { jw.f_bool(w, "truncated", true); }
+        jw.f_i64(w, "scanned", files.len::i64);
+        jw.obj_end(w);
+        ret true;
+    }
+    var progv: re.Prog;
+    var have_prog: bool = false;
+    if (o.is_re) {
+        val prog: res[re.Prog, A.Error] = re.compile(a, o.pat, o.patn);
+        if (sel prog.err) {
+            jw.obj_end(w);
+            ret false;
+        }
+        progv = prog.ok;
+        have_prog = true;
+    }
+    jw.key(w, "files");
+    jw.arr(w);
+    var budget: i64 = o.max;
+    var scanned: i64 = 0;
+    var skipped_n: i64 = 0;
+    var truncated: bool = files.len >= o.max_files::usize;
+    var i: usize = 0;
+    for (i < files.len && budget > 0) {
+        val r: i64 = grep_file(a, root, files.data[i], o, ?progv, w, ?budget);
+        if (r >= 0) { scanned = scanned + 1; }
+        or { skipped_n = skipped_n + 1; }
+        if (r == 1 && budget <= 0) { truncated = true; }
+        i = i + 1;
+    }
+    if (i < files.len) { truncated = true; }
+    jw.arr_end(w);
+    jw.f_bool(w, "truncated", truncated);
+    jw.f_i64(w, "scanned", scanned);
+    if (skipped_n > 0) { jw.f_i64(w, "skipped", skipped_n); }
+    jw.obj_end(w);
+    if (have_prog) { re.dnit(?progv); }
+    ret true;
+}
+
+# one named thing a file declares, for outline
+pub rec Sym {
+    name:   *u8;
+    name_n: usize;
+    kind:   str;
+    line:   i64;
+    end:    i64;
+    indent: i64;
+}
+
+# locals are noise in an outline: val/var/variable only count at top level
+fun push_sym(out: *vector.Vector[Sym], p: *u8, name_at: usize, name_n: usize, kind: str, line: i64, ind: i64) {
+    if (ind > 0 && (util.eq(kind, "val") || util.eq(kind, "var") || util.eq(kind, "variable"))) { ret; }
+    var s: Sym;
+    s.name = (p::usize + name_at)::*u8;
+    s.name_n = name_n;
+    s.kind = kind;
+    s.line = line;
+    s.end = -1;
+    s.indent = ind;
+    vector.push[Sym](out, s);
+}
+
+fun ident_byte(c: u8) bool {
+    if (c >= 'a' && c <= 'z') { ret true; }
+    if (c >= 'A' && c <= 'Z') { ret true; }
+    if (c >= '0' && c <= '9') { ret true; }
+    ret c == '_';
+}
+
+# the identifier length at p[i..], 0 when it does not start one
+fun word_len(p: *u8, n: usize, i: usize) usize {
+    var j: usize = i;
+    for (j < n && ident_byte(p[j])) { j = j + 1; }
+    ret j - i;
+}
+
+# kw_'s length when it appears at p[i..] as a whole word, else 0
+fun kw(p: *u8, n: usize, i: usize, kw_: str) usize {
+    val kn: usize = str_len(kw_);
+    if (i + kn > n) { ret 0; }
+    var j: usize = 0;
+    for (j < kn) {
+        if (p[i + j] != kw_[j]) { ret 0; }
+        j = j + 1;
+    }
+    if (i + kn < n && ident_byte(p[i + kn])) { ret 0; }
+    ret kn;
+}
+
+fun skip_ws_fwd(p: *u8, n: usize, i: usize) usize {
+    var j: usize = i;
+    for (j < n && (p[j] == ' ' || p[j] == '\t')) { j = j + 1; }
+    ret j;
+}
+
+# python: [async] def name( / class name — indent ends the symbol
+fun scan_python(p: *u8, lines: *vector.Vector[usize], out: *vector.Vector[Sym]) {
+    val nl: usize = lines.len / 2;
+    var i: usize = 0;
+    for (i < nl) {
+        val off: usize = lines.data[i * 2];
+        val n: usize = lines.data[i * 2 + 1];
+        var j: usize = 0;
+        for (j < n && (p[off + j] == ' ' || p[off + j] == '\t')) { j = j + 1; }
+        val ind: i64 = j::i64;
+        var k: usize = off + j;
+        var kind: str = nil;
+        var kn: usize = kw(p, off + n, k, "def");
+        if (kn > 0) { kind = "function"; }
+        or {
+            kn = kw(p, off + n, k, "class");
+            if (kn > 0) { kind = "class"; }
+            or {
+                kn = kw(p, off + n, k, "async");
+                if (kn > 0) {
+                    k = skip_ws_fwd(p, off + n, k + kn);
+                    kn = kw(p, off + n, k, "def");
+                    if (kn > 0) { kind = "function"; }
+                }
+            }
+        }
+        if (kind != nil) {
+            k = skip_ws_fwd(p, off + n, k + kn);
+            val wl: usize = word_len(p, off + n, k);
+            if (wl > 0) { push_sym(out, p, k, wl, kind, (i + 1)::i64, ind); }
+        }
+        i = i + 1;
+    }
+}
+
+# mach: [pub] fun|rec|test|val|var|tag|uni|def|ext|fwd name — keyword is kind
+fun scan_mach(p: *u8, lines: *vector.Vector[usize], out: *vector.Vector[Sym]) {
+    val KEYWORDS: [10]str = [10]str{"fun", "rec", "test", "val", "var", "tag", "uni", "def", "ext", "fwd"};
+    val nl: usize = lines.len / 2;
+    var i: usize = 0;
+    for (i < nl) {
+        val off: usize = lines.data[i * 2];
+        val n: usize = lines.data[i * 2 + 1];
+        var j: usize = 0;
+        for (j < n && (p[off + j] == ' ' || p[off + j] == '\t')) { j = j + 1; }
+        val ind: i64 = j::i64;
+        var k: usize = off + j;
+        val pubn: usize = kw(p, off + n, k, "pub");
+        if (pubn > 0) { k = skip_ws_fwd(p, off + n, k + pubn); }
+        var kk: usize = 0;
+        for (kk < 10) {
+            val kn: usize = kw(p, off + n, k, KEYWORDS[kk]);
+            if (kn > 0) {
+                val name_at: usize = skip_ws_fwd(p, off + n, k + kn);
+                val wl: usize = word_len(p, off + n, name_at);
+                if (wl > 0) {
+                    push_sym(out, p, name_at, wl, KEYWORDS[kk], (i + 1)::i64, ind);
+                    kk = 10;
+                }
+            }
+            kk = kk + 1;
+        }
+        i = i + 1;
+    }
+}
+
+# javascript: function/class declarations and const/let/var bindings
+fun scan_js(p: *u8, lines: *vector.Vector[usize], out: *vector.Vector[Sym]) {
+    val nl: usize = lines.len / 2;
+    var i: usize = 0;
+    for (i < nl) {
+        val off: usize = lines.data[i * 2];
+        val n: usize = lines.data[i * 2 + 1];
+        var j: usize = 0;
+        for (j < n && (p[off + j] == ' ' || p[off + j] == '\t')) { j = j + 1; }
+        val ind: i64 = j::i64;
+        var k: usize = off + j;
+        var kn: usize = kw(p, off + n, k, "export");
+        if (kn > 0) {
+            k = skip_ws_fwd(p, off + n, k + kn);
+            val dn: usize = kw(p, off + n, k, "default");
+            if (dn > 0) { k = skip_ws_fwd(p, off + n, k + dn); }
+            kn = kw(p, off + n, k, "async");
+            if (kn > 0) { k = skip_ws_fwd(p, off + n, k + kn); }
+        }
+        var kind: str = nil;
+        kn = kw(p, off + n, k, "function");
+        if (kn > 0) {
+            kind = "function";
+            k = skip_ws_fwd(p, off + n, k + kn);
+            if (k < off + n && p[k] == '*') { k = skip_ws_fwd(p, off + n, k + 1); }
+        }
+        or {
+            kn = kw(p, off + n, k, "class");
+            if (kn > 0) {
+                kind = "class";
+                k = skip_ws_fwd(p, off + n, k + kn);
+            }
+            or {
+                kn = kw(p, off + n, k, "const");
+                if (kn == 0) { kn = kw(p, off + n, k, "let"); }
+                if (kn == 0) { kn = kw(p, off + n, k, "var"); }
+                if (kn > 0) {
+                    kind = "variable";
+                    k = skip_ws_fwd(p, off + n, k + kn);
+                }
+            }
+        }
+        if (kind != nil) {
+            val wl: usize = word_len(p, off + n, k);
+            if (wl > 0) { push_sym(out, p, k, wl, kind, (i + 1)::i64, ind); }
+        }
+        i = i + 1;
+    }
+}
+
+# powershell: function/class names; bash: function name / name()
+fun scan_shell(p: *u8, lines: *vector.Vector[usize], out: *vector.Vector[Sym], bash: bool) {
+    val nl: usize = lines.len / 2;
+    var i: usize = 0;
+    for (i < nl) {
+        val off: usize = lines.data[i * 2];
+        val n: usize = lines.data[i * 2 + 1];
+        var j: usize = 0;
+        for (j < n && (p[off + j] == ' ' || p[off + j] == '\t')) { j = j + 1; }
+        val ind: i64 = j::i64;
+        var k: usize = off + j;
+        var kn: usize = kw(p, off + n, k, "function");
+        if (kn > 0) {
+            k = skip_ws_fwd(p, off + n, k + kn);
+            val wl: usize = word_len(p, off + n, k);
+            if (wl > 0) { push_sym(out, p, k, wl, "function", (i + 1)::i64, ind); }
+        }
+        or (!bash) {
+            kn = kw(p, off + n, k, "class");
+            if (kn > 0) {
+                k = skip_ws_fwd(p, off + n, k + kn);
+                val wl: usize = word_len(p, off + n, k);
+                if (wl > 0) { push_sym(out, p, k, wl, "class", (i + 1)::i64, ind); }
+            }
+        }
+        or (bash) {
+            val wl: usize = word_len(p, off + n, k);
+            if (wl > 0) {
+                val z: usize = skip_ws_fwd(p, off + n, k + wl);
+                if (z + 1 < off + n && p[z] == '(' && p[z + 1] == ')') {
+                    push_sym(out, p, k, wl, "function", (i + 1)::i64, ind);
+                }
+            }
+        }
+        i = i + 1;
+    }
+}
+
+# toml: [section] and [[array]] headers
+fun scan_toml(p: *u8, lines: *vector.Vector[usize], out: *vector.Vector[Sym]) {
+    val nl: usize = lines.len / 2;
+    var i: usize = 0;
+    for (i < nl) {
+        val off: usize = lines.data[i * 2];
+        val n: usize = lines.data[i * 2 + 1];
+        var j: usize = 0;
+        for (j < n && (p[off + j] == ' ' || p[off + j] == '\t')) { j = j + 1; }
+        var k: usize = off + j;
+        if (k < off + n && p[k] == '[') {
+            if (k + 1 < off + n && p[k + 1] == '[') { k = k + 2; }
+            or { k = k + 1; }
+            val st: usize = k;
+            for (k < off + n && p[k] != ']' && p[k] != '\n' && p[k] != '\r') { k = k + 1; }
+            if (k > st) { push_sym(out, p, st, k - st, "section", (i + 1)::i64, 0); }
+        }
+        i = i + 1;
+    }
+}
+
+# emit the outline of one file's bytes for its checker language; mach included
+# ---
+# symbols carry the lines the symbol covers so a caller can read or edit
+# exactly it; end is the line before the next same-or-shallower symbol, or
+# the file's last line
+pub fun outline(a: *A.Allocator, lang: str, p: *u8, n: usize, w: *jw.Jw) {
+    var lines: vector.Vector[usize] = vector.init[usize](a);
+    split_lines(p, n, ?lines);
+    var syms: vector.Vector[Sym] = vector.init[Sym](a);
+    if (util.eq(lang, "python")) { scan_python(p, ?lines, ?syms); }
+    or (util.eq(lang, "mach")) { scan_mach(p, ?lines, ?syms); }
+    or (util.eq(lang, "node")) { scan_js(p, ?lines, ?syms); }
+    or (util.eq(lang, "powershell")) { scan_shell(p, ?lines, ?syms, false); }
+    or (util.eq(lang, "bash")) { scan_shell(p, ?lines, ?syms, true); }
+    or (util.eq(lang, "toml")) { scan_toml(p, ?lines, ?syms); }
+    val nl: i64 = (lines.len / 2)::i64;
+    var i: usize = 0;
+    for (i < syms.len) {
+        var j: usize = i + 1;
+        var end: i64 = nl;
+        for (j < syms.len) {
+            if (syms.data[j].indent <= syms.data[i].indent) {
+                end = syms.data[j].line - 1;
+                j = syms.len;
+            }
+            j = j + 1;
+        }
+        if (end < syms.data[i].line) { end = syms.data[i].line; }
+        syms.data[i].end = end;
+        i = i + 1;
+    }
+    jw.key(w, "symbols");
+    jw.arr(w);
+    i = 0;
+    for (i < syms.len) {
+        jw.obj(w);
+        jw.f_i64(w, "line", syms.data[i].line);
+        jw.f_i64(w, "end", syms.data[i].end);
+        jw.f_str(w, "kind", syms.data[i].kind);
+        jw.f_strn(w, "name", syms.data[i].name, syms.data[i].name_n);
+        jw.f_i64(w, "indent", syms.data[i].indent);
+        jw.obj_end(w);
+        i = i + 1;
+    }
+    jw.arr_end(w);
+}
+
+use std.system.capability;
+
+$if (capability.HOSTED) {
+    use page: std.allocator.page;
+
+    test glob__star_doublestar_and_basename {
+        if (!glob_match("*.py", 4, "x.py", 4)) { ret 1; }
+        if (glob_match("*.py", 4, "x.pyy", 5)) { ret 2; }
+        if (!glob_match("**/*.py", 7, "a/b/c.py", 8)) { ret 3; }
+        if (glob_match("*.py", 4, "a/b/c.py", 8)) { ret 4; }
+        if (!glob_match("src/**", 6, "src/a/b.py", 10)) { ret 5; }
+        if (!glob_match("?.py", 4, "x.py", 4)) { ret 6; }
+        if (glob_match("?.py", 4, "xy.py", 5)) { ret 7; }
+        if (!glob_match("*", 1, "c.py", 4)) { ret 8; }
+        ret 0;
+    }
+}

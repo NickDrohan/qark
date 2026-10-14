@@ -1,0 +1,43 @@
+# filetype from a buffer name
+
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+
+# the filetype string for a path; the result is a static literal
+pub fun from_name(name: str) str {
+    if (name == nil) { ret "text"; }
+    val n: usize = str_len(name);
+    if (n >= 5 && name[n - 5] == '.' && name[n - 4] == 'm' && name[n - 3] == 'a' && name[n - 2] == 'c' && name[n - 1] == 'h') {
+        ret "mach";
+    }
+    if (n >= 3 && name[n - 3] == '.' && name[n - 2] == 'p' && name[n - 1] == 'y') { ret "python"; }
+    if (n >= 3 && name[n - 3] == '.' && name[n - 2] == 'j' && name[n - 1] == 's') { ret "javascript"; }
+    if (n >= 3 && name[n - 3] == '.' && name[n - 2] == 'q' && name[n - 1] == 'k') { ret "qark"; }
+    if (n >= 4 && name[n - 4] == '.' && name[n - 3] == 'p' && name[n - 2] == 's' && name[n - 1] == '1') { ret "powershell"; }
+    if (n >= 3 && name[n - 3] == '.' && name[n - 2] == 's' && name[n - 1] == 'h') { ret "sh"; }
+    if (n >= 5 && name[n - 5] == '.' && name[n - 4] == 'j' && name[n - 3] == 's' && name[n - 2] == 'o' && name[n - 1] == 'n') {
+        ret "json";
+    }
+    if (n >= 3 && name[n - 3] == '.' && name[n - 2] == 'm' && name[n - 1] == 'd') { ret "markdown"; }
+    ret "text";
+}
+
+# spaces per indent level for a filetype
+pub fun shift_of(ft: str) i64 {
+    if (ft == nil) { ret 4; }
+    ret 4;
+}
+
+# comment leader for a filetype, or nil
+pub fun comment_of(ft: str) str {
+    if (ft == nil) { ret "#"; }
+    val n: usize = str_len(ft);
+    if (n == 10) { ret "//"; }
+    if (n == 2 && ft[0] == 's') { ret "#"; }
+    if (n == 10 && ft[0] == 'p') { ret "#"; }
+    if (n == 6 && ft[0] == 'p') { ret "#"; }
+    if (n == 4 && ft[0] == 'm' && ft[1] == 'a') { ret "#"; }
+    if (n == 4 && ft[0] == 'q') { ret ";"; }
+    ret "#";
+}

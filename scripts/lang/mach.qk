@@ -1,0 +1,6 @@
+;; mach profile
+
+(def lang-mach "mach")
+(def mach-comment "#")
+(def mach-indent 4)
+(def mach-function "pub fun NAME(PARAMS) i64 {\n    ret 0;\n}\n")

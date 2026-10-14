@@ -1,0 +1,401 @@
+# buffer table: named texts, cursors, undo, and marks
+
+use std.collections.vector;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+
+use A: std.allocator;
+use text: qark.core.text;
+use hist: qark.core.undo;
+use util: qark.util;
+
+# a named cursor bookmark
+pub rec Mark {
+    row: i64;
+    col: i64;
+    set: bool;
+}
+
+# one open buffer
+pub rec Buffer {
+    id:         i64;
+    name:       str;
+    ft:         str;
+    text:       text.Text;
+    row:        i64;
+    col:        i64;
+    modified:   bool;
+    undo:       vector.Vector[hist.Rec];
+    redo:       vector.Vector[hist.Rec];
+    marks:      [26]Mark;
+    anchor_row: i64;
+    anchor_col: i64;
+}
+
+# every buffer the session has open
+pub rec Buffers {
+    a:       *A.Allocator;
+    items:   vector.Vector[Buffer];
+    current: i64;
+    next_id: i64;
+}
+
+# an empty table
+pub fun init(a: *A.Allocator) Buffers {
+    var b: Buffers;
+    b.a = a;
+    b.items = vector.init[Buffer](a);
+    b.current = 0;
+    b.next_id = 1;
+    ret b;
+}
+
+fun release_buf(a: *A.Allocator, buf: *Buffer) {
+    text.dnit(?buf.text);
+    hist.dnit_stack(a, ?buf.undo);
+    hist.dnit_stack(a, ?buf.redo);
+    util.free(a, buf.name);
+    util.free(a, buf.ft);
+    buf.name = nil;
+    buf.ft = nil;
+}
+
+# release every buffer
+pub fun dnit(b: *Buffers) {
+    var i: usize = 0;
+    for (i < b.items.len) {
+        val g: opt[*Buffer] = vector.get[Buffer](?b.items, i);
+        if (sel g.some) { release_buf(b.a, g.some); }
+        i = i + 1;
+    }
+    vector.dnit[Buffer](?b.items);
+}
+
+# create a buffer and make it current; name and filetype are copied
+# ---
+# name: buffer name, nil becomes ""
+# ft:   filetype, nil becomes ""
+# ret:  the new id, or the allocator's refusal
+pub fun create(b: *Buffers, name: str, ft: str) res[i64, A.Error] {
+    val tx: res[text.Text, A.Error] = text.init(b.a);
+    if (sel tx.err) { ret res[i64, A.Error].err{tx.err}; }
+    val nm: res[str, A.Error] = util.dup(b.a, name);
+    if (sel nm.err) {
+        var tmp: text.Text = tx.ok;
+        text.dnit(?tmp);
+        ret res[i64, A.Error].err{nm.err};
+    }
+    val ft2: res[str, A.Error] = util.dup(b.a, ft);
+    if (sel ft2.err) {
+        util.free(b.a, nm.ok);
+        var tmp: text.Text = tx.ok;
+        text.dnit(?tmp);
+        ret res[i64, A.Error].err{ft2.err};
+    }
+    var buf: Buffer;
+    buf.id = b.next_id;
+    buf.name = nm.ok;
+    buf.ft = ft2.ok;
+    buf.text = tx.ok;
+    buf.row = 0;
+    buf.col = 0;
+    buf.modified = false;
+    buf.undo = vector.init[hist.Rec](b.a);
+    buf.redo = vector.init[hist.Rec](b.a);
+    buf.anchor_row = 0;
+    buf.anchor_col = 0;
+    val pushed: res[usize, A.Error] = vector.push[Buffer](?b.items, buf);
+    if (sel pushed.err) {
+        var doomed: Buffer = buf;
+        release_buf(b.a, ?doomed);
+        ret res[i64, A.Error].err{pushed.err};
+    }
+    b.next_id = b.next_id + 1;
+    b.current = buf.id;
+    ret res[i64, A.Error].ok{buf.id};
+}
+
+# the buffer with this id
+pub fun get(b: *Buffers, id: i64) opt[*Buffer] {
+    var i: usize = 0;
+    for (i < b.items.len) {
+        val g: opt[*Buffer] = vector.get[Buffer](?b.items, i);
+        if (sel g.some) {
+            if (g.some.id == id) { ret g; }
+        }
+        i = i + 1;
+    }
+    ret opt[*Buffer].none{};
+}
+
+# the current buffer
+pub fun current(b: *Buffers) opt[*Buffer] {
+    ret get(b, b.current);
+}
+
+# make id current
+pub fun select(b: *Buffers, id: i64) bool {
+    val g: opt[*Buffer] = get(b, id);
+    if (!sel g.some) { ret false; }
+    b.current = id;
+    ret true;
+}
+
+fun clear_stack(a: *A.Allocator, s: *vector.Vector[hist.Rec]) err[A.Error] {
+    hist.dnit_stack(a, s);
+    @s = vector.init[hist.Rec](a);
+    ret err[A.Error].ok{};
+}
+
+# replace lines, recording an inverse edit when record is set
+# ---
+# end: negative means the end of the buffer
+# ret: ok, or a refusal; a refused edit leaves the buffer unchanged
+pub fun splice(b: *Buffers, id: i64, start: i64, end: i64, srcs: **u8, lens: *usize, count: i64, record: bool) err[A.Error] {
+    val g: opt[*Buffer] = get(b, id);
+    if (!sel g.some) { ret err[A.Error].err{A.Error.invalid{}}; }
+    val buf: *Buffer = g.some;
+    var hi: i64 = end;
+    if (hi < 0) { hi = text.line_count(?buf.text); }
+    var old: hist.Blob;
+    if (record) {
+        val cap: res[hist.Blob, A.Error] = hist.capture(?buf.text, start, hi);
+        if (sel cap.err) { ret err[A.Error].err{cap.err}; }
+        old = cap.ok;
+    }
+    val sp: err[A.Error] = text.splice(?buf.text, start, hi, srcs, lens, count);
+    if (sel sp.err) {
+        if (record) { hist.free_blob(b.a, ?old); }
+        ret sp;
+    }
+    if (record) {
+        var rec: hist.Rec;
+        rec.start = start;
+        rec.old = old;
+        rec.new_nlines = count;
+        val pushed: res[usize, A.Error] = vector.push[hist.Rec](?buf.undo, rec);
+        if (sel pushed.err) { ret err[A.Error].err{pushed.err}; }
+        clear_stack(b.a, ?buf.redo);
+    }
+    buf.modified = true;
+    val n: i64 = text.line_count(?buf.text);
+    if (buf.row >= n) { buf.row = n - 1; }
+    if (buf.row < 0) { buf.row = 0; }
+    clamp_col(buf);
+    ret err[A.Error].ok{};
+}
+
+# keep the cursor column inside the current line
+pub fun clamp_col(buf: *Buffer) {
+    val g: opt[*text.Line] = text.line_at(?buf.text, buf.row);
+    var n: i64 = 0;
+    if (sel g.some) { n = g.some.len::i64; }
+    if (buf.col > n) { buf.col = n; }
+    if (buf.col < 0) { buf.col = 0; }
+}
+
+# undo the latest edit on the current buffer
+pub fun undo(b: *Buffers) err[A.Error] {
+    val g: opt[*Buffer] = current(b);
+    if (!sel g.some) { ret err[A.Error].err{A.Error.invalid{}}; }
+    val buf: *Buffer = g.some;
+    if (buf.undo.len == 0) { ret err[A.Error].ok{}; }
+    val popped: opt[hist.Rec] = vector.pop[hist.Rec](?buf.undo);
+    if (!sel popped.some) { ret err[A.Error].ok{}; }
+    var rec: hist.Rec = popped.some;
+    # remember the lines we are about to overwrite so redo can restore them
+    val hi: i64 = rec.start + rec.new_nlines;
+    val now: res[hist.Blob, A.Error] = hist.capture(?buf.text, rec.start, hi);
+    if (sel now.err) {
+        vector.push[hist.Rec](?buf.undo, rec);
+        ret err[A.Error].err{now.err};
+    }
+    var srcs: **u8 = nil;
+    var lens: *usize = nil;
+    val sp: err[A.Error] = hist.split(b.a, ?rec.old, ?srcs, ?lens);
+    if (sel sp.err) {
+        hist.free_blob(b.a, ?now.ok);
+        vector.push[hist.Rec](?buf.undo, rec);
+        ret sp;
+    }
+    val edited: err[A.Error] = splice(b, buf.id, rec.start, hi, srcs, lens, rec.old.nlines, false);
+    hist.free_split(b.a, srcs, lens, rec.old.nlines);
+    if (sel edited.err) {
+        hist.free_blob(b.a, ?now.ok);
+        vector.push[hist.Rec](?buf.undo, rec);
+        ret edited;
+    }
+    var redo_rec: hist.Rec;
+    redo_rec.start = rec.start;
+    redo_rec.old = now.ok;
+    redo_rec.new_nlines = rec.old.nlines;
+    val pushed: res[usize, A.Error] = vector.push[hist.Rec](?buf.redo, redo_rec);
+    hist.free_blob(b.a, ?rec.old);
+    if (sel pushed.err) { ret err[A.Error].err{pushed.err}; }
+    buf.row = rec.start;
+    if (buf.row >= text.line_count(?buf.text)) { buf.row = text.line_count(?buf.text) - 1; }
+    buf.col = 0;
+    ret err[A.Error].ok{};
+}
+
+# redo the latest undone edit
+pub fun redo(b: *Buffers) err[A.Error] {
+    val g: opt[*Buffer] = current(b);
+    if (!sel g.some) { ret err[A.Error].err{A.Error.invalid{}}; }
+    val buf: *Buffer = g.some;
+    if (buf.redo.len == 0) { ret err[A.Error].ok{}; }
+    val popped: opt[hist.Rec] = vector.pop[hist.Rec](?buf.redo);
+    if (!sel popped.some) { ret err[A.Error].ok{}; }
+    var rec: hist.Rec = popped.some;
+    val hi: i64 = rec.start + rec.new_nlines;
+    val now: res[hist.Blob, A.Error] = hist.capture(?buf.text, rec.start, hi);
+    if (sel now.err) {
+        vector.push[hist.Rec](?buf.redo, rec);
+        ret err[A.Error].err{now.err};
+    }
+    var srcs: **u8 = nil;
+    var lens: *usize = nil;
+    val sp: err[A.Error] = hist.split(b.a, ?rec.old, ?srcs, ?lens);
+    if (sel sp.err) {
+        hist.free_blob(b.a, ?now.ok);
+        vector.push[hist.Rec](?buf.redo, rec);
+        ret sp;
+    }
+    val edited: err[A.Error] = splice(b, buf.id, rec.start, hi, srcs, lens, rec.old.nlines, false);
+    hist.free_split(b.a, srcs, lens, rec.old.nlines);
+    if (sel edited.err) {
+        hist.free_blob(b.a, ?now.ok);
+        vector.push[hist.Rec](?buf.redo, rec);
+        ret edited;
+    }
+    var undo_rec: hist.Rec;
+    undo_rec.start = rec.start;
+    undo_rec.old = now.ok;
+    undo_rec.new_nlines = rec.old.nlines;
+    val pushed: res[usize, A.Error] = vector.push[hist.Rec](?buf.undo, undo_rec);
+    hist.free_blob(b.a, ?rec.old);
+    if (sel pushed.err) { ret err[A.Error].err{pushed.err}; }
+    buf.row = rec.start;
+    buf.col = 0;
+    ret err[A.Error].ok{};
+}
+
+# load bytes into a buffer, as one undoable replacement of every line
+pub fun load(b: *Buffers, id: i64, src: *u8, n: usize) err[A.Error] {
+    val g: opt[*Buffer] = get(b, id);
+    if (!sel g.some) { ret err[A.Error].err{A.Error.invalid{}}; }
+    # parse into a side text, then splice those lines in as one edit
+    val side: res[text.Text, A.Error] = text.init(b.a);
+    if (sel side.err) { ret err[A.Error].err{side.err}; }
+    var tmp: text.Text = side.ok;
+    val loaded: err[A.Error] = text.load(?tmp, src, n);
+    if (sel loaded.err) {
+        text.dnit(?tmp);
+        ret loaded;
+    }
+    val count: i64 = text.line_count(?tmp);
+    val ps: res[**u8, A.Error] = A.allocate[*u8](b.a, count::usize);
+    if (sel ps.err) {
+        text.dnit(?tmp);
+        ret err[A.Error].err{ps.err};
+    }
+    val ls: res[*usize, A.Error] = A.allocate[usize](b.a, count::usize);
+    if (sel ls.err) {
+        A.deallocate[*u8](b.a, ps.ok, count::usize);
+        text.dnit(?tmp);
+        ret err[A.Error].err{ls.err};
+    }
+    var i: i64 = 0;
+    for (i < count) {
+        val ln: opt[*text.Line] = text.line_at(?tmp, i);
+        if (sel ln.some) {
+            ps.ok[i::usize] = ln.some.data;
+            ls.ok[i::usize] = ln.some.len;
+        }
+        or {
+            ps.ok[i::usize] = nil;
+            ls.ok[i::usize] = 0;
+        }
+        i = i + 1;
+    }
+    val sp: err[A.Error] = splice(b, id, 0, -1, ps.ok, ls.ok, count, true);
+    A.deallocate[*u8](b.a, ps.ok, count::usize);
+    A.deallocate[usize](b.a, ls.ok, count::usize);
+    text.dnit(?tmp);
+    if (sel sp.err) { ret sp; }
+    g.some.row = 0;
+    g.some.col = 0;
+    g.some.modified = false;
+    ret err[A.Error].ok{};
+}
+
+# set the filetype string
+pub fun set_ft(b: *Buffers, id: i64, ft: str) err[A.Error] {
+    val g: opt[*Buffer] = get(b, id);
+    if (!sel g.some) { ret err[A.Error].err{A.Error.invalid{}}; }
+    val copied: res[str, A.Error] = util.dup(b.a, ft);
+    if (sel copied.err) { ret err[A.Error].err{copied.err}; }
+    util.free(b.a, g.some.ft);
+    g.some.ft = copied.ok;
+    ret err[A.Error].ok{};
+}
+
+# set the name string
+pub fun set_name(b: *Buffers, id: i64, name: str) err[A.Error] {
+    val g: opt[*Buffer] = get(b, id);
+    if (!sel g.some) { ret err[A.Error].err{A.Error.invalid{}}; }
+    val copied: res[str, A.Error] = util.dup(b.a, name);
+    if (sel copied.err) { ret err[A.Error].err{copied.err}; }
+    util.free(b.a, g.some.name);
+    g.some.name = copied.ok;
+    ret err[A.Error].ok{};
+}
+
+# how many buffers are open
+pub fun count(b: *Buffers) i64 {
+    ret b.items.len::i64;
+}
+
+use std.system.capability;
+
+$if (capability.HOSTED) {
+    use page: std.allocator.page;
+    use std.types.string.str_equals;
+
+    test splice__undo_restores_the_previous_lines {
+        var a: A.Allocator;
+        val made: err[A.Error] = page.make(?a);
+        if (sel made.err) { ret 1; }
+        var bs: Buffers = init(?a);
+        val id: res[i64, A.Error] = create(?bs, "t", "txt");
+        if (sel id.err) { ret 2; }
+        val loaded: err[A.Error] = load(?bs, id.ok, "alpha\nbeta\n", 11);
+        if (sel loaded.err) { ret 3; }
+        var srcs: [1]*u8;
+        var lens: [1]usize;
+        srcs[0] = "BETA";
+        lens[0] = 4;
+        val sp: err[A.Error] = splice(?bs, id.ok, 1, 2, ?srcs[0], ?lens[0], 1, true);
+        if (sel sp.err) { ret 4; }
+        val undone: err[A.Error] = undo(?bs);
+        if (sel undone.err) { ret 5; }
+        val buf: opt[*Buffer] = get(?bs, id.ok);
+        if (!sel buf.some) { ret 6; }
+        val line: opt[*text.Line] = text.line_at(?buf.some.text, 1);
+        if (!sel line.some) { ret 7; }
+        if (!str_equals(line.some.data, "beta")) { ret 8; }
+        val redone: err[A.Error] = redo(?bs);
+        if (sel redone.err) { ret 9; }
+        val line2: opt[*text.Line] = text.line_at(?buf.some.text, 1);
+        if (!sel line2.some) { ret 10; }
+        if (!str_equals(line2.some.data, "BETA")) { ret 11; }
+        dnit(?bs);
+        ret 0;
+    }
+}

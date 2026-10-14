@@ -1,0 +1,5 @@
+﻿motions: h j k l w b e W B E 0 ^ $ g g G f t F T ; , % { }
+operators: d c y > < = g~ gu gU x r ~ J p P . u
+objects: iw aw i" a" i( a( i{ a{ ip ap it at
+insert: i a I A o O   visual: v V   command: :
+macros: q {reg} ... q    @{reg}

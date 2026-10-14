@@ -1,0 +1,16 @@
+apply            files, vars, templates, job, dest, run, prune, dry_run, preview, diff, check, tag -> receipt
+read             path | paths, content, lines, outline, max_bytes -> files with sha256 and symbols
+search           pattern?, regex, icase, glob, path, context, max, max_files, all -> matches per file with sha256;
+                 no pattern lists the matching paths
+template.list    name? -> templates with vars, or one template's text
+template.define  name, text | lines, lang, description, persist
+template.render  template | tmpl, vars -> text
+job.verify       dir -> every manifest file checked against its sha256
+session.info     -> version, root, limits, checkers
+file edits       find, find_re (\0-\9 captures), lines, insert_before|after (line or anchor), append,
+                 prepend, ex, keys; within scopes them, occurrence picks one, all/count widen
+file move        {path: dst, move: src} -> atomic rename; expect pins the source's sha256
+buf.create buf.set_lines keys.feed cmd.ex eval validate.ident job.write
+receipt          per file: status, sha256, notes[] (normalized eol, ignored keys); top: warnings[]
+                 unchanged carries reason no_change|same_content; not-found names line and column
+codes            conflict check_failed locked spec_* tmpl_* edit_* path_* too_large io_commit

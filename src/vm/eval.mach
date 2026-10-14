@@ -1,0 +1,522 @@
+# evaluator: special forms, macros, and tail calls in a loop
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_equals;
+
+use A: std.allocator;
+use bi: qark.vm.builtins;
+use h: qark.vm.heap;
+use rd: qark.vm.reader;
+use v: qark.vm.value;
+
+fun lookup(vm: *v.Vm, env: u32, sym: u32) res[u32, v.VmError] {
+    var e: u32 = env;
+    var guard: i64 = 0;
+    for (e != v.NIL && guard < 100000) {
+        guard = guard + 1;
+        val cell: *v.Cell = h.cell(vm, e);
+        if (cell.kind != v.K_PAIR) { ret res[u32, v.VmError].err{v.VmError.unbound{}}; }
+        val slot: *v.Cell = h.cell(vm, cell.a);
+        if (slot.kind == v.K_PAIR && slot.a == sym) { ret res[u32, v.VmError].ok{slot.b}; }
+        e = cell.b;
+    }
+    ret res[u32, v.VmError].err{v.VmError.unbound{}};
+}
+
+fun define(vm: *v.Vm, sym: u32, val: u32) res[u32, v.VmError] {
+    val pair: res[u32, A.Error] = h.cons(vm, sym, val);
+    if (sel pair.err) { ret res[u32, v.VmError].err{v.VmError.oom{}}; }
+    val link: res[u32, A.Error] = h.cons(vm, pair.ok, vm.global);
+    if (sel link.err) { ret res[u32, v.VmError].err{v.VmError.oom{}}; }
+    vm.global = link.ok;
+    ret res[u32, v.VmError].ok{val};
+}
+
+fun bind_args(vm: *v.Vm, env: u32, params: u32, args: u32) res[u32, v.VmError] {
+    var nv: u32 = env;
+    var p: u32 = params;
+    var a: u32 = args;
+    var guard: i64 = 0;
+    for (guard < 10000) {
+        guard = guard + 1;
+        if (p == v.NIL) { ret res[u32, v.VmError].ok{nv}; }
+        val pc: *v.Cell = h.cell(vm, p);
+        if (pc.kind == v.K_SYM) {
+            val pair: res[u32, A.Error] = h.cons(vm, p, a);
+            if (sel pair.err) { ret res[u32, v.VmError].err{v.VmError.oom{}}; }
+            val link: res[u32, A.Error] = h.cons(vm, pair.ok, nv);
+            if (sel link.err) { ret res[u32, v.VmError].err{v.VmError.oom{}}; }
+            ret res[u32, v.VmError].ok{link.ok};
+        }
+        if (pc.kind != v.K_PAIR) { ret res[u32, v.VmError].err{v.VmError.args{}}; }
+        if (a == v.NIL) { ret res[u32, v.VmError].err{v.VmError.args{}}; }
+        val ac: *v.Cell = h.cell(vm, a);
+        val pair: res[u32, A.Error] = h.cons(vm, pc.a, ac.a);
+        if (sel pair.err) { ret res[u32, v.VmError].err{v.VmError.oom{}}; }
+        val link: res[u32, A.Error] = h.cons(vm, pair.ok, nv);
+        if (sel link.err) { ret res[u32, v.VmError].err{v.VmError.oom{}}; }
+        nv = link.ok;
+        p = pc.b;
+        a = ac.b;
+    }
+    ret res[u32, v.VmError].err{v.VmError.depth{}};
+}
+
+fun is_named(vm: *v.Vm, idx: u32, name: str) bool {
+    if (h.cell(vm, idx).kind != v.K_SYM) { ret false; }
+    ret str_equals(h.sym_name(vm, idx), name);
+}
+
+fun cadr(vm: *v.Vm, list: u32) u32 {
+    val c: *v.Cell = h.cell(vm, list);
+    if (c.kind != v.K_PAIR) { ret v.NIL; }
+    val d: *v.Cell = h.cell(vm, c.b);
+    if (d.kind != v.K_PAIR) { ret v.NIL; }
+    ret d.a;
+}
+
+fun caddr(vm: *v.Vm, list: u32) u32 {
+    val c: *v.Cell = h.cell(vm, list);
+    if (c.kind != v.K_PAIR) { ret v.NIL; }
+    ret cadr(vm, c.b);
+}
+
+fun cadddr(vm: *v.Vm, list: u32) u32 {
+    val c: *v.Cell = h.cell(vm, list);
+    if (c.kind != v.K_PAIR) { ret v.NIL; }
+    ret caddr(vm, c.b);
+}
+
+var eval_fn: fun(*v.Vm, u32, u32) res[u32, v.VmError] = nil;
+
+fun qq(vm: *v.Vm, expr: u32, env: u32) res[u32, v.VmError] {
+    if (h.cell(vm, expr).kind != v.K_PAIR) { ret res[u32, v.VmError].ok{expr}; }
+    val head: u32 = h.cell(vm, expr).a;
+    if (is_named(vm, head, "unquote")) {
+        ret eval_fn(vm, cadr(vm, expr), env);
+    }
+    var built: u32 = v.NIL;
+    var items: [64]u32;
+    var n: i64 = 0;
+    var rest: u32 = expr;
+    var guard: i64 = 0;
+    for (rest != v.NIL && guard < 64) {
+        guard = guard + 1;
+        val kind: u8 = h.cell(vm, rest).kind;
+        if (kind != v.K_PAIR) { brk; }
+        val el: u32 = h.cell(vm, rest).a;
+        val next: u32 = h.cell(vm, rest).b;
+        val el_kind: u8 = h.cell(vm, el).kind;
+        val el_head: u32 = h.cell(vm, el).a;
+        if (el_kind == v.K_PAIR && is_named(vm, el_head, "unquote-splicing")) {
+            val inner: u32 = cadr(vm, el);
+            val piece: res[u32, v.VmError] = eval_fn(vm, inner, env);
+            if (sel piece.err) { ret piece; }
+            var p: u32 = piece.ok;
+            var g2: i64 = 0;
+            for (p != v.NIL && g2 < 64 && n < 64) {
+                g2 = g2 + 1;
+                if (h.cell(vm, p).kind != v.K_PAIR) { brk; }
+                val item: u32 = h.cell(vm, p).a;
+                val pn: u32 = h.cell(vm, p).b;
+                items[n::usize] = item;
+                n = n + 1;
+                p = pn;
+            }
+        }
+        or {
+            val one: res[u32, v.VmError] = qq(vm, el, env);
+            if (sel one.err) { ret one; }
+            if (n < 64) {
+                items[n::usize] = one.ok;
+                n = n + 1;
+            }
+        }
+        rest = next;
+    }
+    var i: i64 = n - 1;
+    for (i >= 0) {
+        val made: res[u32, A.Error] = h.cons(vm, items[i::usize], built);
+        if (sel made.err) { ret res[u32, v.VmError].err{v.VmError.oom{}}; }
+        built = made.ok;
+        i = i - 1;
+    }
+    ret res[u32, v.VmError].ok{built};
+}
+
+fun eval_list(vm: *v.Vm, list: u32, env: u32, out: *u32, n: *i64) res[u32, v.VmError] {
+    var e: u32 = list;
+    var i: i64 = 0;
+    var guard: i64 = 0;
+    for (e != v.NIL && guard < 32) {
+        guard = guard + 1;
+        val c: *v.Cell = h.cell(vm, e);
+        if (c.kind != v.K_PAIR) { ret res[u32, v.VmError].err{v.VmError.args{}}; }
+        val one: res[u32, v.VmError] = eval_fn(vm, c.a, env);
+        if (sel one.err) { ret one; }
+        out[i::usize] = one.ok;
+        i = i + 1;
+        e = c.b;
+    }
+    @n = i;
+    ret res[u32, v.VmError].ok{v.NIL};
+}
+
+fun begin_last(vm: *v.Vm, list: u32) u32 {
+    var e: u32 = list;
+    var last: u32 = v.NIL;
+    var guard: i64 = 0;
+    for (e != v.NIL && guard < 10000) {
+        guard = guard + 1;
+        val c: *v.Cell = h.cell(vm, e);
+        if (c.kind != v.K_PAIR) { ret last; }
+        if (c.b == v.NIL) { ret c.a; }
+        val mid: res[u32, v.VmError] = eval_fn(vm, c.a, vm.global);
+        if (sel mid.err) { ret v.NIL; }
+        e = c.b;
+    }
+    ret last;
+}
+
+# evaluate expr in env; tail positions of if, begin, and calls reuse this frame's loop
+pub fun eval(vm: *v.Vm, expr_in: u32, env_in: u32) res[u32, v.VmError] {
+    eval_fn = eval;
+    var expr: u32 = expr_in;
+    var env: u32 = env_in;
+    var spins: i64 = 0;
+    for (spins < 100000) {
+        spins = spins + 1;
+        vm.depth = vm.depth + 1;
+        if (vm.depth > 2000) { ret res[u32, v.VmError].err{v.VmError.depth{}}; }
+        val kind: u8 = h.cell(vm, expr).kind;
+        if (kind != v.K_PAIR) {
+            if (kind == v.K_SYM) {
+                val found: res[u32, v.VmError] = lookup(vm, env, expr);
+                vm.depth = vm.depth - 1;
+                ret found;
+            }
+            vm.depth = vm.depth - 1;
+            ret res[u32, v.VmError].ok{expr};
+        }
+        val head: u32 = h.cell(vm, expr).a;
+        val rest: u32 = h.cell(vm, expr).b;
+        if (is_named(vm, head, "quote")) {
+            vm.depth = vm.depth - 1;
+            ret res[u32, v.VmError].ok{cadr(vm, expr)};
+        }
+        if (is_named(vm, head, "quasiquote")) {
+            val q: res[u32, v.VmError] = qq(vm, cadr(vm, expr), env);
+            vm.depth = vm.depth - 1;
+            ret q;
+        }
+        if (is_named(vm, head, "if")) {
+            val cond: res[u32, v.VmError] = eval(vm, cadr(vm, expr), env);
+            if (sel cond.err) {
+                vm.depth = vm.depth - 1;
+                ret cond;
+            }
+            if (h.truth(vm, cond.ok)) { expr = caddr(vm, expr); }
+            or { expr = cadddr(vm, expr); }
+            vm.depth = vm.depth - 1;
+        }
+        or (is_named(vm, head, "begin")) {
+            var e: u32 = rest;
+            var guard: i64 = 0;
+            for (e != v.NIL && guard < 10000) {
+                guard = guard + 1;
+                val c: *v.Cell = h.cell(vm, e);
+                if (c.kind != v.K_PAIR) { brk; }
+                if (c.b == v.NIL) {
+                    expr = c.a;
+                    brk;
+                }
+                val mid: res[u32, v.VmError] = eval(vm, c.a, env);
+                if (sel mid.err) {
+                    vm.depth = vm.depth - 1;
+                    ret mid;
+                }
+                e = c.b;
+            }
+            vm.depth = vm.depth - 1;
+        }
+        or (is_named(vm, head, "let")) {
+            var binds: u32 = cadr(vm, expr);
+            var nv: u32 = env;
+            var guard: i64 = 0;
+            var bad: bool = false;
+            var errc: v.VmError = v.VmError.oom{};
+            for (binds != v.NIL && guard < 1000 && !bad) {
+                guard = guard + 1;
+                val row: u32 = h.cell(vm, binds).a;
+                val name: u32 = h.cell(vm, row).a;
+                val init: res[u32, v.VmError] = eval(vm, cadr(vm, row), nv);
+                if (sel init.err) {
+                    bad = true;
+                    errc = init.err;
+                }
+                if (sel init.ok) {
+                    val pair: res[u32, A.Error] = h.cons(vm, name, init.ok);
+                    if (sel pair.ok) {
+                        val link: res[u32, A.Error] = h.cons(vm, pair.ok, nv);
+                        if (sel link.ok) { nv = link.ok; }
+                        or { bad = true; }
+                    }
+                    or { bad = true; }
+                }
+                binds = h.cell(vm, binds).b;
+            }
+            if (bad) {
+                vm.depth = vm.depth - 1;
+                ret res[u32, v.VmError].err{errc};
+            }
+            env = nv;
+            expr = caddr(vm, expr);
+            # further body forms: if the let has several, wrap is not done; eval the
+            # first body as tail and ignore the rest unless it is a begin the user wrote.
+            vm.depth = vm.depth - 1;
+        }
+        or (is_named(vm, head, "lambda")) {
+            val clos: res[u32, A.Error] = h.alloc(vm, v.K_CLOSURE);
+            if (sel clos.err) {
+                vm.depth = vm.depth - 1;
+                ret res[u32, v.VmError].err{v.VmError.oom{}};
+            }
+            val c: *v.Cell = h.cell(vm, clos.ok);
+            c.a = cadr(vm, expr);
+            c.b = h.cell(vm, rest).b;
+            c.c = env;
+            vm.depth = vm.depth - 1;
+            ret res[u32, v.VmError].ok{clos.ok};
+        }
+        or (is_named(vm, head, "def") || is_named(vm, head, "define")) {
+            val name: u32 = cadr(vm, expr);
+            val value: res[u32, v.VmError] = eval(vm, caddr(vm, expr), env);
+            if (sel value.err) {
+                vm.depth = vm.depth - 1;
+                ret value;
+            }
+            val bound: res[u32, v.VmError] = define(vm, name, value.ok);
+            vm.depth = vm.depth - 1;
+            ret bound;
+        }
+        or (is_named(vm, head, "defmacro")) {
+            val mac: res[u32, A.Error] = h.alloc(vm, v.K_MACRO);
+            if (sel mac.err) {
+                vm.depth = vm.depth - 1;
+                ret res[u32, v.VmError].err{v.VmError.oom{}};
+            }
+            val c: *v.Cell = h.cell(vm, mac.ok);
+            c.a = caddr(vm, expr);
+            # (defmacro name params body...) params is cadr of the rest? 
+            # form is (defmacro name params body...)
+            # cadr is name, caddr is params, body is cdddr
+            c.a = caddr(vm, expr);
+            c.b = h.cell(vm, h.cell(vm, rest).b).b;
+            c.c = env;
+            val bound: res[u32, v.VmError] = define(vm, cadr(vm, expr), mac.ok);
+            vm.depth = vm.depth - 1;
+            ret bound;
+        }
+        or {
+            val fn: res[u32, v.VmError] = eval(vm, head, env);
+            if (sel fn.err) {
+                vm.depth = vm.depth - 1;
+                ret fn;
+            }
+            val fk: u8 = h.cell(vm, fn.ok).kind;
+            if (fk == v.K_MACRO) {
+                val mac_a: u32 = h.cell(vm, fn.ok).a;
+                val mac_b: u32 = h.cell(vm, fn.ok).b;
+                val mac_c: u32 = h.cell(vm, fn.ok).c;
+                val nv: res[u32, v.VmError] = bind_args(vm, mac_c, mac_a, rest);
+                if (sel nv.err) {
+                    vm.depth = vm.depth - 1;
+                    ret nv;
+                }
+                env = nv.ok;
+                val body_kind: u8 = h.cell(vm, mac_b).kind;
+                val body_a: u32 = h.cell(vm, mac_b).a;
+                val body_b: u32 = h.cell(vm, mac_b).b;
+                if (body_kind == v.K_PAIR && body_b == v.NIL) {
+                    val expanded: res[u32, v.VmError] = eval_fn(vm, body_a, env);
+                    if (sel expanded.err) {
+                        vm.depth = vm.depth - 1;
+                        ret expanded;
+                    }
+                    expr = expanded.ok;
+                }
+                or {
+                    val begin_sym: res[u32, A.Error] = h.intern(vm, "begin");
+                    if (sel begin_sym.err) {
+                        vm.depth = vm.depth - 1;
+                        ret res[u32, v.VmError].err{v.VmError.oom{}};
+                    }
+                    val wrapped: res[u32, A.Error] = h.cons(vm, begin_sym.ok, mac_b);
+                    if (sel wrapped.err) {
+                        vm.depth = vm.depth - 1;
+                        ret res[u32, v.VmError].err{v.VmError.oom{}};
+                    }
+                    expr = wrapped.ok;
+                }
+                vm.depth = vm.depth - 1;
+            }
+            or (fk == v.K_BUILTIN) {
+                var args: [32]u32;
+                var argc: i64 = 0;
+                val ev: res[u32, v.VmError] = eval_list(vm, rest, env, ?args[0], ?argc);
+                if (sel ev.err) {
+                    vm.depth = vm.depth - 1;
+                    ret ev;
+                }
+                val called: res[u32, v.VmError] = bi.call(vm, h.cell(vm, fn.ok).n, ?args[0], argc);
+                vm.depth = vm.depth - 1;
+                ret called;
+            }
+            or (fk == v.K_CLOSURE) {
+                var args: [32]u32;
+                var argc: i64 = 0;
+                val ev: res[u32, v.VmError] = eval_list(vm, rest, env, ?args[0], ?argc);
+                if (sel ev.err) {
+                    vm.depth = vm.depth - 1;
+                    ret ev;
+                }
+                var arglist: u32 = v.NIL;
+                var i: i64 = argc - 1;
+                for (i >= 0) {
+                    val made: res[u32, A.Error] = h.cons(vm, args[i::usize], arglist);
+                    if (sel made.err) {
+                        vm.depth = vm.depth - 1;
+                        ret res[u32, v.VmError].err{v.VmError.oom{}};
+                    }
+                    arglist = made.ok;
+                    i = i - 1;
+                }
+                val clos: *v.Cell = h.cell(vm, fn.ok);
+                val nv: res[u32, v.VmError] = bind_args(vm, clos.c, clos.a, arglist);
+                if (sel nv.err) {
+                    vm.depth = vm.depth - 1;
+                    ret nv;
+                }
+                env = nv.ok;
+                # body is a list of forms; tail-call the begin of them
+                val begin_sym: res[u32, A.Error] = h.intern(vm, "begin");
+                if (sel begin_sym.err) {
+                    vm.depth = vm.depth - 1;
+                    ret res[u32, v.VmError].err{v.VmError.oom{}};
+                }
+                val wrapped: res[u32, A.Error] = h.cons(vm, begin_sym.ok, clos.b);
+                if (sel wrapped.err) {
+                    vm.depth = vm.depth - 1;
+                    ret res[u32, v.VmError].err{v.VmError.oom{}};
+                }
+                expr = wrapped.ok;
+                vm.depth = vm.depth - 1;
+            }
+            or {
+                vm.depth = vm.depth - 1;
+                ret res[u32, v.VmError].err{v.VmError.apply{}};
+            }
+        }
+    }
+    ret res[u32, v.VmError].err{v.VmError.depth{}};
+}
+
+# install the primitive environment
+pub fun boot(vm: *v.Vm) err[A.Error] {
+    val b0: err[A.Error] = bi.bind(vm, "+", 0);
+    if (sel b0.err) { ret b0; }
+    val b1: err[A.Error] = bi.bind(vm, "-", 1);
+    if (sel b1.err) { ret b1; }
+    val b2: err[A.Error] = bi.bind(vm, "*", 2);
+    if (sel b2.err) { ret b2; }
+    val b3: err[A.Error] = bi.bind(vm, "/", 3);
+    if (sel b3.err) { ret b3; }
+    val b4: err[A.Error] = bi.bind(vm, "cons", 4);
+    if (sel b4.err) { ret b4; }
+    val b5: err[A.Error] = bi.bind(vm, "car", 5);
+    if (sel b5.err) { ret b5; }
+    val b6: err[A.Error] = bi.bind(vm, "cdr", 6);
+    if (sel b6.err) { ret b6; }
+    val b7: err[A.Error] = bi.bind(vm, "null?", 7);
+    if (sel b7.err) { ret b7; }
+    val b8: err[A.Error] = bi.bind(vm, "not", 8);
+    if (sel b8.err) { ret b8; }
+    val b9: err[A.Error] = bi.bind(vm, "eq?", 9);
+    if (sel b9.err) { ret b9; }
+    val b10: err[A.Error] = bi.bind(vm, "<", 10);
+    if (sel b10.err) { ret b10; }
+    val b11: err[A.Error] = bi.bind(vm, "list", 11);
+    if (sel b11.err) { ret b11; }
+    val b12: err[A.Error] = bi.bind(vm, "str-len", 12);
+    if (sel b12.err) { ret b12; }
+    val b13: err[A.Error] = bi.bind(vm, "gc", 13);
+    if (sel b13.err) { ret b13; }
+    ret bi.bind(vm, "type-of", 14);
+}
+
+# read and evaluate one form, booting the machine if needed
+pub fun eval_src(vm: *v.Vm, src: str) res[u32, v.VmError] {
+    if (vm.global == v.NIL) {
+        val booted: err[A.Error] = boot(vm);
+        if (sel booted.err) { ret res[u32, v.VmError].err{v.VmError.oom{}}; }
+    }
+    val form: res[u32, v.VmError] = rd.read(vm, src);
+    if (sel form.err) { ret form; }
+    ret eval(vm, form.ok, vm.global);
+}
+
+# integer value of a cell, or none-as-error
+pub fun as_i64(vm: *v.Vm, idx: u32) res[i64, v.VmError] {
+    if (h.cell(vm, idx).kind != v.K_INT) { ret res[i64, v.VmError].err{v.VmError.type{}}; }
+    ret res[i64, v.VmError].ok{h.cell(vm, idx).n};
+}
+
+use std.system.capability;
+
+$if (capability.HOSTED) {
+    use page: std.allocator.page;
+
+    test eval__arith_let_macro_and_gc {
+        var a: A.Allocator;
+        val made: err[A.Error] = page.make(?a);
+        if (sel made.err) { ret 1; }
+        val vm0: res[v.Vm, A.Error] = h.init(?a);
+        if (sel vm0.err) { ret 2; }
+        var vm: v.Vm = vm0.ok;
+        val sum: res[u32, v.VmError] = eval_src(?vm, "(+ 1 2)");
+        if (sel sum.err) { ret 3; }
+        val n: res[i64, v.VmError] = as_i64(?vm, sum.ok);
+        if (sel n.err) { ret 4; }
+        if (n.ok != 3) { ret 4; }
+        val letv: res[u32, v.VmError] = eval_src(?vm, "(let ((a 2) (b 3)) (+ a b))");
+        if (sel letv.err) { ret 5; }
+        val ln: res[i64, v.VmError] = as_i64(?vm, letv.ok);
+        if (sel ln.err) { ret 6; }
+        if (ln.ok != 5) { ret 6; }
+        val defm: res[u32, v.VmError] = eval_src(?vm, "(defmacro when (c . body) `(if ,c (begin ,@body) nil))");
+        if (sel defm.err) { ret 7; }
+        val wh: res[u32, v.VmError] = eval_src(?vm, "(when #t 7)");
+        if (sel wh.err) { ret 8; }
+        val wn: res[i64, v.VmError] = as_i64(?vm, wh.ok);
+        if (sel wn.err) { ret 9; }
+        if (wn.ok != 7) { ret 9; }
+        var i: i64 = 0;
+        for (i < 1000) {
+            val junk: res[u32, A.Error] = h.cons(?vm, v.NIL, v.NIL);
+            if (sel junk.err) { ret 10; }
+            i = i + 1;
+        }
+        val before: i64 = h.live_count(?vm);
+        h.gc(?vm);
+        val after: i64 = h.live_count(?vm);
+        if (after >= before) { ret 11; }
+        h.dnit(?vm);
+        ret 0;
+    }
+}

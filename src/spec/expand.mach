@@ -1,0 +1,273 @@
+# the shorthand an agent emits instead of a script
+#
+#   @macro
+#   header|header
+#   cell|cell
+#   cell|cell
+#
+#   @other
+#   ...
+#
+# a blank line ends a table. cells are split on | and trimmed. the bytes of
+# each cell point back into the block, so the block must outlive the rows.
+
+use std.collections.vector;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+
+use A: std.allocator;
+use util: qark.util;
+
+pub val COLS: usize = 32;
+
+pub rec Err {
+    code: str;
+    msg:  str;
+    line: i64;
+}
+
+pub rec Cell {
+    p: *u8;
+    n: usize;
+}
+
+pub rec Row {
+    cells: *Cell;
+    ncol:  usize;
+    line:  i64;
+}
+
+pub rec Block {
+    name:  *u8;
+    namen: usize;
+    cols:  *Cell;
+    ncol:  usize;
+    rows:  *Row;
+    nrow:  usize;
+    line:  i64;
+}
+
+fun fail(e: *Err, code: str, msg: str, line: i64) bool {
+    e.code = code;
+    e.msg = msg;
+    e.line = line;
+    ret false;
+}
+
+fun eq_span(p: *u8, n: usize, s: str) bool {
+    if (n != str_len(s)) { ret false; }
+    var i: usize = 0;
+    for (i < n) {
+        if (p[i] != s[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun span_eq(a: *u8, an: usize, b: *u8, bn: usize) bool {
+    if (an != bn) { ret false; }
+    var i: usize = 0;
+    for (i < an) {
+        if (a[i] != b[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun is_space(c: u8) bool {
+    ret c == ' ' || c == '\t';
+}
+
+fun trim(p: *u8, n: usize, s: *usize, end: *usize) {
+    var a: usize = 0;
+    var b: usize = n;
+    for (a < b && is_space(p[a])) { a = a + 1; }
+    for (b > a && is_space(p[b - 1])) { b = b - 1; }
+    @s = a;
+    @end = b;
+}
+
+fun split_line(a: *A.Allocator, p: *u8, n: usize, out: **Cell, ncol: *usize, e: *Err, line: i64) bool {
+    var cells: [32]Cell;
+    var count: usize = 0;
+    var i: usize = 0;
+    var start: usize = 0;
+    for (i <= n) {
+        if (i == n || p[i] == '|') {
+            var s: usize = 0;
+            var end: usize = 0;
+            trim((p::usize + start)::*u8, i - start, ?s, ?end);
+            if (count >= COLS) { ret fail(e, "expand_row", "a row has more than 32 columns", line); }
+            cells[count].p = (p::usize + start + s)::*u8;
+            cells[count].n = end - s;
+            count = count + 1;
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    if (count == 0) { ret fail(e, "expand_syntax", "a table row is empty", line); }
+    val buf: res[*Cell, A.Error] = A.allocate[Cell](a, count);
+    if (sel buf.err) { ret fail(e, "oom", "out of memory", line); }
+    var k: usize = 0;
+    for (k < count) {
+        buf.ok[k] = cells[k];
+        k = k + 1;
+    }
+    @out = buf.ok;
+    @ncol = count;
+    ret true;
+}
+
+fun finish(a: *A.Allocator, blocks: *vector.Vector[Block], name: *u8, namen: usize, cols: *Cell, ncol: usize, rows: *vector.Vector[Row], line: i64, e: *Err) bool {
+    if (namen == 0) { ret fail(e, "expand_syntax", "a macro name is missing after @", line); }
+    if (ncol == 0) { ret fail(e, "expand_syntax", "a macro needs a header row of column names", line); }
+    if (rows.len == 0) { ret fail(e, "expand_empty", "a macro table has a header and no rows, so nothing would be written", line); }
+    var seen: [32]Cell;
+    var s: usize = 0;
+    for (s < ncol) {
+        if (cols[s].n == 0) { ret fail(e, "expand_syntax", "a column name is empty", line); }
+        var p: usize = 0;
+        for (p < s) {
+            if (span_eq(cols[s].p, cols[s].n, seen[p].p, seen[p].n)) {
+                ret fail(e, "expand_syntax", "a column name is repeated", line);
+            }
+            p = p + 1;
+        }
+        seen[s] = cols[s];
+        s = s + 1;
+    }
+    var b: Block;
+    b.name = name;
+    b.namen = namen;
+    b.cols = cols;
+    b.ncol = ncol;
+    b.rows = rows.data;
+    b.nrow = rows.len;
+    b.line = line;
+    vector.push[Block](blocks, b);
+    ret true;
+}
+
+rec Line {
+    p:    *u8;
+    n:    usize;
+    line: i64;
+}
+
+fun macro_name(ln: Line, name: **u8, namen: *usize) bool {
+    var s: usize = 0;
+    var end: usize = 0;
+    trim(ln.p, ln.n, ?s, ?end);
+    if (end <= s || ln.p[s] != '@') { ret false; }
+    var n0: usize = 0;
+    var n1: usize = 0;
+    trim((ln.p::usize + s + 1)::*u8, end - (s + 1), ?n0, ?n1);
+    @name = (ln.p::usize + s + 1 + n0)::*u8;
+    @namen = n1 - n0;
+    ret true;
+}
+
+fun blank_line(ln: Line) bool {
+    var s: usize = 0;
+    var end: usize = 0;
+    trim(ln.p, ln.n, ?s, ?end);
+    ret end == s;
+}
+
+fun at_line(ln: Line) bool {
+    var s: usize = 0;
+    var end: usize = 0;
+    trim(ln.p, ln.n, ?s, ?end);
+    ret end > s && ln.p[s] == '@';
+}
+
+# parse one or more @macro tables. cells point into text.
+pub fun parse(a: *A.Allocator, text: *u8, n: usize, blocks: *vector.Vector[Block], e: *Err) bool {
+    if (text == nil || n == 0) { ret fail(e, "expand_syntax", "expand is empty; start with @macro and a header row", 1); }
+    var lines: vector.Vector[Line] = vector.init[Line](a);
+    var i: usize = 0;
+    var no: i64 = 1;
+    for (i < n) {
+        var start: usize = i;
+        for (i < n && text[i] != '\n') { i = i + 1; }
+        var len: usize = i - start;
+        if (len > 0 && text[start + len - 1] == '\r') { len = len - 1; }
+        var ln: Line;
+        ln.p = (text::usize + start)::*u8;
+        ln.n = len;
+        ln.line = no;
+        vector.push[Line](?lines, ln);
+        if (i < n && text[i] == '\n') { i = i + 1; }
+        no = no + 1;
+    }
+    var at: usize = 0;
+    for (at < lines.len && blank_line(lines.data[at])) { at = at + 1; }
+    if (at >= lines.len) { ret fail(e, "expand_syntax", "expand has no @macro block", 1); }
+    for (at < lines.len) {
+        for (at < lines.len && blank_line(lines.data[at])) { at = at + 1; }
+        if (at >= lines.len) { ret true; }
+        val head: Line = lines.data[at];
+        if (!at_line(head)) { ret fail(e, "expand_syntax", "expand starts with @macro, then a header row, then one record per line", head.line); }
+        var name: *u8 = nil;
+        var namen: usize = 0;
+        if (!macro_name(head, ?name, ?namen) || namen == 0) { ret fail(e, "expand_syntax", "a macro name is missing after @", head.line); }
+        at = at + 1;
+        if (at >= lines.len || blank_line(lines.data[at]) || at_line(lines.data[at])) {
+            ret fail(e, "expand_syntax", "the line after @macro is the header, with column names split on |", head.line);
+        }
+        var cols: *Cell = nil;
+        var ncol: usize = 0;
+        if (!split_line(a, lines.data[at].p, lines.data[at].n, ?cols, ?ncol, e, lines.data[at].line)) { ret false; }
+        at = at + 1;
+        var rows: vector.Vector[Row] = vector.init[Row](a);
+        for (at < lines.len && !blank_line(lines.data[at]) && !at_line(lines.data[at])) {
+            var cells: *Cell = nil;
+            var cn: usize = 0;
+            if (!split_line(a, lines.data[at].p, lines.data[at].n, ?cells, ?cn, e, lines.data[at].line)) { ret false; }
+            if (cn != ncol) { ret fail(e, "expand_row", "a row has a different number of columns than the header", lines.data[at].line); }
+            var row: Row;
+            row.cells = cells;
+            row.ncol = cn;
+            row.line = lines.data[at].line;
+            vector.push[Row](?rows, row);
+            at = at + 1;
+        }
+        if (!finish(a, blocks, name, namen, cols, ncol, ?rows, head.line, e)) { ret false; }
+    }
+    ret true;
+}
+
+use std.types.string.str_equals;
+use page: std.allocator.page;
+use std.system.capability;
+
+$if (capability.HOSTED) {
+    fun cell_eq(c: Cell, s: str) bool {
+        ret eq_span(c.p, c.n, s);
+    }
+
+    test parse__two_blocks_and_a_short_row {
+        var a: A.Allocator;
+        val made: err[A.Error] = page.make(?a);
+        if (sel made.err) { ret 1; }
+        val text: str = "@greet\nwho\nAda\n\n@check\npath|cols\nout/a.py|id name\nout/b.py|id\n";
+        var blocks: vector.Vector[Block] = vector.init[Block](?a);
+        var e: Err;
+        if (!parse(?a, text, str_len(text), ?blocks, ?e)) { ret 2; }
+        if (blocks.len != 2) { ret 3; }
+        if (!eq_span(blocks.data[0].name, blocks.data[0].namen, "greet") || blocks.data[0].nrow != 1) { ret 4; }
+        if (!cell_eq(blocks.data[0].cols[0], "who") || !cell_eq(blocks.data[0].rows[0].cells[0], "Ada")) { ret 5; }
+        if (blocks.data[1].ncol != 2 || blocks.data[1].nrow != 2) { ret 6; }
+        if (!cell_eq(blocks.data[1].rows[1].cells[1], "id")) { ret 7; }
+        val bad: str = "@greet\nwho|city\nAda\n";
+        if (parse(?a, bad, str_len(bad), ?blocks, ?e)) { ret 8; }
+        if (!str_equals(e.code, "expand_row") || e.line != 3) { ret 9; }
+        ret 0;
+    }
+}

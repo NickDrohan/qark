@@ -1,0 +1,228 @@
+# checker processes kept alive between applies
+#
+# a warm checker is a helper script started with --serve: it reads one json
+# request per line and answers with one line. starting an interpreter costs
+# far more than checking a file, so a session keeps one checker per language.
+# a watchdog thread kills a checker that misses its deadline, which ends the
+# blocked read; the caller then falls back to a one-shot run and the next
+# apply starts a fresh checker.
+
+use std.chrono.duration;
+use std.chrono.time;
+use std.filesystem;
+use io_error: std.io.error;
+use io_handle: std.io.handle;
+use std.process.exec;
+use std.sync.atomic;
+use thread: std.sync.thread;
+use std.system.os;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+
+use A: std.allocator;
+use util: qark.util;
+
+# one long-lived checker
+# ---
+# wr:  our end of the checker's stdin
+# rd:  our end of the checker's stdout
+# buf: bytes read past the last answer, owned by a
+pub rec Warm {
+    alive: bool;
+    child: exec.Child;
+    wr:    usize;
+    rd:    usize;
+    buf:   *u8;
+    len:   usize;
+    cap:   usize;
+    a:     *A.Allocator;
+    uses:  i64;
+}
+
+rec Watch {
+    child:   exec.Child;
+    timeout: i64;
+    done:    i64;
+    fired:   i64;
+}
+
+fun watch(arg: *u8) {
+    val w: *Watch = arg::*Watch;
+    val start: time.InstantClock = time.instant();
+    for {
+        if (atomic.load(?w.done) != 0) { ret; }
+        if (sel start.ok) {
+            val el: time.Elapsed = time.elapsed(start.ok);
+            if (sel el.ok && duration.duration_msec(el.ok) >= w.timeout) {
+                atomic.store(?w.fired, 1);
+                exec.terminate_group(w.child);
+                ret;
+            }
+        }
+        os.sleep(1000000);
+    }
+}
+
+fun file(h: usize) filesystem.File {
+    ret filesystem.File{handle: io_handle.FileHandle{value: h}};
+}
+
+fun send_all(h: usize, p: *u8, n: usize) bool {
+    var off: usize = 0;
+    for (off < n) {
+        val wr: res[usize, io_error.Error] = filesystem.write(file(h), (p::usize + off)::*u8, n - off);
+        if (sel wr.err) { ret false; }
+        if (wr.ok == 0) { ret false; }
+        off = off + wr.ok;
+    }
+    ret true;
+}
+
+fun release_ends(w: *Warm) {
+    os.close(w.wr);
+    os.close(w.rd);
+    w.wr = os.INVALID_HANDLE;
+    w.rd = os.INVALID_HANDLE;
+    w.len = 0;
+    if (w.buf != nil && w.a != nil && w.cap > 0) {
+        A.deallocate[u8](w.a, w.buf, w.cap + 1);
+    }
+    w.buf = nil;
+    w.cap = 0;
+}
+
+# stop a checker; it is safe to call on one that never started
+pub fun stop(w: *Warm) {
+    if (!w.alive) { ret; }
+    w.alive = false;
+    release_ends(w);
+    exec.terminate_group(w.child);
+    exec.wait(w.child);
+}
+
+# drop a checker that has already exited, so its handles do not outlive it
+pub fun reap_if_dead(w: *Warm) {
+    if (!w.alive) { ret; }
+    val waited: res[opt[exec.ExitStatus], exec.Error] = exec.try_wait(w.child);
+    if (sel waited.ok) {
+        if (sel waited.ok.some) {
+            w.alive = false;
+            release_ends(w);
+        }
+    }
+}
+
+fun null_device() usize {
+    var name: str = "/dev/null";
+    $if ($mach.build.os == $mach.os.windows) {
+        name = "NUL";
+    }
+    var h: usize = os.INVALID_HANDLE;
+    val raw: i64 = os.open(os.working_dir(), name, os.O_WRONLY, 0, ?h);
+    if (raw < 0) { ret os.INVALID_HANDLE; }
+    ret h;
+}
+
+# start argv[0] with argv as a warm checker; a is the long-lived allocator for its buffer
+pub fun start(a: *A.Allocator, w: *Warm, argv: **u8) bool {
+    stop(w);
+    var in_r: usize = os.INVALID_HANDLE;
+    var in_w: usize = os.INVALID_HANDLE;
+    var out_r: usize = os.INVALID_HANDLE;
+    var out_w: usize = os.INVALID_HANDLE;
+    if (os.pipe(?in_r, ?in_w) < 0) { ret false; }
+    if (os.pipe(?out_r, ?out_w) < 0) {
+        os.close(in_r);
+        os.close(in_w);
+        ret false;
+    }
+    val sink: usize = null_device();
+    val child: res[exec.Child, exec.Error] = exec.spawn_redirected_in_grouped(argv[0], argv, nil, "", in_r, out_w, sink);
+    os.close(in_r);
+    os.close(out_w);
+    if (sink != os.INVALID_HANDLE) { os.close(sink); }
+    if (sel child.err) {
+        os.close(in_w);
+        os.close(out_r);
+        ret false;
+    }
+    w.child = child.ok;
+    w.wr = in_w;
+    w.rd = out_r;
+    w.a = a;
+    w.len = 0;
+    w.alive = true;
+    w.uses = 0;
+    ret true;
+}
+
+# send one request line; the answer is collected by receive
+pub fun send(w: *Warm, req: *u8, n: usize) bool {
+    if (!w.alive) { ret false; }
+    if (!send_all(w.wr, req, n) || !send_all(w.wr, "\n", 1)) {
+        stop(w);
+        ret false;
+    }
+    ret true;
+}
+
+fun take_line(w: *Warm, ra: *A.Allocator, out: **u8, out_n: *usize) bool {
+    var i: usize = 0;
+    for (i < w.len) {
+        if (w.buf[i] == '\n') {
+            val line: res[str, A.Error] = util.dup_n(ra, w.buf, i);
+            if (sel line.err) { ret false; }
+            val rest: usize = w.len - i - 1;
+            var k: usize = 0;
+            for (k < rest) {
+                w.buf[k] = w.buf[i + 1 + k];
+                k = k + 1;
+            }
+            w.len = rest;
+            w.buf[rest] = 0;
+            @out = line.ok;
+            @out_n = i;
+            ret true;
+        }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# wait for the answer to the last send, at most timeout_ms; the line comes from ra
+pub fun receive(w: *Warm, timeout_ms: i64, ra: *A.Allocator, out: **u8, out_n: *usize) bool {
+    if (!w.alive) { ret false; }
+    if (take_line(w, ra, out, out_n)) { ret true; }
+    var wd: Watch;
+    wd.child = w.child;
+    wd.timeout = timeout_ms;
+    var t: thread.Thread;
+    var cfg: thread.Config;
+    thread.config_default(?cfg);
+    cfg.stack_reserve = 65536;
+    val spawned: thread.Operation = thread.spawn_with_config(watch, ((?wd)::usize)::*u8, ?cfg, ?t);
+    var got: bool = false;
+    var chunk: [16384]u8;
+    for (!got) {
+        val rd: res[usize, io_error.Error] = filesystem.read(file(w.rd), ?chunk[0], 16384);
+        if (sel rd.err) { brk; }
+        if (rd.ok == 0) { brk; }
+        val ap: err[A.Error] = util.append(w.a, ?w.buf, ?w.len, ?w.cap, ?chunk[0], rd.ok);
+        if (sel ap.err) { brk; }
+        got = take_line(w, ra, out, out_n);
+    }
+    atomic.store(?wd.done, 1);
+    if (sel spawned.ok) { thread.join(?t); }
+    if (!got || atomic.load(?wd.fired) != 0) {
+        stop(w);
+        ret false;
+    }
+    w.uses = w.uses + 1;
+    ret true;
+}

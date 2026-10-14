@@ -1,0 +1,369 @@
+# gap-free line store: one owned buffer per line, spliced in bulk
+
+use std.collections.vector;
+use std.memory;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_equals;
+
+use A: std.allocator;
+use util: qark.util;
+
+# one line of text, nul-terminated, without the newline
+# ---
+# data: owned bytes
+# len:  content length
+# cap:  allocated content capacity
+pub rec Line {
+    data: *u8;
+    len:  usize;
+    cap:  usize;
+}
+
+# a buffer's text
+# ---
+# a:     allocator
+# lines: the lines; a live text always holds at least one
+pub rec Text {
+    a:     *A.Allocator;
+    lines: vector.Vector[Line];
+}
+
+fun blank(ln: *Line) {
+    ln.data = nil;
+    ln.len = 0;
+    ln.cap = 0;
+}
+
+fun release_line(a: *A.Allocator, ln: *Line) {
+    if (ln.data != nil) {
+        A.deallocate[u8](a, ln.data, ln.cap + 1);
+        blank(ln);
+    }
+}
+
+# an empty text with a single empty line
+# ---
+# a: allocator that outlives the text
+# ret: empty text, or the allocator's refusal
+pub fun init(a: *A.Allocator) res[Text, A.Error] {
+    var t: Text;
+    t.a = a;
+    t.lines = vector.init[Line](a);
+    var ln: Line;
+    blank(?ln);
+    val pushed: res[usize, A.Error] = vector.push[Line](?t.lines, ln);
+    if (sel pushed.err) { ret res[Text, A.Error].err{pushed.err}; }
+    ret res[Text, A.Error].ok{t};
+}
+
+# release every line and the line vector
+# ---
+# t: text; nil is a no-op
+pub fun dnit(t: *Text) {
+    if (t == nil) { ret; }
+    var i: usize = 0;
+    for (i < t.lines.len) {
+        val g: opt[*Line] = vector.get[Line](?t.lines, i);
+        if (sel g.some) { release_line(t.a, g.some); }
+        i = i + 1;
+    }
+    vector.dnit[Line](?t.lines);
+}
+
+# how many lines the text holds
+pub fun line_count(t: *Text) i64 {
+    ret t.lines.len::i64;
+}
+
+# borrowed line at a zero-based index
+# ---
+# ret: the line, or none when the index is outside
+pub fun line_at(t: *Text, index: i64) opt[*Line] {
+    if (index < 0) { ret opt[*Line].none{}; }
+    ret vector.get[Line](?t.lines, index::usize);
+}
+
+# replace the bytes of one existing line
+# ---
+# index: zero-based line
+# src:   new bytes
+# n:     byte count
+# ret:   ok, or a refusal
+pub fun set_line(t: *Text, index: i64, src: *u8, n: usize) err[A.Error] {
+    val g: opt[*Line] = line_at(t, index);
+    if (!sel g.some) { ret err[A.Error].err{A.Error.invalid{}}; }
+    val ln: *Line = g.some;
+    if (n > ln.cap) {
+        val got: res[*u8, A.Error] = util.dup_n(t.a, src, n);
+        if (sel got.err) { ret err[A.Error].err{got.err}; }
+        release_line(t.a, ln);
+        ln.data = got.ok;
+        ln.len = n;
+        ln.cap = n;
+        ret err[A.Error].ok{};
+    }
+    if (ln.data == nil) {
+        val got: res[*u8, A.Error] = util.dup_n(t.a, src, n);
+        if (sel got.err) { ret err[A.Error].err{got.err}; }
+        ln.data = got.ok;
+        ln.len = n;
+        ln.cap = n;
+        ret err[A.Error].ok{};
+    }
+    if (n > 0 && src != nil) { memory.copy[u8](ln.data, src, n); }
+    ln.data[n] = 0;
+    ln.len = n;
+    ret err[A.Error].ok{};
+}
+
+fun take_line(a: *A.Allocator, src: *u8, n: usize) res[Line, A.Error] {
+    val got: res[str, A.Error] = util.dup_n(a, src, n);
+    if (sel got.err) { ret res[Line, A.Error].err{got.err}; }
+    ret res[Line, A.Error].ok{Line{data: got.ok, len: n, cap: n}};
+}
+
+# replace lines [start, end) with count new lines
+#
+# end < 0 means the line count. the text is never left with zero lines: a
+# deletion of everything becomes one empty line. on failure the text is unchanged.
+# ---
+# start: first line to replace, zero-based
+# end:   exclusive end, or negative for the end of the text
+# srcs:  array of line pointers, count long
+# lens:  array of lengths, count long
+# count: how many replacement lines
+# ret:   ok, or a refusal
+pub fun splice(t: *Text, start: i64, end: i64, srcs: **u8, lens: *usize, count: i64) err[A.Error] {
+    val n: i64 = line_count(t);
+    var hi: i64 = end;
+    if (hi < 0) { hi = n; }
+    if (start < 0 || start > hi || hi > n || count < 0) {
+        ret err[A.Error].err{A.Error.invalid{}};
+    }
+    val old_n: i64 = hi - start;
+    var fresh: vector.Vector[Line] = vector.init[Line](t.a);
+    var i: i64 = 0;
+    for (i < count) {
+        var src: *u8 = nil;
+        var ln: usize = 0;
+        if (srcs != nil) { src = srcs[i::usize]; }
+        if (lens != nil) { ln = lens[i::usize]; }
+        val made: res[Line, A.Error] = take_line(t.a, src, ln);
+        if (sel made.err) {
+            var k: usize = 0;
+            for (k < fresh.len) {
+                val g: opt[*Line] = vector.get[Line](?fresh, k);
+                if (sel g.some) { release_line(t.a, g.some); }
+                k = k + 1;
+            }
+            vector.dnit[Line](?fresh);
+            ret err[A.Error].err{made.err};
+        }
+        val pushed: res[usize, A.Error] = vector.push[Line](?fresh, made.ok);
+        if (sel pushed.err) {
+            release_line(t.a, ?made.ok);
+            vector.dnit[Line](?fresh);
+            ret err[A.Error].err{pushed.err};
+        }
+        i = i + 1;
+    }
+
+    var neu: vector.Vector[Line] = vector.init[Line](t.a);
+    i = 0;
+    for (i < start) {
+        val g: opt[*Line] = vector.get[Line](?t.lines, i::usize);
+        if (sel g.some) {
+            val pushed: res[usize, A.Error] = vector.push[Line](?neu, @g.some);
+            if (sel pushed.err) {
+                vector.dnit[Line](?neu);
+                vector.dnit[Line](?fresh);
+                ret err[A.Error].err{pushed.err};
+            }
+        }
+        i = i + 1;
+    }
+    var j: usize = 0;
+    for (j < fresh.len) {
+        val g: opt[*Line] = vector.get[Line](?fresh, j);
+        if (sel g.some) {
+            val pushed: res[usize, A.Error] = vector.push[Line](?neu, @g.some);
+            if (sel pushed.err) {
+                vector.dnit[Line](?neu);
+                vector.dnit[Line](?fresh);
+                ret err[A.Error].err{pushed.err};
+            }
+        }
+        j = j + 1;
+    }
+    i = hi;
+    for (i < n) {
+        val g: opt[*Line] = vector.get[Line](?t.lines, i::usize);
+        if (sel g.some) {
+            val pushed: res[usize, A.Error] = vector.push[Line](?neu, @g.some);
+            if (sel pushed.err) {
+                vector.dnit[Line](?neu);
+                vector.dnit[Line](?fresh);
+                ret err[A.Error].err{pushed.err};
+            }
+        }
+        i = i + 1;
+    }
+
+    if (neu.len == 0) {
+        var empty: Line;
+        blank(?empty);
+        val pushed: res[usize, A.Error] = vector.push[Line](?neu, empty);
+        if (sel pushed.err) {
+            vector.dnit[Line](?neu);
+            vector.dnit[Line](?fresh);
+            ret err[A.Error].err{pushed.err};
+        }
+    }
+
+    i = start;
+    for (i < hi) {
+        val g: opt[*Line] = vector.get[Line](?t.lines, i::usize);
+        if (sel g.some) { release_line(t.a, g.some); }
+        i = i + 1;
+    }
+    vector.dnit[Line](?t.lines);
+    vector.dnit[Line](?fresh);
+    t.lines = neu;
+    if (old_n == 0 && count == 0) { ret err[A.Error].ok{}; }
+    ret err[A.Error].ok{};
+}
+
+# total content bytes, not counting newlines
+pub fun content_bytes(t: *Text) usize {
+    var n: usize = 0;
+    var i: usize = 0;
+    for (i < t.lines.len) {
+        val g: opt[*Line] = vector.get[Line](?t.lines, i);
+        if (sel g.some) { n = n + g.some.len; }
+        i = i + 1;
+    }
+    ret n;
+}
+
+# join lines with newlines into an owned string; a final newline is included
+# ---
+# ret: owned text, or the allocator's refusal
+pub fun join(t: *Text) res[str, A.Error] {
+    var buf: *u8 = nil;
+    var len: usize = 0;
+    var cap: usize = 0;
+    var i: usize = 0;
+    for (i < t.lines.len) {
+        val g: opt[*Line] = vector.get[Line](?t.lines, i);
+        if (sel g.some) {
+            if (g.some.len > 0) {
+                val ap: err[A.Error] = util.append(t.a, ?buf, ?len, ?cap, g.some.data, g.some.len);
+                if (sel ap.err) { ret res[str, A.Error].err{ap.err}; }
+            }
+        }
+        val nl: err[A.Error] = util.append_byte(t.a, ?buf, ?len, ?cap, '\n');
+        if (sel nl.err) { ret res[str, A.Error].err{nl.err}; }
+        i = i + 1;
+    }
+    if (buf == nil) { ret util.dup(t.a, ""); }
+    ret res[str, A.Error].ok{buf};
+}
+
+# load a whole buffer from bytes, splitting on \n and stripping a trailing \r
+# ---
+# src: bytes
+# n:   length
+# ret: ok, or the allocator's refusal
+pub fun load(t: *Text, src: *u8, n: usize) err[A.Error] {
+    val cleared: err[A.Error] = splice(t, 0, -1, nil, nil, 0);
+    if (sel cleared.err) { ret cleared; }
+    var line_start: usize = 0;
+    var i: usize = 0;
+    var placed: i64 = 0;
+    for (i <= n) {
+        val at_end: bool = i == n;
+        var brk_here: bool = at_end;
+        if (!at_end && src[i] == '\n') { brk_here = true; }
+        if (brk_here) {
+            var ln: usize = i - line_start;
+            var p: *u8 = nil;
+            if (ln > 0) { p = (src::usize + line_start)::*u8; }
+            if (ln > 0 && p[ln - 1] == '\r') { ln = ln - 1; }
+            var skip: bool = false;
+            if (at_end && ln == 0 && placed > 0) { skip = true; }
+            if (!skip) {
+                if (placed == 0) {
+                    val set: err[A.Error] = set_line(t, 0, p, ln);
+                    if (sel set.err) { ret set; }
+                }
+                or {
+                    var srcs: [1]*u8;
+                    var lens: [1]usize;
+                    srcs[0] = p;
+                    lens[0] = ln;
+                    val sp: err[A.Error] = splice(t, placed, placed, ?srcs[0], ?lens[0], 1);
+                    if (sel sp.err) { ret sp; }
+                }
+                placed = placed + 1;
+            }
+            line_start = i + 1;
+        }
+        if (!at_end) { i = i + 1; }
+        or { brk; }
+    }
+    ret err[A.Error].ok{};
+}
+
+use std.system.capability;
+
+$if (capability.HOSTED) {
+    use page: std.allocator.page;
+
+    test splice__replaces_a_middle_line {
+        var a: A.Allocator;
+        val made: err[A.Error] = page.make(?a);
+        if (sel made.err) { ret 1; }
+        val t0: res[Text, A.Error] = init(?a);
+        if (sel t0.err) { ret 2; }
+        var t: Text = t0.ok;
+        val loaded: err[A.Error] = load(?t, "one\ntwo\nthree\n", 14);
+        if (sel loaded.err) { ret 3; }
+        if (line_count(?t) != 3) { ret 4; }
+        var srcs: [1]*u8;
+        var lens: [1]usize;
+        srcs[0] = "TWO";
+        lens[0] = 3;
+        val sp: err[A.Error] = splice(?t, 1, 2, ?srcs[0], ?lens[0], 1);
+        if (sel sp.err) { ret 5; }
+        val mid: opt[*Line] = line_at(?t, 1);
+        if (!sel mid.some) { ret 6; }
+        if (!str_equals(mid.some.data, "TWO")) { ret 7; }
+        val joined: res[str, A.Error] = join(?t);
+        if (sel joined.err) { ret 8; }
+        if (!str_equals(joined.ok, "one\nTWO\nthree\n")) { ret 9; }
+        util.free(?a, joined.ok);
+        dnit(?t);
+        ret 0;
+    }
+
+    test load__keeps_a_blank_buffer {
+        var a: A.Allocator;
+        val made: err[A.Error] = page.make(?a);
+        if (sel made.err) { ret 1; }
+        val t0: res[Text, A.Error] = init(?a);
+        if (sel t0.err) { ret 2; }
+        var t: Text = t0.ok;
+        val loaded: err[A.Error] = load(?t, "", 0);
+        if (sel loaded.err) { ret 3; }
+        if (line_count(?t) != 1) { ret 4; }
+        dnit(?t);
+        ret 0;
+    }
+}

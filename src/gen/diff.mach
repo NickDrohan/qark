@@ -1,0 +1,386 @@
+# unified diffs between old and new text, for receipts and dry runs
+#
+# both texts split into lines, the common head and tail drop away, and myers
+# runs on the middle. when the middle needs more than MAX_D edits it becomes
+# one coarse hunk instead: still a true account of the change, not a minimal
+# one. output follows the unified format, one hunk per region, CTX lines of
+# context, and a \ No newline marker when a shown line is unterminated.
+
+use std.collections.vector;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.result.res;
+use std.types.size.usize;
+
+use A: std.allocator;
+use jw: qark.rpc.jw;
+use util: qark.util;
+
+# how far myers searches before the middle collapses to one hunk
+pub val MAX_D: i64 = 600;
+
+# context lines on each side of a change
+pub val CTX: i64 = 3;
+
+# diff text cap; a longer diff stops mid-hunks and reports truncated
+pub val MAX_OUT: usize = 65536;
+
+# middle sizes past this skip myers and go straight to the coarse hunk
+pub val MAX_MIDDLE: usize = 100000;
+
+val OP_KEEP: i64 = 0;
+val OP_DEL:  i64 = 1;
+val OP_INS:  i64 = 2;
+
+# split p[0,n) into line spans: off and len pairs appended to out, '\n' included
+fun split(a: *A.Allocator, p: *u8, n: usize, out: *vector.Vector[usize]) {
+    var i: usize = 0;
+    var start: usize = 0;
+    for (i < n) {
+        if (p[i] == '\n') {
+            vector.push[usize](out, start);
+            vector.push[usize](out, i + 1 - start);
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    if (start < n) {
+        vector.push[usize](out, start);
+        vector.push[usize](out, n - start);
+    }
+}
+
+fun lines_eq(ap: *u8, av: *vector.Vector[usize], ai: usize, bp: *u8, bv: *vector.Vector[usize], bi: usize) bool {
+    if (av.data[ai * 2 + 1] != bv.data[bi * 2 + 1]) { ret false; }
+    var i: usize = 0;
+    val n: usize = av.data[ai * 2 + 1];
+    for (i < n) {
+        if (ap[av.data[ai * 2] + i] != bp[bv.data[bi * 2] + i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# append one op: tag, a position, b position (middle-relative)
+fun push_op(ops: *vector.Vector[i64], tag: i64, x: i64, y: i64) {
+    vector.push[i64](ops, tag);
+    vector.push[i64](ops, x);
+    vector.push[i64](ops, y);
+}
+
+# myers on the middle slices; ops come out end-first and are reversed in place.
+# false means the edit distance ran past MAX_D and the caller should fall back.
+fun middle_ops(a: *A.Allocator, ap: *u8, av: *vector.Vector[usize], a_lo: usize, na: usize, bp: *u8, bv: *vector.Vector[usize], b_lo: usize, ma: usize, ops: *vector.Vector[i64]) bool {
+    val first_op: usize = ops.len;
+    if (na == 0 && ma == 0) { ret true; }
+    if (na == 0) {
+        var y: usize = 0;
+        for (y < ma) {
+            push_op(ops, OP_INS, 0, y::i64);
+            y = y + 1;
+        }
+        ret true;
+    }
+    if (ma == 0) {
+        var x: usize = 0;
+        for (x < na) {
+            push_op(ops, OP_DEL, x::i64, 0);
+            x = x + 1;
+        }
+        ret true;
+    }
+    if (na > MAX_MIDDLE || ma > MAX_MIDDLE) { ret false; }
+    val span: usize = 2 * (MAX_D::usize) + 5;
+    val vres: res[*i64, A.Error] = A.allocate[i64](a, span);
+    if (sel vres.err) { ret false; }
+    var v: *i64 = vres.ok;
+    var i: usize = 0;
+    for (i < span) {
+        v[i] = 0;
+        i = i + 1;
+    }
+    val koff: i64 = MAX_D + 2;
+    var trace: vector.Vector[i64] = vector.init[i64](a);
+    var found: i64 = -1;
+    var d: i64 = 0;
+    for (d <= MAX_D && found < 0) {
+        var k: i64 = 0 - d;
+        for (k <= d) {
+            var x: i64 = 0;
+            if (k == 0 - d || (k != d && v[(k - 1 + koff)::usize] < v[(k + 1 + koff)::usize])) {
+                x = v[(k + 1 + koff)::usize];
+            }
+            or { x = v[(k - 1 + koff)::usize] + 1; }
+            var y: i64 = x - k;
+            for (x < na::i64 && y < ma::i64 && lines_eq(ap, av, a_lo + x::usize, bp, bv, b_lo + y::usize)) {
+                x = x + 1;
+                y = y + 1;
+            }
+            v[(k + koff)::usize] = x;
+            vector.push[i64](?trace, x);
+            if (x >= na::i64 && y >= ma::i64) { found = d; }
+            k = k + 2;
+        }
+        d = d + 1;
+    }
+    if (found < 0) { ret false; }
+    var x: i64 = na::i64;
+    var y: i64 = ma::i64;
+    d = found;
+    for (d >= 0) {
+        val k: i64 = x - y;
+        var prev_x: i64 = 0;
+        var prev_y: i64 = 0;
+        if (d > 0) {
+            val pb: i64 = (d - 1) * d / 2;
+            var prev_k: i64 = k - 1;
+            if (k == 0 - d) { prev_k = k + 1; }
+            or (k != d) {
+                val vl: i64 = trace.data[(pb + (k + d - 2) / 2)::usize];
+                val vr: i64 = trace.data[(pb + (k + d) / 2)::usize];
+                if (vl < vr) { prev_k = k + 1; }
+            }
+            prev_x = trace.data[(pb + (prev_k + d - 1) / 2)::usize];
+            prev_y = prev_x - prev_k;
+        }
+        for (x > prev_x && y > prev_y) {
+            push_op(ops, OP_KEEP, x - 1, y - 1);
+            x = x - 1;
+            y = y - 1;
+        }
+        if (d > 0) {
+            if (x == prev_x) { push_op(ops, OP_INS, x, y - 1); }
+            or { push_op(ops, OP_DEL, x - 1, y); }
+            x = prev_x;
+            y = prev_y;
+        }
+        d = d - 1;
+    }
+    var lo: usize = first_op;
+    var hi: usize = ops.len;
+    if (hi >= lo + 3) { hi = hi - 3; }
+    or { ret true; }
+    for (lo < hi) {
+        var t: i64 = ops.data[lo];
+        ops.data[lo] = ops.data[hi];
+        ops.data[hi] = t;
+        t = ops.data[lo + 1];
+        ops.data[lo + 1] = ops.data[hi + 1];
+        ops.data[hi + 1] = t;
+        t = ops.data[lo + 2];
+        ops.data[lo + 2] = ops.data[hi + 2];
+        ops.data[hi + 2] = t;
+        lo = lo + 3;
+        hi = hi - 3;
+    }
+    ret true;
+}
+
+# the middle as one coarse hunk: every old middle line deleted, every new inserted
+fun coarse_ops(na: usize, ma: usize, ops: *vector.Vector[i64]) {
+    var x: usize = 0;
+    for (x < na) {
+        push_op(ops, OP_DEL, x::i64, 0);
+        x = x + 1;
+    }
+    var y: usize = 0;
+    for (y < ma) {
+        push_op(ops, OP_INS, na::i64, y::i64);
+        y = y + 1;
+    }
+}
+
+fun emit_num(w: *jw.Jw, n: i64) {
+    var num: [24]u8;
+    val k: usize = util.fmt_i64(?num[0], 24, n);
+    jw.bytes(w, ?num[0], k);
+}
+
+# one shown line: prefix, the line text, and the no-newline marker it may need
+fun emit_line(w: *jw.Jw, p: *u8, v: *vector.Vector[usize], idx: i64, mark: u8) {
+    jw.byte(w, mark);
+    val off: usize = v.data[idx::usize * 2];
+    val n: usize = v.data[idx::usize * 2 + 1];
+    jw.bytes(w, (p::usize + off)::*u8, n);
+    if (n == 0 || p[off + n - 1] != '\n') {
+        jw.raw(w, "\n\\ No newline at end of file\n");
+    }
+}
+
+# walk the op list over full arrays and emit hunks; 1 when MAX_OUT cut it short
+fun emit_hunks(ap: *u8, av: *vector.Vector[usize], bp: *u8, bv: *vector.Vector[usize], ops: *vector.Vector[i64], w: *jw.Jw) i64 {
+    val total: usize = ops.len / 3;
+    var first: i64 = -1;
+    var i: usize = 0;
+    for (i < total) {
+        if (ops.data[i * 3] != OP_KEEP) {
+            if (first < 0) { first = i::i64; }
+        }
+        i = i + 1;
+    }
+    if (first < 0) { ret 0; }
+    var c: i64 = first;
+    for (c >= 0 && c < total::i64) {
+        var hi: i64 = c;
+        var last_change: i64 = c;
+        var j: i64 = c + 1;
+        for (j < total::i64) {
+            if (ops.data[j::usize * 3] == OP_KEEP) {
+                if (j - last_change > 2 * CTX) { brk; }
+            }
+            or { last_change = j; }
+            j = j + 1;
+        }
+        var end: i64 = last_change + 1;
+        var ctx_after: i64 = 0;
+        for (end < total::i64 && ctx_after < CTX && ops.data[end::usize * 3] == OP_KEEP) {
+            end = end + 1;
+            ctx_after = ctx_after + 1;
+        }
+        var start: i64 = c;
+        var ctx_before: i64 = 0;
+        for (start > 0 && ctx_before < CTX && ops.data[(start - 1)::usize * 3] == OP_KEEP) {
+            start = start - 1;
+            ctx_before = ctx_before + 1;
+        }
+        var a_start: i64 = ops.data[start::usize * 3 + 1];
+        var b_start: i64 = ops.data[start::usize * 3 + 2];
+        var a_cnt: i64 = 0;
+        var b_cnt: i64 = 0;
+        var e: i64 = start;
+        for (e < end) {
+            val tag: i64 = ops.data[e::usize * 3];
+            if (tag == OP_KEEP || tag == OP_DEL) { a_cnt = a_cnt + 1; }
+            if (tag == OP_KEEP || tag == OP_INS) { b_cnt = b_cnt + 1; }
+            e = e + 1;
+        }
+        jw.raw(w, "@@ -");
+        if (a_cnt > 0) { emit_num(w, a_start + 1); }
+        or { emit_num(w, a_start); }
+        jw.byte(w, ',');
+        emit_num(w, a_cnt);
+        jw.raw(w, " +");
+        if (b_cnt > 0) { emit_num(w, b_start + 1); }
+        or { emit_num(w, b_start); }
+        jw.byte(w, ',');
+        emit_num(w, b_cnt);
+        jw.raw(w, " @@\n");
+        e = start;
+        for (e < end) {
+            val tag: i64 = ops.data[e::usize * 3];
+            if (tag == OP_KEEP) { emit_line(w, ap, av, ops.data[e::usize * 3 + 1], ' '); }
+            or (tag == OP_DEL) { emit_line(w, ap, av, ops.data[e::usize * 3 + 1], '-'); }
+            or { emit_line(w, bp, bv, ops.data[e::usize * 3 + 2], '+'); }
+            e = e + 1;
+        }
+        if (w.len > MAX_OUT) { ret 1; }
+        c = j;
+        var next_change: i64 = -1;
+        for (c < total::i64) {
+            if (ops.data[c::usize * 3] != OP_KEEP) {
+                next_change = c;
+                c = total::i64;
+            }
+            or { c = c + 1; }
+        }
+        c = next_change;
+    }
+    ret 0;
+}
+
+# write the unified diff of a[0,an) to b[0,bn) into w; 0 done, 1 truncated
+pub fun unified(a: *A.Allocator, ap: *u8, an: usize, bp: *u8, bn: usize, w: *jw.Jw) i64 {
+    if (an == 0 && bn == 0) { ret 0; }
+    var av: vector.Vector[usize] = vector.init[usize](a);
+    var bv: vector.Vector[usize] = vector.init[usize](a);
+    split(a, ap, an, ?av);
+    split(a, bp, bn, ?bv);
+    val na_all: usize = av.len / 2;
+    val mb_all: usize = bv.len / 2;
+    var cp: usize = 0;
+    for (cp < na_all && cp < mb_all && lines_eq(ap, ?av, cp, bp, ?bv, cp)) {
+        cp = cp + 1;
+    }
+    var cs: usize = 0;
+    for (cs < na_all - cp && cs < mb_all - cp && lines_eq(ap, ?av, na_all - 1 - cs, bp, ?bv, mb_all - 1 - cs)) {
+        cs = cs + 1;
+    }
+    val na: usize = na_all - cp - cs;
+    val ma: usize = mb_all - cp - cs;
+    var ops: vector.Vector[i64] = vector.init[i64](a);
+    var k: usize = 0;
+    for (k < cp) {
+        push_op(?ops, OP_KEEP, k::i64, k::i64);
+        k = k + 1;
+    }
+    if (na > 0 || ma > 0) {
+        val mid_at: usize = ops.len;
+        if (!middle_ops(a, ap, ?av, cp, na, bp, ?bv, cp, ma, ?ops)) {
+            coarse_ops(na, ma, ?ops);
+        }
+        k = mid_at;
+        for (k < ops.len) {
+            ops.data[k + 1] = ops.data[k + 1] + cp::i64;
+            ops.data[k + 2] = ops.data[k + 2] + cp::i64;
+            k = k + 3;
+        }
+    }
+    k = 0;
+    for (k < cs) {
+        push_op(?ops, OP_KEEP, (cp + na + k)::i64, (cp + ma + k)::i64);
+        k = k + 1;
+    }
+    ret emit_hunks(ap, ?av, bp, ?bv, ?ops, w);
+}
+
+use std.system.capability;
+
+$if (capability.HOSTED) {
+    use page: std.allocator.page;
+    use std.types.string.str;
+    use std.types.string.str_contains;
+
+    test diff__one_change_in_context {
+        var a: A.Allocator;
+        val made: err[A.Error] = page.make(?a);
+        if (sel made.err) { ret 1; }
+        var w: jw.Jw = jw.init(?a);
+        unified(?a, "one\ntwo\nthree\n", 14, "one\nTWO\nthree\n", 14, ?w);
+        val t: str = jw.text(?w);
+        if (!str_contains(t, "@@ -1,3 +1,3 @@")) { ret 2; }
+        if (!str_contains(t, "-two\n")) { ret 3; }
+        if (!str_contains(t, "+TWO\n")) { ret 4; }
+        if (!str_contains(t, " one\n")) { ret 5; }
+        ret 0;
+    }
+
+    test diff__separate_hunks_and_empty_sides {
+        var a: A.Allocator;
+        val made: err[A.Error] = page.make(?a);
+        if (sel made.err) { ret 1; }
+        var w: jw.Jw = jw.init(?a);
+        unified(?a, "l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9\nlA\nlB\nlC\n", 36, "l1\nx2\nl3\nl4\nl5\nl6\nl7\nl8\nl9\nlA\nxB\nlC\n", 36, ?w);
+        val t: str = jw.text(?w);
+        if (!str_contains(t, "@@ -1,5 +1,5 @@")) { ret 2; }
+        if (!str_contains(t, "@@ -8,5 +8,5 @@")) { ret 3; }
+        var w2: jw.Jw = jw.init(?a);
+        unified(?a, "", 0, "x\ny\n", 4, ?w2);
+        if (!str_contains(jw.text(?w2), "@@ -0,0 +1,2 @@")) { ret 4; }
+        if (!str_contains(jw.text(?w2), "+x\n+y\n")) { ret 5; }
+        ret 0;
+    }
+
+    test diff__no_newline_marker {
+        var a: A.Allocator;
+        val made: err[A.Error] = page.make(?a);
+        if (sel made.err) { ret 1; }
+        var w: jw.Jw = jw.init(?a);
+        unified(?a, "a\nb", 3, "a\nc", 3, ?w);
+        val t: str = jw.text(?w);
+        if (!str_contains(t, "-b\n\\ No newline at end of file\n")) { ret 2; }
+        if (!str_contains(t, "+c\n\\ No newline at end of file\n")) { ret 3; }
+        ret 0;
+    }
+}

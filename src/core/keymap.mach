@@ -1,0 +1,219 @@
+# a trie of key bindings per mode
+
+use std.collections.vector;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+
+use A: std.allocator;
+use keys: qark.core.keys;
+use util: qark.util;
+
+pub val M_NORMAL: u8 = 0;
+pub val M_INSERT: u8 = 1;
+pub val M_VISUAL: u8 = 2;
+pub val M_COMMAND: u8 = 3;
+
+pub val ACT_KEYS: u8 = 1;
+pub val ACT_LISP: u8 = 2;
+
+pub val LOOK_NONE:   u8 = 0;
+pub val LOOK_PREFIX: u8 = 1;
+pub val LOOK_HIT:    u8 = 2;
+
+# one trie edge
+pub rec Node {
+    key:   keys.Key;
+    child: i64;
+    sib:   i64;
+    act:   i64;
+}
+
+# a binding
+pub rec Act {
+    kind:  u8;
+    keys:  str;
+    lisp:  u32;
+    remap: bool;
+}
+
+# four mode tries
+pub rec Map {
+    a:     *A.Allocator;
+    nodes: vector.Vector[Node];
+    acts:  vector.Vector[Act];
+    roots: [4]i64;
+}
+
+# what a lookup found
+pub rec Look {
+    kind: u8;
+    act:  i64;
+}
+
+# an empty map
+pub fun init(a: *A.Allocator) Map {
+    var m: Map;
+    m.a = a;
+    m.nodes = vector.init[Node](a);
+    m.acts = vector.init[Act](a);
+    m.roots[0] = -1;
+    m.roots[1] = -1;
+    m.roots[2] = -1;
+    m.roots[3] = -1;
+    ret m;
+}
+
+# release bindings
+pub fun dnit(m: *Map) {
+    var i: usize = 0;
+    for (i < m.acts.len) {
+        val g: opt[*Act] = vector.get[Act](?m.acts, i);
+        if (sel g.some) { util.free(m.a, g.some.keys); }
+        i = i + 1;
+    }
+    vector.dnit[Act](?m.acts);
+    vector.dnit[Node](?m.nodes);
+}
+
+fun add_node(m: *Map, key: keys.Key) res[i64, A.Error] {
+    var n: Node;
+    n.key = key;
+    n.child = -1;
+    n.sib = -1;
+    n.act = -1;
+    val at: i64 = m.nodes.len::i64;
+    val pushed: res[usize, A.Error] = vector.push[Node](?m.nodes, n);
+    if (sel pushed.err) { ret res[i64, A.Error].err{pushed.err}; }
+    ret res[i64, A.Error].ok{at};
+}
+
+# bind a key sequence in a mode to either a key replay or a lisp id
+pub fun bind(m: *Map, mode: u8, spec: str, kind: u8, replay: str, lisp: u32, remap: bool) err[A.Error] {
+    var seq: keys.Seq = keys.seq_init(m.a);
+    val parsed: err[A.Error] = keys.parse(spec, ?seq);
+    if (sel parsed.err) {
+        keys.seq_dnit(?seq);
+        ret parsed;
+    }
+    if (seq.len == 0 || mode > 3) {
+        keys.seq_dnit(?seq);
+        ret err[A.Error].err{A.Error.invalid{}};
+    }
+    var copied: str = nil;
+    if (kind == ACT_KEYS) {
+        val d: res[str, A.Error] = util.dup(m.a, replay);
+        if (sel d.err) {
+            keys.seq_dnit(?seq);
+            ret err[A.Error].err{d.err};
+        }
+        copied = d.ok;
+    }
+    var act: Act;
+    act.kind = kind;
+    act.keys = copied;
+    act.lisp = lisp;
+    act.remap = remap;
+    val ai: i64 = m.acts.len::i64;
+    val ap: res[usize, A.Error] = vector.push[Act](?m.acts, act);
+    if (sel ap.err) {
+        util.free(m.a, copied);
+        keys.seq_dnit(?seq);
+        ret err[A.Error].err{ap.err};
+    }
+    var parent: i64 = -1;
+    var edge: i64 = m.roots[mode::usize];
+    var i: usize = 0;
+    for (i < seq.len) {
+        var found: i64 = -1;
+        var walk: i64 = edge;
+        for (walk >= 0) {
+            val g: opt[*Node] = vector.get[Node](?m.nodes, walk::usize);
+            if (sel g.some && keys.same(g.some.key, seq.data[i])) {
+                found = walk;
+                brk;
+            }
+            if (sel g.some) { walk = g.some.sib; }
+            or { brk; }
+        }
+        if (found < 0) {
+            val created: res[i64, A.Error] = add_node(m, seq.data[i]);
+            if (sel created.err) {
+                keys.seq_dnit(?seq);
+                ret err[A.Error].err{created.err};
+            }
+            found = created.ok;
+            if (parent < 0) {
+                val root: i64 = m.roots[mode::usize];
+                val node: opt[*Node] = vector.get[Node](?m.nodes, found::usize);
+                if (sel node.some) { node.some.sib = root; }
+                m.roots[mode::usize] = found;
+            }
+            or {
+                val node: opt[*Node] = vector.get[Node](?m.nodes, parent::usize);
+                if (sel node.some) {
+                    val kid: opt[*Node] = vector.get[Node](?m.nodes, found::usize);
+                    if (sel kid.some) { kid.some.sib = node.some.child; }
+                    node.some.child = found;
+                }
+            }
+        }
+        parent = found;
+        val g: opt[*Node] = vector.get[Node](?m.nodes, found::usize);
+        if (sel g.some) { edge = g.some.child; }
+        or { edge = -1; }
+        i = i + 1;
+    }
+    val leaf: opt[*Node] = vector.get[Node](?m.nodes, parent::usize);
+    if (sel leaf.some) { leaf.some.act = ai; }
+    keys.seq_dnit(?seq);
+    ret err[A.Error].ok{};
+}
+
+# look up the longest binding for a key sequence
+pub fun lookup(m: *Map, mode: u8, seq: *keys.Seq) Look {
+    var out: Look;
+    if (mode > 3 || seq.len == 0) { ret out; }
+    var edge: i64 = m.roots[mode::usize];
+    var i: usize = 0;
+    var node: i64 = -1;
+    for (i < seq.len) {
+        var found: i64 = -1;
+        var walk: i64 = edge;
+        for (walk >= 0) {
+            val g: opt[*Node] = vector.get[Node](?m.nodes, walk::usize);
+            if (sel g.some && keys.same(g.some.key, seq.data[i])) {
+                found = walk;
+                brk;
+            }
+            if (sel g.some) { walk = g.some.sib; }
+            or { brk; }
+        }
+        if (found < 0) { ret out; }
+        node = found;
+        val g: opt[*Node] = vector.get[Node](?m.nodes, found::usize);
+        if (sel g.some) { edge = g.some.child; }
+        or { edge = -1; }
+        i = i + 1;
+    }
+    val g: opt[*Node] = vector.get[Node](?m.nodes, node::usize);
+    if (!sel g.some) { ret out; }
+    if (g.some.act >= 0) {
+        out.kind = LOOK_HIT;
+        out.act = g.some.act;
+        ret out;
+    }
+    if (g.some.child >= 0) { out.kind = LOOK_PREFIX; }
+    ret out;
+}
+
+# borrowed action
+pub fun act_at(m: *Map, index: i64) opt[*Act] {
+    if (index < 0) { ret opt[*Act].none{}; }
+    ret vector.get[Act](?m.acts, index::usize);
+}

@@ -1,0 +1,4 @@
+{"id":1,"op":"session.info"}
+{"id":2,"op":"buf.create","args":{"name":"gen/math.py","filetype":"python"}}
+{"id":3,"op":"eval","args":{"src":"(+ 20 22)"}}
+{"id":4,"op":"validate.ident","args":{"lang":"python","name":"double"}}

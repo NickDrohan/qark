@@ -1,0 +1,633 @@
+# atomic publication of file changes beneath one workspace root
+#
+# a change set is observed against the disk, checked, and then published under
+# the workspace lock. every new file is staged as an exclusive sibling temporary
+# and renamed into place, so a reader sees the old bytes or the new bytes and
+# never a prefix. when a later rename fails, the files this call already
+# published are restored from the bytes observed before the commit.
+
+use std.chrono.duration;
+use std.chrono.time;
+use std.collections.vector;
+use std.crypto.hash.sha256;
+use std.crypto.rand;
+use std.filesystem;
+use io_error: std.io.error;
+use io_handle: std.io.handle;
+use std.system.os;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+
+use A: std.allocator;
+use path: std.types.path;
+use pathx: qark.gen.pathx;
+use util: qark.util;
+
+pub val MODE_CREATE:  u8 = 0;
+pub val MODE_REPLACE: u8 = 1;
+pub val MODE_UPSERT:  u8 = 2;
+pub val MODE_DELETE:  u8 = 3;
+
+pub val ST_PENDING:   u8 = 0;
+pub val ST_CREATE:    u8 = 1;
+pub val ST_REPLACE:   u8 = 2;
+pub val ST_UNCHANGED: u8 = 3;
+pub val ST_DELETE:    u8 = 4;
+pub val ST_CONFLICT:  u8 = 5;
+
+pub val CK_NONE:    u8 = 0;
+pub val CK_OK:      u8 = 1;
+pub val CK_FAILED:  u8 = 2;
+pub val CK_SKIPPED: u8 = 3;
+
+# one file in a change set
+# ---
+# rel:      canonical relative path, '/' separated
+# full:     host path under the root
+# data:     the bytes to publish; nil for a delete
+# sha:      hex sha-256 of data
+# expect:   hex sha-256 the current file must have, when has_expect
+# existed:  the file was there when observed
+# old:      the observed bytes, kept to restore on a failed commit
+# status:   ST_* decided by observe
+# reason:   static conflict code when status is ST_CONFLICT
+# lang:     checker name, or nil for no syntax check
+# check:    CK_* after the checkers ran
+# notes:    advisory lines for the receipt, such as line-ending normalization
+# edited:   the bytes came through an edits list rather than a full text
+pub rec Entry {
+    rel:        str;
+    full:       str;
+    data:       *u8;
+    len:        usize;
+    sha:        [65]u8;
+    mode:       u8;
+    has_expect: bool;
+    expect:     [65]u8;
+    exec:       bool;
+    existed:    bool;
+    old:        *u8;
+    old_len:    usize;
+    old_sha:    [65]u8;
+    old_perm:   u32;
+    status:     u8;
+    reason:     str;
+    temp:       str;
+    done:       bool;
+    lang:       str;
+    check:      u8;
+    ck_line:    i64;
+    ck_col:     i64;
+    ck_msg:     str;
+    notes:      vector.Vector[str];
+    edited:     bool;
+}
+
+# a change set; every string and buffer it holds comes from `a`
+pub rec Set {
+    a:       *A.Allocator;
+    root:    str;
+    items:   vector.Vector[Entry];
+    durable: bool;
+}
+
+# what publish achieved
+pub rec Outcome {
+    ok:    bool;
+    code:  str;
+    msg:   str;
+    index: i64;
+}
+
+# the workspace lock
+pub rec Lock {
+    fd:   usize;
+    held: bool;
+}
+
+pub fun hash_hex(data: *u8, n: usize, out: *u8) {
+    var dig: [32]u8;
+    var empty: [1]u8;
+    var p: *u8 = data;
+    if (p == nil) { p = ?empty[0]; }
+    sha256.hash(p, n, ?dig[0]);
+    util.fmt_hex(out, 65, ?dig[0], 32);
+}
+
+pub fun init(a: *A.Allocator, root: str) Set {
+    var s: Set;
+    s.a = a;
+    s.root = root;
+    s.items = vector.init[Entry](a);
+    ret s;
+}
+
+pub fun count(set: *Set) usize {
+    ret set.items.len;
+}
+
+pub fun entry(set: *Set, i: usize) *Entry {
+    ret ?set.items.data[i];
+}
+
+# add a change; rel must already pass pathx.check and be canonical
+pub fun add(set: *Set, rel: str, data: *u8, n: usize, mode: u8) res[usize, A.Error] {
+    var e: Entry;
+    e.rel = rel;
+    val full: res[str, A.Error] = pathx.native(set.a, set.root, rel);
+    if (sel full.err) { ret res[usize, A.Error].err{full.err}; }
+    e.full = full.ok;
+    e.data = data;
+    e.len = n;
+    e.mode = mode;
+    e.notes = vector.init[str](set.a);
+    if (mode != MODE_DELETE) { hash_hex(data, n, ?e.sha[0]); }
+    val pushed: res[usize, A.Error] = vector.push[Entry](?set.items, e);
+    if (sel pushed.err) { ret res[usize, A.Error].err{pushed.err}; }
+    ret res[usize, A.Error].ok{set.items.len - 1};
+}
+
+fun is_hex(c: u8) bool {
+    ret (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+}
+
+# record the hash the current file must have; false unless it is 64 hex digits
+pub fun set_expect(e: *Entry, hex: str) bool {
+    if (hex == nil || str_len(hex) != 64) { ret false; }
+    var i: usize = 0;
+    for (i < 64) {
+        val c: u8 = hex[i];
+        if (!is_hex(c)) { ret false; }
+        if (c >= 'A' && c <= 'F') { e.expect[i] = c + 32; }
+        or { e.expect[i] = c; }
+        i = i + 1;
+    }
+    e.expect[64] = 0;
+    e.has_expect = true;
+    ret true;
+}
+
+# attach an advisory line that the file's receipt reports
+pub fun note(e: *Entry, msg: str) {
+    vector.push[str](?e.notes, msg);
+}
+
+# 0 absent, 1 regular file, 2 directory, 3 link or other, -1 unreadable
+fun probe(p: str, perm: *u32) i64 {
+    val m: res[filesystem.Metadata, io_error.Error] = filesystem.metadata_link(p);
+    if (sel m.err) {
+        if (m.err.kind == io_error.NOT_FOUND || m.err.kind == io_error.NOT_DIRECTORY) { ret 0; }
+        ret -1;
+    }
+    if (perm != nil) { @perm = m.ok.mode; }
+    if (m.ok.kind == filesystem.KIND_FILE) { ret 1; }
+    if (m.ok.kind == filesystem.KIND_DIR) { ret 2; }
+    ret 3;
+}
+
+# why an ancestor makes the path unusable, or nil when every ancestor is a real directory or absent
+fun ancestry(set: *Set, rel: str) str {
+    val n: usize = str_len(rel);
+    var i: usize = 0;
+    for (i < n) {
+        if (rel[i] == '/') {
+            val prefix: res[str, A.Error] = util.dup_n(set.a, rel, i);
+            if (sel prefix.err) { ret "oom"; }
+            val p: res[str, A.Error] = pathx.native(set.a, set.root, prefix.ok);
+            if (sel p.err) { ret "oom"; }
+            val k: i64 = probe(p.ok, nil);
+            if (k == 0) { ret nil; }
+            if (k == 3) { ret "path_link"; }
+            if (k == 1) { ret "path_not_dir"; }
+            if (k == -1) { ret "path_unreadable"; }
+        }
+        i = i + 1;
+    }
+    ret nil;
+}
+
+fun conflict(e: *Entry, why: str) {
+    e.status = ST_CONFLICT;
+    e.reason = why;
+}
+
+fun decide(e: *Entry) {
+    if (e.mode == MODE_DELETE) {
+        if (!e.existed) {
+            conflict(e, "missing");
+            ret;
+        }
+        if (e.has_expect && !util.eq(?e.expect[0], ?e.old_sha[0])) {
+            conflict(e, "stale");
+            ret;
+        }
+        e.status = ST_DELETE;
+        ret;
+    }
+    if (!e.existed) {
+        if (e.mode == MODE_REPLACE || e.has_expect) {
+            conflict(e, "missing");
+            ret;
+        }
+        e.status = ST_CREATE;
+        ret;
+    }
+    if (util.eq(?e.sha[0], ?e.old_sha[0])) {
+        e.status = ST_UNCHANGED;
+        ret;
+    }
+    if (e.mode == MODE_CREATE) {
+        conflict(e, "exists");
+        ret;
+    }
+    if (e.has_expect && !util.eq(?e.expect[0], ?e.old_sha[0])) {
+        conflict(e, "stale");
+        ret;
+    }
+    e.status = ST_REPLACE;
+}
+
+# read the disk for every entry and decide what publishing it would do
+pub fun observe(set: *Set) {
+    var i: usize = 0;
+    for (i < set.items.len) {
+        val e: *Entry = ?set.items.data[i];
+        e.status = ST_PENDING;
+        e.reason = nil;
+        e.existed = false;
+        e.old = nil;
+        e.old_len = 0;
+        e.old_sha[0] = 0;
+        val bad: str = ancestry(set, e.rel);
+        if (bad != nil) { conflict(e, bad); }
+        or {
+            var perm: u32 = 0;
+            val k: i64 = probe(e.full, ?perm);
+            if (k == 2) { conflict(e, "path_is_dir"); }
+            or (k == 3) { conflict(e, "path_link"); }
+            or (k == -1) { conflict(e, "path_unreadable"); }
+            or {
+                if (k == 1) {
+                    val got: res[vector.Vector[u8], filesystem.FsError] = filesystem.read_bytes(set.a, e.full);
+                    if (sel got.ok) {
+                        e.existed = true;
+                        e.old = got.ok.data;
+                        e.old_len = got.ok.len;
+                        e.old_perm = perm;
+                        hash_hex(e.old, e.old_len, ?e.old_sha[0]);
+                    }
+                    or { conflict(e, "path_unreadable"); }
+                }
+                if (e.status != ST_CONFLICT) { decide(e); }
+            }
+        }
+        i = i + 1;
+    }
+}
+
+# how many entries are in a status
+pub fun tally(set: *Set, st: u8) i64 {
+    var n: i64 = 0;
+    var i: usize = 0;
+    for (i < set.items.len) {
+        if (set.items.data[i].status == st) { n = n + 1; }
+        i = i + 1;
+    }
+    ret n;
+}
+
+# true when publishing would change the disk
+pub fun dirty(set: *Set) bool {
+    ret tally(set, ST_CREATE) + tally(set, ST_REPLACE) + tally(set, ST_DELETE) > 0;
+}
+
+# take the workspace lock: 0 held, 1 still busy after timeout_ms, 2 failed
+pub fun lock(set: *Set, timeout_ms: i64, out: *Lock) i64 {
+    out.held = false;
+    val dir: res[str, A.Error] = pathx.native(set.a, set.root, ".qark");
+    if (sel dir.err) { ret 2; }
+    val made: err[filesystem.FsError] = filesystem.create_dir_all(set.a, dir.ok, 493);
+    if (sel made.err) { ret 2; }
+    val lp: res[str, A.Error] = pathx.native(set.a, set.root, ".qark/lock");
+    if (sel lp.err) { ret 2; }
+    var h: usize = os.INVALID_HANDLE;
+    val raw: i64 = os.open(os.working_dir(), lp.ok, os.O_CREAT | os.O_RDWR, 384, ?h);
+    if (raw < 0) { ret 2; }
+    val start: time.InstantClock = time.instant();
+    var wait_ns: i64 = 500000;
+    for {
+        val got: i64 = os.lock_fd(h, os.LOCK_EX | os.LOCK_NB);
+        if (got >= 0) {
+            out.fd = h;
+            out.held = true;
+            ret 0;
+        }
+        if (os.error_kind(got) != io_error.WOULD_BLOCK && os.error_kind(got) != io_error.BUSY) {
+            os.close(h);
+            ret 2;
+        }
+        if (sel start.ok) {
+            val el: time.Elapsed = time.elapsed(start.ok);
+            if (sel el.ok && duration.duration_msec(el.ok) >= timeout_ms) {
+                os.close(h);
+                ret 1;
+            }
+        }
+        os.sleep(wait_ns);
+        if (wait_ns < 16000000) { wait_ns = wait_ns * 2; }
+    }
+    ret 2;
+}
+
+pub fun unlock(l: *Lock) {
+    if (!l.held) { ret; }
+    os.lock_fd(l.fd, os.LOCK_UN);
+    os.close(l.fd);
+    l.held = false;
+}
+
+fun write_all(h: usize, data: *u8, n: usize) bool {
+    val f: filesystem.File = filesystem.File{handle: io_handle.FileHandle{value: h}};
+    var off: usize = 0;
+    for (off < n) {
+        val wr: res[usize, io_error.Error] = filesystem.write(f, (data::usize + off)::*u8, n - off);
+        if (sel wr.err) { ret false; }
+        if (wr.ok == 0) { ret false; }
+        off = off + wr.ok;
+    }
+    ret true;
+}
+
+fun temp_beside(set: *Set, full: str) res[str, A.Error] {
+    val parent: res[str, A.Error] = path.parent(set.a, full);
+    if (sel parent.err) { ret parent; }
+    var rnd: [8]u8;
+    rand.fill(?rnd[0], 8);
+    var name: [32]u8;
+    name[0] = '.';
+    name[1] = 'q';
+    name[2] = 'a';
+    name[3] = 'r';
+    name[4] = 'k';
+    name[5] = '-';
+    util.fmt_hex(?name[6], 17, ?rnd[0], 8);
+    name[22] = '.';
+    name[23] = 't';
+    name[24] = 'm';
+    name[25] = 'p';
+    name[26] = 0;
+    ret path.join(set.a, parent.ok, ?name[0]);
+}
+
+fun perm_for(e: *Entry) i32 {
+    if (e.exec) { ret 493; }
+    if (e.existed) {
+        val p: i32 = (e.old_perm & 511)::i32;
+        if (p != 0) { ret p; }
+    }
+    ret 420;
+}
+
+fun stage(set: *Set, e: *Entry) bool {
+    val parent: res[str, A.Error] = path.parent(set.a, e.full);
+    if (sel parent.err) { ret false; }
+    val made: err[filesystem.FsError] = filesystem.create_dir_all(set.a, parent.ok, 493);
+    if (sel made.err) { ret false; }
+    var attempt: i64 = 0;
+    for (attempt < 8) {
+        val tmp: res[str, A.Error] = temp_beside(set, e.full);
+        if (sel tmp.err) { ret false; }
+        var h: usize = os.INVALID_HANDLE;
+        val raw: i64 = os.open(os.working_dir(), tmp.ok, os.O_CREAT | os.O_EXCL | os.O_WRONLY, perm_for(e), ?h);
+        if (raw >= 0) {
+            val wrote: bool = write_all(h, e.data, e.len);
+            var synced: bool = true;
+            if (wrote && set.durable) {
+                val sy: err[io_error.Error] = filesystem.sync(filesystem.File{handle: io_handle.FileHandle{value: h}});
+                if (sel sy.err) { synced = false; }
+            }
+            os.close(h);
+            if (!wrote || !synced) {
+                filesystem.remove_file(tmp.ok);
+                ret false;
+            }
+            e.temp = tmp.ok;
+            ret true;
+        }
+        if (os.error_kind(raw) != io_error.EXISTS) { ret false; }
+        attempt = attempt + 1;
+    }
+    ret false;
+}
+
+fun drop_temps(set: *Set) {
+    var i: usize = 0;
+    for (i < set.items.len) {
+        val e: *Entry = ?set.items.data[i];
+        if (e.temp != nil && !e.done) {
+            filesystem.remove_file(e.temp);
+            e.temp = nil;
+        }
+        i = i + 1;
+    }
+}
+
+fun restore(set: *Set, e: *Entry) {
+    if (e.status == ST_CREATE) {
+        filesystem.remove_file(e.full);
+        ret;
+    }
+    if (e.status == ST_REPLACE || e.status == ST_DELETE) {
+        var perm: i32 = (e.old_perm & 511)::i32;
+        if (perm == 0) { perm = 420; }
+        filesystem.replace_bytes_atomic(set.a, e.full, e.old, e.old_len, perm, 493);
+    }
+}
+
+fun failed(code: str, msg: str, index: usize) Outcome {
+    var out: Outcome;
+    out.ok = false;
+    out.code = code;
+    out.msg = msg;
+    out.index = index::i64;
+    ret out;
+}
+
+# publish every planned change; the caller holds the lock and observed just before
+pub fun publish(set: *Set) Outcome {
+    var i: usize = 0;
+    for (i < set.items.len) {
+        val e: *Entry = ?set.items.data[i];
+        e.done = false;
+        e.temp = nil;
+        i = i + 1;
+    }
+    i = 0;
+    for (i < set.items.len) {
+        val e: *Entry = ?set.items.data[i];
+        if (e.status == ST_CREATE || e.status == ST_REPLACE) {
+            if (!stage(set, e)) {
+                drop_temps(set);
+                ret failed("io_stage", "could not stage a temporary file beside the destination; nothing was published", i);
+            }
+        }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < set.items.len) {
+        val e: *Entry = ?set.items.data[i];
+        var broke: bool = false;
+        if (e.status == ST_CREATE || e.status == ST_REPLACE) {
+            val mv: err[io_error.Error] = filesystem.rename(e.temp, e.full);
+            if (sel mv.err) { broke = true; }
+            or { e.done = true; }
+        }
+        or (e.status == ST_DELETE) {
+            val rm: err[io_error.Error] = filesystem.remove_file(e.full);
+            if (sel rm.err) { broke = true; }
+            or { e.done = true; }
+        }
+        if (broke) {
+            var j: usize = i;
+            for (j > 0) {
+                j = j - 1;
+                val d: *Entry = ?set.items.data[j];
+                if (d.done) {
+                    restore(set, d);
+                    d.done = false;
+                }
+            }
+            drop_temps(set);
+            ret failed("io_commit", "a file could not be published (is it open in another program?); files already published by this call were restored", i);
+        }
+        i = i + 1;
+    }
+    var ok: Outcome;
+    ok.ok = true;
+    ok.index = -1;
+    ret ok;
+}
+
+# append one line to .qark/journal.ndjson under the held lock; returns the byte offset it starts at, or -1
+pub fun journal(set: *Set, line: *u8, n: usize) i64 {
+    val p: res[str, A.Error] = pathx.native(set.a, set.root, ".qark/journal.ndjson");
+    if (sel p.err) { ret -1; }
+    var offset: i64 = 0;
+    val m: res[filesystem.Metadata, io_error.Error] = filesystem.metadata(p.ok);
+    if (sel m.ok) { offset = m.ok.size::i64; }
+    var h: usize = os.INVALID_HANDLE;
+    val raw: i64 = os.open(os.working_dir(), p.ok, os.O_CREAT | os.O_WRONLY | os.O_APPEND, 420, ?h);
+    if (raw < 0) { ret -1; }
+    val ok: bool = write_all(h, line, n);
+    os.close(h);
+    if (!ok) { ret -1; }
+    ret offset;
+}
+
+pub fun status_name(st: u8) str {
+    if (st == ST_CREATE) { ret "created"; }
+    if (st == ST_REPLACE) { ret "replaced"; }
+    if (st == ST_UNCHANGED) { ret "unchanged"; }
+    if (st == ST_DELETE) { ret "deleted"; }
+    if (st == ST_CONFLICT) { ret "conflict"; }
+    ret "pending";
+}
+
+# what a dry run reports for the same status
+pub fun plan_name(st: u8) str {
+    if (st == ST_CREATE) { ret "would_create"; }
+    if (st == ST_REPLACE) { ret "would_replace"; }
+    if (st == ST_UNCHANGED) { ret "unchanged"; }
+    if (st == ST_DELETE) { ret "would_delete"; }
+    if (st == ST_CONFLICT) { ret "conflict"; }
+    ret "pending";
+}
+
+pub fun reason_message(why: str) str {
+    if (util.eq(why, "exists")) { ret "file exists with different content; use mode replace with expect set to its sha256, or mode upsert"; }
+    if (util.eq(why, "missing")) { ret "file does not exist; use mode create or upsert"; }
+    if (util.eq(why, "stale")) { ret "file changed since its sha256 was read; read it again and resend"; }
+    if (util.eq(why, "path_is_dir")) { ret "a directory is in the way"; }
+    if (util.eq(why, "path_not_dir")) { ret "a parent of the path is a file"; }
+    if (util.eq(why, "path_link")) { ret "the path or a parent is a symbolic link or junction; qark does not write through links"; }
+    if (util.eq(why, "path_unreadable")) { ret "the current file could not be read"; }
+    ret "conflict";
+}
+
+use std.system.capability;
+
+$if (capability.HOSTED) {
+    use page: std.allocator.page;
+    use std.types.string.str_equals;
+
+    fun scratch(a: *A.Allocator) str {
+        val tf: res[filesystem.TempFile, filesystem.FsError] = filesystem.temp_create(a, "qark_commit");
+        if (sel tf.err) { ret nil; }
+        var t: filesystem.TempFile = tf.ok;
+        val p: str = filesystem.temp_path(?t);
+        val copy: res[str, A.Error] = util.dup(a, p);
+        filesystem.temp_close_and_remove(?t);
+        if (sel copy.err) { ret nil; }
+        val made: err[io_error.Error] = filesystem.create_dir(copy.ok, 493);
+        if (sel made.err) { ret nil; }
+        ret copy.ok;
+    }
+
+    test commit__create_unchanged_conflict_replace_delete {
+        var a: A.Allocator;
+        val made: err[A.Error] = page.make(?a);
+        if (sel made.err) { ret 1; }
+        val root: str = scratch(?a);
+        if (root == nil) { ret 2; }
+        var bad: i32 = 0;
+        var s: Set = init(?a, root);
+        add(?s, "sub/a.txt", "one\n", 4, MODE_CREATE);
+        add(?s, "b.txt", "two\n", 4, MODE_CREATE);
+        observe(?s);
+        if (tally(?s, ST_CREATE) != 2) { bad = 3; }
+        var l: Lock;
+        if (bad == 0 && lock(?s, 2000, ?l) != 0) { bad = 4; }
+        if (bad == 0) {
+            val o: Outcome = publish(?s);
+            if (!o.ok) { bad = 5; }
+            unlock(?l);
+        }
+        observe(?s);
+        if (bad == 0 && tally(?s, ST_UNCHANGED) != 2) { bad = 6; }
+
+        var s2: Set = init(?a, root);
+        add(?s2, "b.txt", "TWO\n", 4, MODE_CREATE);
+        observe(?s2);
+        if (bad == 0 && tally(?s2, ST_CONFLICT) != 1) { bad = 7; }
+        if (bad == 0 && !util.eq(entry(?s2, 0).reason, "exists")) { bad = 8; }
+
+        var s3: Set = init(?a, root);
+        add(?s3, "b.txt", "TWO\n", 4, MODE_REPLACE);
+        set_expect(entry(?s3, 0), "0000000000000000000000000000000000000000000000000000000000000000");
+        observe(?s3);
+        if (bad == 0 && !util.eq(entry(?s3, 0).reason, "stale")) { bad = 9; }
+
+        var s4: Set = init(?a, root);
+        add(?s4, "b.txt", "TWO\n", 4, MODE_REPLACE);
+        add(?s4, "sub/a.txt", nil, 0, MODE_DELETE);
+        observe(?s4);
+        if (bad == 0 && (entry(?s4, 0).status != ST_REPLACE || entry(?s4, 1).status != ST_DELETE)) { bad = 10; }
+        if (bad == 0 && lock(?s4, 2000, ?l) == 0) {
+            val o4: Outcome = publish(?s4);
+            if (!o4.ok) { bad = 11; }
+            unlock(?l);
+        }
+        val back: res[str, filesystem.FsError] = filesystem.read_string(?a, entry(?s4, 0).full);
+        if (bad == 0 && !(sel back.ok && str_equals(back.ok, "TWO\n"))) { bad = 12; }
+        val gone: res[bool, io_error.Error] = filesystem.exists(entry(?s4, 1).full);
+        if (bad == 0 && !(sel gone.ok && !gone.ok)) { bad = 13; }
+        filesystem.remove_all(?a, root);
+        ret bad;
+    }
+}

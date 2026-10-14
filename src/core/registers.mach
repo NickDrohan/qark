@@ -1,0 +1,152 @@
+# named, numbered, and unnamed registers, plus the recording buffer
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+
+use A: std.allocator;
+use util: qark.util;
+
+# one register's text
+pub rec Reg {
+    data:     *u8;
+    len:      usize;
+    cap:      usize;
+    linewise: bool;
+}
+
+# the register file
+pub rec Registers {
+    a:         *A.Allocator;
+    unnamed:   Reg;
+    named:     [26]Reg;
+    numbered:  [10]Reg;
+    last:      u8;
+    recording: u8;
+    rec:       Reg;
+}
+
+# an empty register file
+pub fun init(a: *A.Allocator) Registers {
+    var r: Registers;
+    r.a = a;
+    r.last = 0;
+    r.recording = 0;
+    ret r;
+}
+
+fun clear(a: *A.Allocator, r: *Reg) {
+    if (r.data != nil) {
+        A.deallocate[u8](a, r.data, r.cap + 1);
+    }
+    r.data = nil;
+    r.len = 0;
+    r.cap = 0;
+    r.linewise = false;
+}
+
+# release every register
+pub fun dnit(rs: *Registers) {
+    clear(rs.a, ?rs.unnamed);
+    clear(rs.a, ?rs.rec);
+    var i: usize = 0;
+    for (i < 26) {
+        clear(rs.a, ?rs.named[i]);
+        i = i + 1;
+    }
+    i = 0;
+    for (i < 10) {
+        clear(rs.a, ?rs.numbered[i]);
+        i = i + 1;
+    }
+}
+
+fun slot(rs: *Registers, name: u8) *Reg {
+    if (name >= 'a' && name <= 'z') {
+        ret ?rs.named[(name - 'a')::usize];
+    }
+    if (name >= '0' && name <= '9') {
+        ret ?rs.numbered[(name - '0')::usize];
+    }
+    ret ?rs.unnamed;
+}
+
+# replace a register's text; also fills the unnamed register unless name is '"'
+# ---
+# name: '"' or 0 for unnamed, a-z, or 0-9
+# ret:  ok, or the allocator's refusal
+pub fun set(rs: *Registers, name: u8, src: *u8, n: usize, linewise: bool) err[A.Error] {
+    val got: res[str, A.Error] = util.dup_n(rs.a, src, n);
+    if (sel got.err) { ret err[A.Error].err{got.err}; }
+    val dst: *Reg = slot(rs, name);
+    clear(rs.a, dst);
+    dst.data = got.ok;
+    dst.len = n;
+    dst.cap = n;
+    dst.linewise = linewise;
+    if (name >= 'a' && name <= 'z') { rs.last = name; }
+    if (name != '"' && name != 0) {
+        val copy: res[str, A.Error] = util.dup_n(rs.a, src, n);
+        if (sel copy.err) { ret err[A.Error].err{copy.err}; }
+        clear(rs.a, ?rs.unnamed);
+        rs.unnamed.data = copy.ok;
+        rs.unnamed.len = n;
+        rs.unnamed.cap = n;
+        rs.unnamed.linewise = linewise;
+    }
+    ret err[A.Error].ok{};
+}
+
+# borrowed register contents; len receives the byte count
+# ---
+# ret: bytes, or nil when the register is empty
+pub fun get(rs: *Registers, name: u8, len: *usize) *u8 {
+    val dst: *Reg = slot(rs, name);
+    @len = dst.len;
+    ret dst.data;
+}
+
+# whether the register yanks whole lines
+pub fun is_linewise(rs: *Registers, name: u8) bool {
+    ret slot(rs, name).linewise;
+}
+
+# begin recording into a-z; a second call with the same or 0 stops
+# ---
+# name: register letter, or 0 to stop
+# ret:  true when recording state changed
+pub fun record(rs: *Registers, name: u8) bool {
+    if (rs.recording != 0) {
+        val dst: *Reg = slot(rs, rs.recording);
+        clear(rs.a, dst);
+        dst.data = rs.rec.data;
+        dst.len = rs.rec.len;
+        dst.cap = rs.rec.cap;
+        dst.linewise = false;
+        rs.rec.data = nil;
+        rs.rec.len = 0;
+        rs.rec.cap = 0;
+        rs.last = rs.recording;
+        rs.recording = 0;
+        ret true;
+    }
+    if (name < 'a' || name > 'z') { ret false; }
+    clear(rs.a, ?rs.rec);
+    rs.recording = name;
+    ret true;
+}
+
+# append raw bytes to the recording buffer
+pub fun record_bytes(rs: *Registers, src: *u8, n: usize) err[A.Error] {
+    if (rs.recording == 0) { ret err[A.Error].ok{}; }
+    ret util.append(rs.a, ?rs.rec.data, ?rs.rec.len, ?rs.rec.cap, src, n);
+}
+
+# true while a macro is being recorded
+pub fun is_recording(rs: *Registers) bool {
+    ret rs.recording != 0;
+}

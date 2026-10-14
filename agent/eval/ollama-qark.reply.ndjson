@@ -1,0 +1,8 @@
+﻿{"id":1,"ok":true,"result":{"name":"qark","version":"0.1.0"}}
+{"id":2,"ok":true,"result":{"value":110}}
+{"id":3,"ok":true,"result":{"ok":true}}
+{"id":4,"ok":true,"result":{"wrote":true}}
+{"id":5,"ok":true,"result":{"wrote":true}}
+{"id":6,"ok":true,"result":{"wrote":true}}
+{"id":7,"ok":true,"result":{"wrote":true}}
+{"id":0,"ok":false,"error":{"code":"bad","message":"request failed"}}

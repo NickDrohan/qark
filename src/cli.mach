@@ -1,0 +1,307 @@
+# command line: the write layer (apply, validate, templates, mcp, ndjson), the tui, and lisp
+
+use std.data.json;
+use std.filesystem;
+use io_error: std.io.error;
+use std.input;
+use std.print;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_equals;
+use std.types.string.str_len;
+
+use A: std.allocator;
+use heap: std.allocator.heap;
+use ev: qark.vm.eval;
+use printer: qark.vm.printer;
+use vm: qark.vm.value;
+use session: qark.session;
+use jw: qark.rpc.jw;
+use stdio: qark.rpc.stdio;
+use write: qark.rpc.write;
+use ui: qark.ui.app;
+use util: qark.util;
+
+pub val VERSION: str = "0.2.0";
+
+fun arg(argv: **u8, i: i64) str {
+    if (argv == nil || i < 0) { ret nil; }
+    ret argv[i::usize];
+}
+
+fun has(argc: i64, argv: **u8, flag: str) bool {
+    var i: i64 = 1;
+    for (i < argc) {
+        if (str_equals(arg(argv, i), flag)) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+fun value_after(argc: i64, argv: **u8, flag: str) str {
+    var i: i64 = 1;
+    for (i + 1 < argc) {
+        if (str_equals(arg(argv, i), flag)) { ret arg(argv, i + 1); }
+        i = i + 1;
+    }
+    ret nil;
+}
+
+fun help() {
+    print.println("qark 0.2.0 - the write layer for agents, and a modal editor");
+    print.println("  qark mcp [--root DIR]                  model context protocol server on stdio");
+    print.println("  qark --headless --stdio [--root DIR]   ndjson worker on stdio");
+    print.println("  qark apply SPEC|- [--dry-run] [--root DIR]");
+    print.println("                                         apply a json spec ('-' reads stdin); prints the receipt");
+    print.println("  qark validate JOB_DIR [--root DIR]     verify a job against its manifest");
+    print.println("  qark templates [--root DIR]            list templates");
+    print.println("  qark --dump ops|keys|lisp              print a reference");
+    print.println("  qark --script FILE | --repl            qark lisp");
+    print.println("  qark trace export --sft IN OUT         wrap a trace as one chat example");
+    print.println("  qark                                   open the terminal ui");
+    print.println("  qark --version");
+}
+
+fun dump(which: str) {
+    if (str_equals(which, "ops")) {
+        print.println("apply            files, vars, templates, job, dest, run, prune, dry_run, preview, diff, check, tag -> receipt");
+        print.println("read             path | paths, content, lines, outline, max_bytes -> files with sha256 and symbols");
+        print.println("search           pattern?, regex, icase, glob, path, context, max, max_files, all -> matches per file with sha256;");
+        print.println("                 no pattern lists the matching paths");
+        print.println("template.list    name? -> templates with vars, or one template's text");
+        print.println("template.define  name, text | lines, lang, description, persist");
+        print.println("template.render  template | tmpl, vars -> text");
+        print.println("job.verify       dir -> every manifest file checked against its sha256");
+        print.println("session.info     -> version, root, limits, checkers");
+        print.println("file edits       find, find_re (\\0-\\9 captures), lines, insert_before|after (line or anchor), append,");
+        print.println("                 prepend, ex, keys; within scopes them, occurrence picks one, all/count widen");
+        print.println("file move        {path: dst, move: src} -> atomic rename; expect pins the source's sha256");
+        print.println("buf.create buf.set_lines keys.feed cmd.ex eval validate.ident job.write");
+        print.println("receipt          per file: status, sha256, notes[] (normalized eol, ignored keys); top: warnings[]");
+        print.println("                 unchanged carries reason no_change|same_content; not-found names line and column");
+        print.println("codes            conflict check_failed locked spec_* tmpl_* edit_* path_* too_large io_commit");
+        ret;
+    }
+    if (str_equals(which, "keys")) {
+        print.println("motions: h j k l w b e W B E 0 ^ $ g g G f t F T ; , % { }");
+        print.println("operators: d c y > < = g~ gu gU x r ~ J p P . u");
+        print.println("objects: iw aw i\" a\" i( a( i{ a{ ip ap it at");
+        print.println("insert: i a I A o O   visual: v V   command: :");
+        print.println("macros: q {reg} ... q    @{reg}");
+        ret;
+    }
+    print.println("special: quote if begin let lambda def defmacro quasiquote");
+    print.println("builtin: + - * / cons car cdr list null? not eq? < str-len gc type-of");
+    print.println("prelude: when unless defun for-each");
+}
+
+fun repl(s: *session.Session) i64 {
+    print.println("qark lisp  (empty line leaves)");
+    var buf: [1024]u8;
+    for {
+        val n: res[usize, input.InputError] = input.read_line(?buf[0], 1024);
+        if (sel n.err) { ret 0; }
+        if (n.ok == 0) { ret 0; }
+        val value: res[u32, vm.VmError] = ev.eval_src(?s.vm, ?buf[0]);
+        if (sel value.err) { print.println("error"); }
+        if (sel value.ok) {
+            val shown: res[str, A.Error] = printer.print(?s.vm, value.ok);
+            if (sel shown.ok) {
+                print.println(shown.ok);
+                util.free(s.a, shown.ok);
+            }
+        }
+    }
+    ret 0;
+}
+
+fun export_sft(a: *A.Allocator, inn: str, out: str) i64 {
+    val text: res[str, filesystem.FsError] = filesystem.read_string(a, inn);
+    if (sel text.err) { ret 1; }
+    var w: jw.Jw = jw.init(a);
+    jw.raw(?w, "{\"messages\":[{\"role\":\"user\",\"content\":\"qark task\"},{\"role\":\"assistant\",\"content\":");
+    jw.quoted(?w, text.ok, str_len(text.ok));
+    jw.raw(?w, "}]}\n");
+    if (w.failed) { ret 1; }
+    val wr: err[filesystem.FsError] = filesystem.write_bytes(out, w.buf, w.len, 420);
+    if (sel wr.err) { ret 1; }
+    ret 0;
+}
+
+fun read_stdin(a: *A.Allocator, out: **u8, n: *usize) bool {
+    var buf: *u8 = nil;
+    var len: usize = 0;
+    var cap: usize = 0;
+    var chunk: [65536]u8;
+    for {
+        val rd: res[usize, io_error.Error] = filesystem.read(filesystem.STDIN, ?chunk[0], 65536);
+        if (sel rd.err) { brk; }
+        if (rd.ok == 0) { brk; }
+        val ap: err[A.Error] = util.append(a, ?buf, ?len, ?cap, ?chunk[0], rd.ok);
+        if (sel ap.err) { ret false; }
+    }
+    if (buf == nil) { ret false; }
+    @out = buf;
+    @n = len;
+    ret true;
+}
+
+# print {"ok":true,"result":...} or {"ok":false,"error":...} and return the exit status
+fun emit(w: *jw.Jw, ok: bool) i64 {
+    var out: jw.Jw = jw.init(w.a);
+    if (ok) { jw.raw(?out, "{\"ok\":true,\"result\":"); }
+    or { jw.raw(?out, "{\"ok\":false,\"error\":"); }
+    jw.raw(?out, jw.text(w));
+    jw.raw(?out, "}");
+    print.println(jw.text(?out));
+    if (ok) { ret 0; }
+    ret 1;
+}
+
+fun apply_file(s: *session.Session, src: str, dry: bool) i64 {
+    var text: *u8 = nil;
+    var n: usize = 0;
+    if (str_equals(src, "-")) {
+        if (!read_stdin(?s.ra, ?text, ?n)) {
+            print.println("{\"ok\":false,\"error\":{\"code\":\"spec_missing\",\"message\":\"no spec on stdin\"}}");
+            ret 2;
+        }
+    }
+    or {
+        val got: res[str, filesystem.FsError] = filesystem.read_string(?s.ra, src);
+        if (sel got.err) {
+            print.println("{\"ok\":false,\"error\":{\"code\":\"spec_missing\",\"message\":\"the spec file could not be read\"}}");
+            ret 2;
+        }
+        text = got.ok;
+        n = str_len(got.ok);
+    }
+    if (n >= 3 && text[0] == 239 && text[1] == 187 && text[2] == 191) {
+        text = (text::usize + 3)::*u8;
+        n = n - 3;
+    }
+    val parsed: res[json.Value, json.JsonError] = json.parse(text, n, ?s.ra);
+    if (sel parsed.err) {
+        print.println("{\"ok\":false,\"error\":{\"code\":\"spec_json\",\"message\":\"the spec is not valid json\"}}");
+        ret 2;
+    }
+    var doc: json.Value = parsed.ok;
+    s.force_dry = dry;
+    var w: jw.Jw = jw.init(?s.ra);
+    val ok: bool = write.apply(s, ?doc, ?w);
+    ret emit(?w, ok);
+}
+
+# parse argv and run the chosen mode
+pub fun run(argc: i64, argv: **u8) i64 {
+    if (has(argc, argv, "--version")) {
+        print.println(VERSION);
+        ret 0;
+    }
+    if (has(argc, argv, "--help") || has(argc, argv, "-h")) {
+        help();
+        ret 0;
+    }
+    val dumped: str = value_after(argc, argv, "--dump");
+    if (dumped != nil) {
+        dump(dumped);
+        ret 0;
+    }
+    var src: heap.Source;
+    var hp: heap.Heap;
+    var a: A.Allocator;
+    heap.native_source(?src);
+    val hinit: err[A.Error] = heap.init(?hp, ?src, 67108864);
+    if (sel hinit.err) { ret 1; }
+    val made: err[A.Error] = heap.make(?a, ?hp);
+    if (sel made.err) { ret 1; }
+    if (argc >= 4 && str_equals(arg(argv, 1), "trace") && str_equals(arg(argv, 2), "export")) {
+        val inn: str = value_after(argc, argv, "--sft");
+        var out: str = nil;
+        if (inn != nil) {
+            var i: i64 = 1;
+            for (i + 1 < argc) {
+                if (str_equals(arg(argv, i), inn)) { out = arg(argv, i + 1); }
+                i = i + 1;
+            }
+        }
+        if (inn == nil || out == nil) { ret 1; }
+        ret export_sft(?a, inn, out);
+    }
+    val opened: res[session.Session, A.Error] = session.open(?a);
+    if (sel opened.err) { ret 1; }
+    var s: session.Session = opened.ok;
+    session.bind(?s);
+    val root: str = value_after(argc, argv, "--root");
+    if (root != nil && !session.set_root(?s, root)) {
+        print.eprintln("qark: --root is not a directory");
+        session.close(?s);
+        ret 2;
+    }
+    val word: str = arg(argv, 1);
+    if (argc >= 2 && str_equals(word, "mcp")) {
+        session.headless(?s);
+        val code: i64 = stdio.serve(?s, true);
+        session.close(?s);
+        ret code;
+    }
+    if (has(argc, argv, "--headless") || has(argc, argv, "--stdio")) {
+        session.headless(?s);
+        val code: i64 = stdio.serve(?s, false);
+        session.close(?s);
+        ret code;
+    }
+    if (argc >= 3 && str_equals(word, "apply")) {
+        session.headless(?s);
+        session.begin_request(?s);
+        val code: i64 = apply_file(?s, arg(argv, 2), has(argc, argv, "--dry-run"));
+        session.close(?s);
+        ret code;
+    }
+    if (argc >= 3 && (str_equals(word, "validate") || str_equals(word, "verify"))) {
+        session.begin_request(?s);
+        var w: jw.Jw = jw.init(?s.ra);
+        var matched: bool = false;
+        val ok: bool = write.verify(?s, arg(argv, 2), ?w, ?matched);
+        var code: i64 = emit(?w, ok);
+        if (code == 0 && !matched) { code = 1; }
+        session.close(?s);
+        ret code;
+    }
+    if (argc >= 2 && str_equals(word, "templates")) {
+        session.begin_request(?s);
+        var w: jw.Jw = jw.init(?s.ra);
+        var empty: json.Value;
+        empty.kind = json.OBJECT;
+        val ok: bool = write.templates(?s, ?empty, ?w);
+        val code: i64 = emit(?w, ok);
+        session.close(?s);
+        ret code;
+    }
+    val script: str = value_after(argc, argv, "--script");
+    if (script != nil) {
+        val text: res[str, filesystem.FsError] = filesystem.read_string(?a, script);
+        if (sel text.err) {
+            session.close(?s);
+            ret 1;
+        }
+        val value: res[u32, vm.VmError] = ev.eval_src(?s.vm, text.ok);
+        util.free(?a, text.ok);
+        session.close(?s);
+        if (sel value.err) { ret 1; }
+        ret 0;
+    }
+    if (has(argc, argv, "--repl")) {
+        val code: i64 = repl(?s);
+        session.close(?s);
+        ret code;
+    }
+    val code: i64 = ui.run(?s);
+    session.close(?s);
+    ret code;
+}

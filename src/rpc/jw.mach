@@ -1,0 +1,324 @@
+# compact json text built in place, with comma bookkeeping and sticky failure
+
+use std.data.json;
+use std.io.writer;
+use std.io.writer.WriteError;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+
+use A: std.allocator;
+use util: qark.util;
+
+val MAX_DEPTH: usize = 64;
+
+# one json document under construction
+# ---
+# started: per depth, 1 once the container holds an item
+# keyed:   a key was written and its value is next
+# failed:  an allocation failed; every later write is dropped
+pub rec Jw {
+    a:       *A.Allocator;
+    buf:     *u8;
+    len:     usize;
+    cap:     usize;
+    depth:   usize;
+    started: [64]u8;
+    keyed:   bool;
+    failed:  bool;
+}
+
+pub fun init(a: *A.Allocator) Jw {
+    var w: Jw;
+    w.a = a;
+    ret w;
+}
+
+pub fun dnit(w: *Jw) {
+    if (w.buf != nil) { A.deallocate[u8](w.a, w.buf, w.cap + 1); }
+    w.buf = nil;
+    w.len = 0;
+    w.cap = 0;
+    w.depth = 0;
+    w.keyed = false;
+    w.failed = false;
+}
+
+# forget the text but keep the storage
+pub fun clear(w: *Jw) {
+    w.len = 0;
+    w.depth = 0;
+    w.keyed = false;
+    w.failed = false;
+    if (w.buf != nil) { w.buf[0] = 0; }
+}
+
+pub fun bytes(w: *Jw, p: *u8, n: usize) {
+    if (w.failed || n == 0) { ret; }
+    val ap: err[A.Error] = util.append(w.a, ?w.buf, ?w.len, ?w.cap, p, n);
+    if (sel ap.err) { w.failed = true; }
+}
+
+pub fun raw(w: *Jw, s: str) {
+    if (s == nil) { ret; }
+    bytes(w, s, str_len(s));
+}
+
+pub fun byte(w: *Jw, b: u8) {
+    var one: [1]u8;
+    one[0] = b;
+    bytes(w, ?one[0], 1);
+}
+
+fun value_sep(w: *Jw) {
+    if (w.keyed) {
+        w.keyed = false;
+        ret;
+    }
+    if (w.depth == 0) { ret; }
+    if (w.started[w.depth] != 0) { byte(w, ','); }
+    w.started[w.depth] = 1;
+}
+
+fun open(w: *Jw) {
+    if (w.depth + 1 >= MAX_DEPTH) {
+        w.failed = true;
+        ret;
+    }
+    w.depth = w.depth + 1;
+    w.started[w.depth] = 0;
+}
+
+fun close(w: *Jw, b: u8) {
+    if (w.depth > 0) { w.depth = w.depth - 1; }
+    byte(w, b);
+}
+
+fun hex_digit(n: u8) u8 {
+    if (n < 10) { ret '0' + n; }
+    ret 'a' + n - 10;
+}
+
+# a quoted json string with '"', '\', and control bytes escaped; other bytes pass
+pub fun quoted(w: *Jw, p: *u8, n: usize) {
+    byte(w, '"');
+    var i: usize = 0;
+    var run: usize = 0;
+    for (i < n) {
+        val c: u8 = p[i];
+        var esc: u8 = 0;
+        if (c == '"') { esc = '"'; }
+        or (c == '\\') { esc = '\\'; }
+        or (c == '\n') { esc = 'n'; }
+        or (c == '\r') { esc = 'r'; }
+        or (c == '\t') { esc = 't'; }
+        or (c < 0x20 || c == 0x7f) { esc = 'u'; }
+        if (esc != 0) {
+            if (i > run) { bytes(w, (p::usize + run)::*u8, i - run); }
+            if (esc == 'u') {
+                var u: [6]u8;
+                u[0] = '\\';
+                u[1] = 'u';
+                u[2] = '0';
+                u[3] = '0';
+                u[4] = hex_digit(c >> 4);
+                u[5] = hex_digit(c & 15);
+                bytes(w, ?u[0], 6);
+            }
+            or {
+                var two: [2]u8;
+                two[0] = '\\';
+                two[1] = esc;
+                bytes(w, ?two[0], 2);
+            }
+            run = i + 1;
+        }
+        i = i + 1;
+    }
+    if (n > run) { bytes(w, (p::usize + run)::*u8, n - run); }
+    byte(w, '"');
+}
+
+pub fun obj(w: *Jw) {
+    value_sep(w);
+    byte(w, '{');
+    open(w);
+}
+
+pub fun obj_end(w: *Jw) {
+    close(w, '}');
+}
+
+pub fun arr(w: *Jw) {
+    value_sep(w);
+    byte(w, '[');
+    open(w);
+}
+
+pub fun arr_end(w: *Jw) {
+    close(w, ']');
+}
+
+pub fun key(w: *Jw, k: str) {
+    value_sep(w);
+    quoted(w, k, str_len(k));
+    byte(w, ':');
+    w.keyed = true;
+}
+
+pub fun str_v(w: *Jw, s: str) {
+    value_sep(w);
+    if (s == nil) {
+        raw(w, "null");
+        ret;
+    }
+    quoted(w, s, str_len(s));
+}
+
+pub fun str_n(w: *Jw, p: *u8, n: usize) {
+    value_sep(w);
+    quoted(w, p, n);
+}
+
+# a string whose bytes are already json-escaped, such as a parsed value's raw form
+pub fun wire_str(w: *Jw, p: *u8, n: usize) {
+    value_sep(w);
+    byte(w, '"');
+    bytes(w, p, n);
+    byte(w, '"');
+}
+
+pub fun i64_v(w: *Jw, n: i64) {
+    value_sep(w);
+    var num: [32]u8;
+    val k: usize = util.fmt_i64(?num[0], 32, n);
+    bytes(w, ?num[0], k);
+}
+
+fun sink_write(ctx: ptr, p: *u8, n: usize) res[usize, WriteError] {
+    val w: *Jw = ctx::*Jw;
+    bytes(w, p, n);
+    ret res[usize, WriteError].ok{n};
+}
+
+# a float in json's shortest round-trip form, without comma handling
+pub fun float(w: *Jw, f: f64) {
+    var sink: writer.Writer = writer.Writer{ctx: w::ptr, f_write: sink_write};
+    json.value_f64(?sink, f);
+}
+
+pub fun bool_v(w: *Jw, b: bool) {
+    value_sep(w);
+    if (b) { raw(w, "true"); }
+    or { raw(w, "false"); }
+}
+
+pub fun null_v(w: *Jw) {
+    value_sep(w);
+    raw(w, "null");
+}
+
+# one complete json value written verbatim
+pub fun raw_v(w: *Jw, s: str) {
+    value_sep(w);
+    raw(w, s);
+}
+
+pub fun raw_vn(w: *Jw, p: *u8, n: usize) {
+    value_sep(w);
+    bytes(w, p, n);
+}
+
+# microseconds written as milliseconds with three decimals
+pub fun ms_v(w: *Jw, us: i64) {
+    value_sep(w);
+    var x: i64 = us;
+    if (x < 0) { x = 0; }
+    var num: [32]u8;
+    val k: usize = util.fmt_i64(?num[0], 32, x / 1000);
+    bytes(w, ?num[0], k);
+    var frac: [4]u8;
+    val f: i64 = x % 1000;
+    frac[0] = '.';
+    frac[1] = '0' + (f / 100)::u8;
+    frac[2] = '0' + ((f / 10) % 10)::u8;
+    frac[3] = '0' + (f % 10)::u8;
+    bytes(w, ?frac[0], 4);
+}
+
+pub fun f_str(w: *Jw, k: str, s: str) {
+    key(w, k);
+    str_v(w, s);
+}
+
+pub fun f_strn(w: *Jw, k: str, p: *u8, n: usize) {
+    key(w, k);
+    str_n(w, p, n);
+}
+
+pub fun f_i64(w: *Jw, k: str, n: i64) {
+    key(w, k);
+    i64_v(w, n);
+}
+
+pub fun f_bool(w: *Jw, k: str, b: bool) {
+    key(w, k);
+    bool_v(w, b);
+}
+
+pub fun f_raw(w: *Jw, k: str, s: str) {
+    key(w, k);
+    raw_v(w, s);
+}
+
+pub fun f_ms(w: *Jw, k: str, us: i64) {
+    key(w, k);
+    ms_v(w, us);
+}
+
+# an exact owned copy of the text
+pub fun take(w: *Jw, a: *A.Allocator) res[str, A.Error] {
+    if (w.failed) { ret res[str, A.Error].err{A.Error.exhausted{}}; }
+    ret util.dup_n(a, w.buf, w.len);
+}
+
+# the text so far, borrowed; "" when empty
+pub fun text(w: *Jw) str {
+    if (w.buf == nil) { ret ""; }
+    ret w.buf;
+}
+
+use std.system.capability;
+
+$if (capability.HOSTED) {
+    use page: std.allocator.page;
+    use std.types.string.str_equals;
+
+    test jw__nested_values_and_escapes {
+        var a: A.Allocator;
+        val made: err[A.Error] = page.make(?a);
+        if (sel made.err) { ret 1; }
+        var w: Jw = init(?a);
+        obj(?w);
+        f_i64(?w, "a", 1);
+        key(?w, "b");
+        arr(?w);
+        bool_v(?w, true);
+        null_v(?w);
+        str_v(?w, "x\"y\n");
+        arr_end(?w);
+        key(?w, "c");
+        obj(?w);
+        obj_end(?w);
+        f_ms(?w, "t", 12345);
+        obj_end(?w);
+        if (!str_equals(text(?w), "{\"a\":1,\"b\":[true,null,\"x\\\"y\\n\"],\"c\":{},\"t\":12.345}")) { ret 2; }
+        dnit(?w);
+        ret 0;
+    }
+}

@@ -1,0 +1,59 @@
+# terminal facade: windows console or a posix stub, plus std.terminal keys
+
+use std.terminal;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.option.opt;
+use std.types.size.usize;
+
+use keys: qark.core.keys;
+
+$if ($mach.build.os == $mach.os.windows) {
+    use impl: qark.term.windows;
+}
+$or {
+    use impl: qark.term.posix;
+}
+
+pub fun enable() bool {
+    val raw: terminal.Operation = terminal.enable_raw();
+    val vt: bool = impl.enable();
+    if (sel raw.err) { ret vt; }
+    ret true;
+}
+
+pub fun disable() {
+    terminal.disable_raw();
+    impl.disable();
+}
+
+pub fun size(cols: *i64, rows: *i64) {
+    impl.size(cols, rows);
+}
+
+pub fun write_str(s: *u8) {
+    impl.write_str(s);
+}
+
+# one non-blocking key, or none
+pub fun poll() opt[keys.Key] {
+    val polled: terminal.Poll = terminal.poll_key_decoded();
+    if (sel polled.err) { ret opt[keys.Key].none{}; }
+    if (!sel polled.ok.some) { ret opt[keys.Key].none{}; }
+    val k: terminal.Key = polled.ok.some;
+    if (terminal.is_byte(k)) {
+        if (k.byte == 27) { ret opt[keys.Key].some{keys.spec_key(keys.SP_ESC, 0)}; }
+        if (k.byte == 13 || k.byte == 10) { ret opt[keys.Key].some{keys.spec_key(keys.SP_CR, 0)}; }
+        if (k.byte == 9) { ret opt[keys.Key].some{keys.spec_key(keys.SP_TAB, 0)}; }
+        if (k.byte == 8 || k.byte == 127) { ret opt[keys.Key].some{keys.spec_key(keys.SP_BS, 0)}; }
+        ret opt[keys.Key].some{keys.byte_key(k.byte)};
+    }
+    if (terminal.is_special(k)) {
+        if (k.special == terminal.KEY_UP) { ret opt[keys.Key].some{keys.spec_key(keys.SP_UP, 0)}; }
+        if (k.special == terminal.KEY_DOWN) { ret opt[keys.Key].some{keys.spec_key(keys.SP_DOWN, 0)}; }
+        if (k.special == terminal.KEY_LEFT) { ret opt[keys.Key].some{keys.spec_key(keys.SP_LEFT, 0)}; }
+        if (k.special == terminal.KEY_RIGHT) { ret opt[keys.Key].some{keys.spec_key(keys.SP_RIGHT, 0)}; }
+    }
+    ret opt[keys.Key].none{};
+}

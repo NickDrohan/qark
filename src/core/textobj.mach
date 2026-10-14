@@ -1,0 +1,275 @@
+# text objects: words, quotes, brackets, paragraphs, tags
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.option.opt;
+
+use motion: qark.core.motion;
+use text: qark.core.text;
+
+# a span [r1,c1) .. [r2,c2) ; linewise ignores columns and covers whole lines
+pub rec Span {
+    r1:       i64;
+    c1:       i64;
+    r2:       i64;
+    c2:       i64;
+    linewise: bool;
+    ok:       bool;
+}
+
+# order two positions into a half-open span
+pub fun from_points(a: motion.Pos, b: motion.Pos, inclusive: bool, linewise: bool) Span {
+    var s: Span;
+    s.ok = true;
+    s.linewise = linewise;
+    var r1: i64 = a.row;
+    var c1: i64 = a.col;
+    var r2: i64 = b.row;
+    var c2: i64 = b.col;
+    if (r2 < r1 || (r2 == r1 && c2 < c1)) {
+        r1 = b.row;
+        c1 = b.col;
+        r2 = a.row;
+        c2 = a.col;
+    }
+    if (inclusive) { c2 = c2 + 1; }
+    if (linewise) {
+        if (r2 < r1) {
+            val t: i64 = r1;
+            r1 = r2;
+            r2 = t;
+        }
+        c1 = 0;
+        c2 = 0;
+        r2 = r2 + 1;
+    }
+    s.r1 = r1;
+    s.c1 = c1;
+    s.r2 = r2;
+    s.c2 = c2;
+    ret s;
+}
+
+fun span_word(t: *text.Text, p: motion.Pos, big: bool, around: bool) Span {
+    var s: Span;
+    var row: i64 = p.row;
+    var col: i64 = p.col;
+    val len: i64 = motion.line_len(t, row);
+    if (col >= len) {
+        if (col > 0) { col = col - 1; }
+        or { ret s; }
+    }
+    val b: u8 = motion.byte_at(t, row, col);
+    var cls: u8 = motion.class_of(b);
+    if (big && cls != motion.CLASS_SPACE) { cls = motion.CLASS_WORD; }
+    if (cls == motion.CLASS_SPACE && !around) { ret s; }
+    var c1: i64 = col;
+    for (c1 > 0) {
+        val prev: u8 = motion.byte_at(t, row, c1 - 1);
+        var pc: u8 = motion.class_of(prev);
+        if (big && pc != motion.CLASS_SPACE) { pc = motion.CLASS_WORD; }
+        if (pc != cls) { brk; }
+        c1 = c1 - 1;
+    }
+    var c2: i64 = col;
+    for (c2 < len) {
+        var pc: u8 = motion.class_of(motion.byte_at(t, row, c2));
+        if (big && pc != motion.CLASS_SPACE) { pc = motion.CLASS_WORD; }
+        if (pc != cls) { brk; }
+        c2 = c2 + 1;
+    }
+    if (around) {
+        for (c2 < len && motion.class_of(motion.byte_at(t, row, c2)) == motion.CLASS_SPACE) {
+            c2 = c2 + 1;
+        }
+        if (c2 == col || (c1 == col && motion.class_of(b) != motion.CLASS_SPACE)) {
+            var k: i64 = c1;
+            for (k > 0 && motion.class_of(motion.byte_at(t, row, k - 1)) == motion.CLASS_SPACE) {
+                k = k - 1;
+            }
+            c1 = k;
+        }
+    }
+    s.ok = true;
+    s.r1 = row;
+    s.c1 = c1;
+    s.r2 = row;
+    s.c2 = c2;
+    ret s;
+}
+
+# `iw` / `aw`; big selects WORDs
+pub fun word(t: *text.Text, p: motion.Pos, big: bool, around: bool) Span {
+    ret span_word(t, p, big, around);
+}
+
+# quote object; around includes the quotes
+pub fun quote(t: *text.Text, p: motion.Pos, q: u8, around: bool) Span {
+    var s: Span;
+    val len: i64 = motion.line_len(t, p.row);
+    var left: i64 = -1;
+    var c: i64 = p.col;
+    if (c >= len && c > 0) { c = c - 1; }
+    for (c >= 0) {
+        if (motion.byte_at(t, p.row, c) == q) {
+            left = c;
+            brk;
+        }
+        c = c - 1;
+    }
+    if (left < 0) { ret s; }
+    var right: i64 = left + 1;
+    for (right < len) {
+        if (motion.byte_at(t, p.row, right) == q) { brk; }
+        right = right + 1;
+    }
+    if (right >= len) { ret s; }
+    s.ok = true;
+    s.r1 = p.row;
+    s.r2 = p.row;
+    if (around) {
+        s.c1 = left;
+        s.c2 = right + 1;
+    }
+    or {
+        s.c1 = left + 1;
+        s.c2 = right;
+    }
+    ret s;
+}
+
+# bracket object for (), [], {}
+pub fun bracket(t: *text.Text, p: motion.Pos, open: u8, close: u8, around: bool) Span {
+    var s: Span;
+    var row: i64 = p.row;
+    var col: i64 = p.col;
+    var depth: i64 = 0;
+    var guard: i64 = 0;
+    var found: bool = false;
+    var lr: i64 = 0;
+    var lc: i64 = 0;
+    for (guard < 100000) {
+        guard = guard + 1;
+        val b: u8 = motion.byte_at(t, row, col);
+        if (b == close) { depth = depth + 1; }
+        if (b == open) {
+            if (depth == 0) {
+                lr = row;
+                lc = col;
+                found = true;
+                brk;
+            }
+            depth = depth - 1;
+        }
+        col = col - 1;
+        if (col < 0) {
+            row = row - 1;
+            if (row < 0) { brk; }
+            col = motion.line_len(t, row) - 1;
+            if (col < 0) { col = 0; }
+        }
+    }
+    if (!found) { ret s; }
+    row = lr;
+    col = lc;
+    depth = 0;
+    guard = 0;
+    for (guard < 100000) {
+        guard = guard + 1;
+        val b: u8 = motion.byte_at(t, row, col);
+        if (b == open) { depth = depth + 1; }
+        if (b == close) {
+            depth = depth - 1;
+            if (depth == 0) {
+                s.ok = true;
+                if (around) {
+                    s.r1 = lr;
+                    s.c1 = lc;
+                    s.r2 = row;
+                    s.c2 = col + 1;
+                }
+                or {
+                    # inside, starting just after the opener
+                    var ir: i64 = lr;
+                    var ic: i64 = lc + 1;
+                    if (ic > motion.line_len(t, ir)) {
+                        ir = ir + 1;
+                        ic = 0;
+                    }
+                    s.r1 = ir;
+                    s.c1 = ic;
+                    s.r2 = row;
+                    s.c2 = col;
+                }
+                ret s;
+            }
+        }
+        col = col + 1;
+        if (col >= motion.line_len(t, row)) {
+            row = row + 1;
+            col = 0;
+            if (row >= text.line_count(t)) { ret s; }
+        }
+    }
+    ret s;
+}
+
+# `ip` / `ap` between blank lines
+pub fun paragraph(t: *text.Text, p: motion.Pos, around: bool) Span {
+    var s: Span;
+    var r1: i64 = p.row;
+    for (r1 > 0 && motion.line_len(t, r1 - 1) != 0) { r1 = r1 - 1; }
+    var r2: i64 = p.row;
+    val last: i64 = text.line_count(t) - 1;
+    for (r2 < last && motion.line_len(t, r2 + 1) != 0) { r2 = r2 + 1; }
+    if (around) {
+        if (r2 < last && motion.line_len(t, r2 + 1) == 0) { r2 = r2 + 1; }
+    }
+    s.ok = true;
+    s.linewise = true;
+    s.r1 = r1;
+    s.r2 = r2 + 1;
+    ret s;
+}
+
+# a simple `<tag>...</tag>` object on one or more lines
+pub fun tag(t: *text.Text, p: motion.Pos, around: bool) Span {
+    var s: Span;
+    val len: i64 = motion.line_len(t, p.row);
+    var i: i64 = 0;
+    var open_at: i64 = -1;
+    for (i < len) {
+        if (motion.byte_at(t, p.row, i) == '<') {
+            val n: u8 = motion.byte_at(t, p.row, i + 1);
+            if (n != '/' && n != 0) { open_at = i; }
+        }
+        i = i + 1;
+    }
+    if (open_at < 0) { ret s; }
+    var close_at: i64 = open_at;
+    for (close_at < len && motion.byte_at(t, p.row, close_at) != '>') { close_at = close_at + 1; }
+    if (close_at >= len) { ret s; }
+    var end: i64 = close_at + 1;
+    for (end < len) {
+        if (motion.byte_at(t, p.row, end) == '<' && motion.byte_at(t, p.row, end + 1) == '/') {
+            var e: i64 = end;
+            for (e < len && motion.byte_at(t, p.row, e) != '>') { e = e + 1; }
+            if (e >= len) { ret s; }
+            s.ok = true;
+            s.r1 = p.row;
+            s.r2 = p.row;
+            if (around) {
+                s.c1 = open_at;
+                s.c2 = e + 1;
+            }
+            or {
+                s.c1 = close_at + 1;
+                s.c2 = end;
+            }
+            ret s;
+        }
+        end = end + 1;
+    }
+    ret s;
+}

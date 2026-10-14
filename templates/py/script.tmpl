@@ -1,0 +1,27 @@
+{{!-- a python 3 command-line script: argparse flags, a main(), and an exit code.
+vars: description; args [{name, help, type, default, required, flag}]; imports [module]; body (main's code, indented for you) --}}
+#!/usr/bin/env python3
+"""{{description}}"""
+import argparse
+{{#if imports}}
+{{#each imports}}
+import {{.}}
+{{/each}}
+{{/if}}
+import sys
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description={{description|py}})
+{{#if args}}
+{{#each args}}
+    parser.add_argument("--{{name|kebab}}"{{#if flag}}, action="store_true"{{/if}}{{#if type}}, type={{type|ident}}{{/if}}{{#if default}}, default={{default|py}}{{/if}}{{#if required}}, required=True{{/if}}, help={{help|default:""|py}})
+{{/each}}
+{{/if}}
+    args = parser.parse_args(argv)
+    {{body|default:"pass"|indent:4}}
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

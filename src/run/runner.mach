@@ -1,0 +1,176 @@
+# run a program as an argv array, with a timeout, optional stdin bytes, and captured output
+#
+# start and finish split one run so several children can work at once: each
+# start fixes its own deadline, and finish waits for that child alone.
+
+use std.chrono.duration;
+use std.chrono.time;
+use std.filesystem;
+use std.process.exec;
+use std.system.os;
+use std.types.path;
+use std.sync.cancel;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+use io_error: std.io.error;
+
+use A: std.allocator;
+use util: qark.util;
+
+# one finished run
+pub rec RunResult {
+    exit:      i64;
+    timed_out: bool;
+    stdout:    str;
+    stderr:    str;
+}
+
+# a started child and the files it writes into
+pub rec Job {
+    child:    exec.Child;
+    out_tf:   filesystem.TempFile;
+    err_tf:   filesystem.TempFile;
+    in_tf:    filesystem.TempFile;
+    has_in:   bool;
+    deadline: opt[time.Instant];
+}
+
+fun empty_result() RunResult {
+    var r: RunResult;
+    ret r;
+}
+
+fun write_all(f: filesystem.File, data: *u8, n: usize) bool {
+    var off: usize = 0;
+    for (off < n) {
+        val wr: res[usize, io_error.Error] = filesystem.write(f, (data::usize + off)::*u8, n - off);
+        if (sel wr.err) { ret false; }
+        if (wr.ok == 0) { ret false; }
+        off = off + wr.ok;
+    }
+    ret true;
+}
+
+fun drop_temps(j: *Job) {
+    filesystem.temp_close_and_remove(?j.out_tf);
+    filesystem.temp_close_and_remove(?j.err_tf);
+    if (j.has_in) { filesystem.temp_close_and_remove(?j.in_tf); }
+}
+
+# start argv[0] with argv, feeding input[0,n) on stdin when input is not nil
+#
+# argv is a null-terminated list and argv[0] must be a resolved program path.
+# timeout_ms <= 0 waits without a deadline. cwd nil inherits the parent directory.
+pub fun start(a: *A.Allocator, argv: **u8, cwd: str, input: *u8, n: usize, timeout_ms: i64, out: *Job) err[exec.Error] {
+    if (argv == nil || argv[0] == nil) { ret err[exec.Error].err{exec.Error.empty_name{}}; }
+    val out_f: res[filesystem.TempFile, filesystem.FsError] = filesystem.temp_create(a, "qarkout");
+    if (sel out_f.err) { ret err[exec.Error].err{exec.Error.alloc{A.Error.exhausted{}}}; }
+    val err_f: res[filesystem.TempFile, filesystem.FsError] = filesystem.temp_create(a, "qarkerr");
+    if (sel err_f.err) {
+        var doomed: filesystem.TempFile = out_f.ok;
+        filesystem.temp_close_and_remove(?doomed);
+        ret err[exec.Error].err{exec.Error.alloc{A.Error.exhausted{}}};
+    }
+    out.out_tf = out_f.ok;
+    out.err_tf = err_f.ok;
+    out.has_in = false;
+    var in_handle: usize = os.INVALID_HANDLE;
+    if (input != nil) {
+        val in_f: res[filesystem.TempFile, filesystem.FsError] = filesystem.temp_create(a, "qarkin");
+        if (sel in_f.err) {
+            drop_temps(out);
+            ret err[exec.Error].err{exec.Error.alloc{A.Error.exhausted{}}};
+        }
+        out.in_tf = in_f.ok;
+        out.has_in = true;
+        if (!write_all(out.in_tf.file, input, n)) {
+            drop_temps(out);
+            ret err[exec.Error].err{exec.Error.alloc{A.Error.exhausted{}}};
+        }
+        filesystem.seek(out.in_tf.file, 0, filesystem.SEEK_SET);
+        in_handle = out.in_tf.file.handle.value;
+    }
+    var dir: str = cwd;
+    if (dir == nil) { dir = ""; }
+    val child: res[exec.Child, exec.Error] = exec.spawn_redirected_in_grouped(
+        argv[0], argv, nil, dir,
+        in_handle,
+        out.out_tf.file.handle.value,
+        out.err_tf.file.handle.value
+    );
+    if (sel child.err) {
+        drop_temps(out);
+        ret err[exec.Error].err{child.err};
+    }
+    out.child = child.ok;
+    out.deadline = opt[time.Instant].none{};
+    if (timeout_ms > 0) {
+        val now: time.InstantClock = time.instant();
+        if (sel now.ok) {
+            out.deadline = opt[time.Instant].some{time.instant_add(now.ok, timeout_ms * duration.MILLISECOND)};
+        }
+    }
+    ret err[exec.Error].ok{};
+}
+
+# wait for a started child, then collect what it wrote
+pub fun finish(a: *A.Allocator, j: *Job) res[RunResult, exec.Error] {
+    var scope: cancel.Scope;
+    val rooted: cancel.Operation = cancel.make_root(?scope, j.deadline);
+    if (sel rooted.err) {
+        exec.terminate_group(j.child);
+        drop_temps(j);
+        ret res[RunResult, exec.Error].err{exec.Error.unsupported{}};
+    }
+    val waited: res[exec.Supervised, exec.Error] = exec.wait_within(j.child, ?scope);
+    cancel.destroy(?scope);
+    filesystem.temp_close(?j.out_tf);
+    filesystem.temp_close(?j.err_tf);
+    if (j.has_in) { filesystem.temp_close(?j.in_tf); }
+    if (sel waited.err) {
+        filesystem.temp_remove(?j.out_tf);
+        filesystem.temp_remove(?j.err_tf);
+        if (j.has_in) { filesystem.temp_remove(?j.in_tf); }
+        ret res[RunResult, exec.Error].err{waited.err};
+    }
+    var result: RunResult = empty_result();
+    result.timed_out = waited.ok.terminated;
+    if (exec.exited(waited.ok.status)) { result.exit = exec.code(waited.ok.status)::i64; }
+    or { result.exit = 1; }
+    val out_s: res[str, filesystem.FsError] = filesystem.read_string(a, filesystem.temp_path(?j.out_tf));
+    if (sel out_s.ok) { result.stdout = out_s.ok; }
+    val err_s: res[str, filesystem.FsError] = filesystem.read_string(a, filesystem.temp_path(?j.err_tf));
+    if (sel err_s.ok) { result.stderr = err_s.ok; }
+    filesystem.temp_remove(?j.out_tf);
+    filesystem.temp_remove(?j.err_tf);
+    if (j.has_in) { filesystem.temp_remove(?j.in_tf); }
+    ret res[RunResult, exec.Error].ok{result};
+}
+
+# start and finish one child
+pub fun run(a: *A.Allocator, argv: **u8, cwd: str, timeout_ms: i64) res[RunResult, exec.Error] {
+    var j: Job;
+    val started: err[exec.Error] = start(a, argv, cwd, nil, 0, timeout_ms, ?j);
+    if (sel started.err) { ret res[RunResult, exec.Error].err{started.err}; }
+    ret finish(a, ?j);
+}
+
+# free captured output
+pub fun dnit(a: *A.Allocator, r: *RunResult) {
+    util.free(a, r.stdout);
+    util.free(a, r.stderr);
+    r.stdout = nil;
+    r.stderr = nil;
+}
+
+# resolve a program name on PATH
+pub fun which(a: *A.Allocator, name: str) res[str, exec.Error] {
+    ret exec.resolve(a, name);
+}

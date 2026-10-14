@@ -1,0 +1,910 @@
+# modal editing loop: normal, insert, visual, and the command line
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_equals;
+use std.types.string.str_len;
+
+use A: std.allocator;
+use buffer: qark.core.buffer;
+use ev: qark.core.event;
+use ex: qark.core.excmd;
+use ft: qark.core.filetype;
+use keys: qark.core.keys;
+use km: qark.core.keymap;
+use macro: qark.core.macro;
+use marks: qark.core.marks;
+use re: qark.core.regex;
+use search: qark.core.search;
+use mode: qark.core.mode;
+use motion: qark.core.motion;
+use op: qark.core.operator;
+use regs: qark.core.registers;
+use snip: qark.core.snippet;
+use text: qark.core.text;
+use obj: qark.core.textobj;
+use util: qark.util;
+
+# callbacks from the host (lisp, jobs, the screen)
+pub rec Hooks {
+    ctx:    *u8;
+    lisp:   fun(*u8, u32) i64;
+    write:  fun(*u8, i64) i64;
+    shell:  fun(*u8, str) i64;
+    source: fun(*u8, str) i64;
+}
+
+# the editor
+pub rec Engine {
+    a:          *A.Allocator;
+    bufs:       buffer.Buffers;
+    regs:       regs.Registers;
+    mode:       u8;
+    count:      i64;
+    count_set:  bool;
+    op:         u8;
+    g:          bool;
+    find_kind:  u8;
+    find_ch:    u8;
+    find_fwd:   bool;
+    find_till:  bool;
+    has_find:   bool;
+    search_pat: str;
+    search_fwd: bool;
+    cmd:        *u8;
+    cmd_len:    usize;
+    cmd_cap:    usize;
+    quit:       bool;
+    shift:      i64;
+    expandtab:  bool;
+    map:        km.Map;
+    events:     ev.Bus;
+    snips:      snip.State;
+    hooks:      Hooks;
+    msg:        str;
+    leader:     u8;
+    play:       i64;
+    dot_op:     u8;
+    dot_motion: u8;
+    dot_arg:    u8;
+    dot_count:  i64;
+    dot_line:   bool;
+    dot_text:   str;
+    has_dot:    bool;
+    ins_text:   str;
+    ins_len:    usize;
+    ins_cap:    usize;
+    pending_src: str;
+    sandbox:    bool;
+    ins_repeat: i64;
+}
+
+# a fresh engine with one empty buffer
+pub fun init(a: *A.Allocator) res[Engine, A.Error] {
+    var e: Engine;
+    e.a = a;
+    e.bufs = buffer.init(a);
+    e.regs = regs.init(a);
+    e.mode = mode.NORMAL;
+    e.map = km.init(a);
+    e.events = ev.init(a);
+    e.snips = snip.init(a);
+    e.shift = 4;
+    e.leader = '\\';
+    e.search_fwd = true;
+    val id: res[i64, A.Error] = buffer.create(?e.bufs, "", "text");
+    if (sel id.err) { ret res[Engine, A.Error].err{id.err}; }
+    ret res[Engine, A.Error].ok{e};
+}
+
+# release the engine
+pub fun dnit(e: *Engine) {
+    buffer.dnit(?e.bufs);
+    regs.dnit(?e.regs);
+    km.dnit(?e.map);
+    ev.dnit(?e.events);
+    snip.dnit(?e.snips);
+    util.free(e.a, e.search_pat);
+    util.free(e.a, e.msg);
+    util.free(e.a, e.dot_text);
+    if (e.ins_text != nil) { A.deallocate[u8](e.a, e.ins_text, e.ins_cap + 1); }
+    if (e.cmd != nil) { A.deallocate[u8](e.a, e.cmd, e.cmd_cap + 1); }
+}
+
+fun cur(e: *Engine) opt[*buffer.Buffer] {
+    ret buffer.current(?e.bufs);
+}
+
+fun count_of(e: *Engine) i64 {
+    if (!e.count_set || e.count < 1) { ret 1; }
+    ret e.count;
+}
+
+# a count above this is refused by name instead of being run short
+pub val MAX_REPEAT: i64 = 10000;
+
+fun say(e: *Engine, s: str) {
+    util.free(e.a, e.msg);
+    val d: res[str, A.Error] = util.dup(e.a, s);
+    if (sel d.ok) { e.msg = d.ok; }
+}
+
+# true when the pending count is too large; the count is cleared and e.msg names the refusal
+fun over_count(e: *Engine) bool {
+    if (e.count_set && e.count > MAX_REPEAT) {
+        e.count = 0;
+        e.count_set = false;
+        say(e, "count is above 10000; the edit was not applied");
+        ret true;
+    }
+    ret false;
+}
+
+fun begin_insert(e: *Engine) {
+    e.mode = mode.INSERT;
+    e.ins_repeat = take_count(e);
+    if (e.ins_text != nil) { A.deallocate[u8](e.a, e.ins_text, e.ins_cap + 1); }
+    e.ins_text = nil;
+    e.ins_len = 0;
+    e.ins_cap = 0;
+}
+
+fun take_count(e: *Engine) i64 {
+    val n: i64 = count_of(e);
+    e.count = 0;
+    e.count_set = false;
+    ret n;
+}
+
+fun pos_of(b: *buffer.Buffer) motion.Pos {
+    ret motion.Pos{row: b.row, col: b.col};
+}
+
+fun set_pos(b: *buffer.Buffer, p: motion.Pos) {
+    b.row = p.row;
+    b.col = p.col;
+    buffer.clamp_col(b);
+}
+
+fun remember_dot(e: *Engine, opv: u8, motionb: u8, arg: u8, count: i64, linewise: bool) {
+    e.dot_op = opv;
+    e.dot_motion = motionb;
+    e.dot_arg = arg;
+    e.dot_count = count;
+    e.dot_line = linewise;
+    e.has_dot = true;
+}
+
+fun visual_span(b: *buffer.Buffer, linewise: bool) obj.Span {
+    val a: motion.Pos = motion.Pos{row: b.anchor_row, col: b.anchor_col};
+    val c: motion.Pos = pos_of(b);
+    ret obj.from_points(a, c, true, linewise);
+}
+
+fun apply_span(e: *Engine, s: obj.Span, opv: u8) err[A.Error] {
+    val b: opt[*buffer.Buffer] = cur(e);
+    if (!sel b.some) { ret err[A.Error].err{A.Error.invalid{}}; }
+    val applied: res[op.Applied, A.Error] = op.apply(?e.bufs, b.some.id, ?e.regs, '"', opv, s, e.shift);
+    if (sel applied.err) { ret err[A.Error].err{applied.err}; }
+    if (applied.ok.insert) { e.mode = mode.INSERT; }
+    or { e.mode = mode.NORMAL; }
+    e.op = mode.OP_NONE;
+    ret err[A.Error].ok{};
+}
+
+fun move_to(e: *Engine, p: motion.Pos) {
+    val b: opt[*buffer.Buffer] = cur(e);
+    if (sel b.some) { set_pos(b.some, p); }
+}
+
+fun motion_span(e: *Engine, dest: motion.Pos, inclusive: bool, linewise: bool) obj.Span {
+    val b: opt[*buffer.Buffer] = cur(e);
+    if (!sel b.some) {
+        var s: obj.Span;
+        ret s;
+    }
+    ret obj.from_points(pos_of(b.some), dest, inclusive, linewise);
+}
+
+fun do_motion(e: *Engine, dest: motion.Pos, inclusive: bool, linewise: bool, motionb: u8) err[A.Error] {
+    val n: i64 = count_of(e);
+    if (e.op != mode.OP_NONE) {
+        val s: obj.Span = motion_span(e, dest, inclusive, linewise);
+        remember_dot(e, e.op, motionb, 0, n, linewise);
+        e.count = 0;
+        e.count_set = false;
+        ret apply_span(e, s, e.op);
+    }
+    move_to(e, dest);
+    e.count = 0;
+    e.count_set = false;
+    ret err[A.Error].ok{};
+}
+
+fun text_object(e: *Engine, s: obj.Span, motionb: u8) err[A.Error] {
+    if (!s.ok) { ret err[A.Error].ok{}; }
+    if (e.op == mode.OP_NONE && !mode.is_visual(e.mode)) { ret err[A.Error].ok{}; }
+    if (mode.is_visual(e.mode)) {
+        val b: opt[*buffer.Buffer] = cur(e);
+        if (sel b.some) {
+            b.some.anchor_row = s.r1;
+            b.some.anchor_col = s.c1;
+            b.some.row = s.r2;
+            b.some.col = s.c2;
+            if (b.some.col > 0) { b.some.col = b.some.col - 1; }
+            buffer.clamp_col(b.some);
+        }
+        ret err[A.Error].ok{};
+    }
+    val n: i64 = count_of(e);
+    remember_dot(e, e.op, motionb, 0, n, s.linewise);
+    e.count = 0;
+    e.count_set = false;
+    ret apply_span(e, s, e.op);
+}
+
+fun b_early(e: *Engine) *buffer.Buffer {
+    val b: opt[*buffer.Buffer] = cur(e);
+    if (!sel b.some) { ret nil; }
+    ret b.some;
+}
+
+fun buf_text(e: *Engine) *text.Text {
+    val b: opt[*buffer.Buffer] = cur(e);
+    if (!sel b.some) { ret nil; }
+    ret ?b.some.text;
+}
+
+fun handle_normal(e: *Engine, k: keys.Key) err[A.Error] {
+    if (k.kind == keys.KIND_SPEC && k.special == keys.SP_ESC) {
+        e.op = mode.OP_NONE;
+        e.g = false;
+        e.find_kind = 0;
+        e.count = 0;
+        e.count_set = false;
+        e.mode = mode.NORMAL;
+        ret err[A.Error].ok{};
+    }
+    if (e.find_kind >= 10 && k.kind == keys.KIND_BYTE) {
+        val kind: u8 = e.find_kind;
+        e.find_kind = 0;
+        if (kind == 13) {
+            var nreg: usize = 0;
+            val data: *u8 = regs.get(?e.regs, k.byte, ?nreg);
+            if (data != nil) {
+                if (e.play >= 8) {
+                    say(e, "macro nested more than 8 times; the edit was not applied");
+                    ret err[A.Error].err{A.Error.invalid{}};
+                }
+                e.play = e.play + 1;
+                val fed: err[A.Error] = feed(e, data);
+                e.play = e.play - 1;
+                if (sel fed.err) { ret fed; }
+            }
+            ret err[A.Error].ok{};
+        }
+        if (kind == 14) {
+            val bb: opt[*buffer.Buffer] = cur(e);
+            if (sel bb.some) { marks.set(bb.some, k.byte, bb.some.row, bb.some.col); }
+            ret err[A.Error].ok{};
+        }
+        if (kind == 15) {
+            val bb: opt[*buffer.Buffer] = cur(e);
+            if (sel bb.some) { marks.jump(bb.some, k.byte); }
+            ret err[A.Error].ok{};
+        }
+        if (kind == 16) {
+            regs.record(?e.regs, k.byte);
+            ret err[A.Error].ok{};
+        }
+        if (kind == 12) {
+            var tmp: [1]u8;
+            tmp[0] = k.byte;
+            val bb: opt[*buffer.Buffer] = cur(e);
+            if (!sel bb.some) { ret err[A.Error].ok{}; }
+            val s: obj.Span = obj.from_points(pos_of(bb.some), pos_of(bb.some), true, false);
+            val deleted: err[A.Error] = apply_span(e, s, mode.OP_DELETE);
+            if (sel deleted.err) { ret deleted; }
+            e.mode = mode.NORMAL;
+            ret op.insert_text(?e.bufs, bb.some.id, ?tmp[0], 1);
+        }
+        if (kind == 10 || kind == 11) {
+            val around: bool = kind == 11;
+            val bb: opt[*buffer.Buffer] = cur(e);
+            if (!sel bb.some) { ret err[A.Error].ok{}; }
+            val t0: *text.Text = buf_text(e);
+            val p0: motion.Pos = pos_of(bb.some);
+            var s: obj.Span;
+            if (k.byte == 'w') { s = obj.word(t0, p0, false, around); }
+            or (k.byte == 'W') { s = obj.word(t0, p0, true, around); }
+            or (k.byte == '"') { s = obj.quote(t0, p0, '"', around); }
+            or (k.byte == '\'') { s = obj.quote(t0, p0, '\'', around); }
+            or (k.byte == '(' || k.byte == ')') { s = obj.bracket(t0, p0, '(', ')', around); }
+            or (k.byte == '{' || k.byte == '}') { s = obj.bracket(t0, p0, '{', '}', around); }
+            or (k.byte == '[') { s = obj.bracket(t0, p0, '[', ']', around); }
+            or (k.byte == 'p') { s = obj.paragraph(t0, p0, around); }
+            or (k.byte == 't') { s = obj.tag(t0, p0, around); }
+            ret text_object(e, s, k.byte);
+        }
+    }
+    if (e.find_kind != 0 && e.find_kind < 10 && k.kind == keys.KIND_BYTE) {
+        val fwd: bool = e.find_kind == 1 || e.find_kind == 3;
+        val till: bool = e.find_kind == 3 || e.find_kind == 4;
+        e.find_ch = k.byte;
+        e.find_fwd = fwd;
+        e.find_till = till;
+        e.has_find = true;
+        e.find_kind = 0;
+        val b: opt[*buffer.Buffer] = cur(e);
+        if (!sel b.some) { ret err[A.Error].ok{}; }
+        val dest: motion.Pos = motion.find_char(buf_text(e), pos_of(b.some), k.byte, fwd, till, take_count(e));
+        ret do_motion(e, dest, true, false, 'f');
+    }
+    if (k.kind == keys.KIND_BYTE && k.mods == 0 && k.byte >= '1' && k.byte <= '9' && e.op == mode.OP_NONE && !e.g) {
+        if (e.count > 922337203685477580) { e.count = MAX_REPEAT + 1; }
+        or { e.count = e.count * 10 + (k.byte - '0')::i64; }
+        if (e.count > MAX_REPEAT) { e.count = MAX_REPEAT + 1; }
+        e.count_set = true;
+        ret err[A.Error].ok{};
+    }
+    if (k.kind == keys.KIND_BYTE && k.byte == '0' && e.count_set && e.op == mode.OP_NONE) {
+        if (e.count > 922337203685477580) { e.count = MAX_REPEAT + 1; }
+        or { e.count = e.count * 10; }
+        if (e.count > MAX_REPEAT) { e.count = MAX_REPEAT + 1; }
+        ret err[A.Error].ok{};
+    }
+    val t: *text.Text = buf_text(e);
+    if (t == nil) { ret err[A.Error].ok{}; }
+    val b: opt[*buffer.Buffer] = cur(e);
+    if (!sel b.some) { ret err[A.Error].ok{}; }
+    val p: motion.Pos = pos_of(b.some);
+    val n: i64 = count_of(e);
+    if (over_count(e)) { ret err[A.Error].err{A.Error.invalid{}}; }
+
+    if (e.g && k.kind == keys.KIND_BYTE) {
+        e.g = false;
+        if (k.byte == 'g') { ret do_motion(e, motion.file_top(t), false, false, 'g'); }
+        if (k.byte == 'u') { e.op = mode.OP_LOWER; ret err[A.Error].ok{}; }
+        if (k.byte == 'U') { e.op = mode.OP_UPPER; ret err[A.Error].ok{}; }
+        if (k.byte == '~') { e.op = mode.OP_TOGGLE; ret err[A.Error].ok{}; }
+        ret err[A.Error].ok{};
+    }
+
+    if (k.kind == keys.KIND_SPEC) {
+        if (k.special == keys.SP_LEFT)  { ret do_motion(e, motion.left(t, p, n), false, false, 'h'); }
+        if (k.special == keys.SP_RIGHT) { ret do_motion(e, motion.right(t, p, n), false, false, 'l'); }
+        if (k.special == keys.SP_UP)    { ret do_motion(e, motion.up(t, p, n), false, true, 'k'); }
+        if (k.special == keys.SP_DOWN)  { ret do_motion(e, motion.down(t, p, n), false, true, 'j'); }
+        if (k.special == keys.SP_HOME)  { ret do_motion(e, motion.line_start(p), false, false, '0'); }
+        if (k.special == keys.SP_END)   { ret do_motion(e, motion.line_end(t, p), true, false, '$'); }
+        ret err[A.Error].ok{};
+    }
+    if (k.kind != keys.KIND_BYTE) { ret err[A.Error].ok{}; }
+    val ch: u8 = k.byte;
+
+    if (ch == 'h') { ret do_motion(e, motion.left(t, p, n), false, false, 'h'); }
+    if (ch == 'l') { ret do_motion(e, motion.right(t, p, n), false, false, 'l'); }
+    if (ch == 'j') { ret do_motion(e, motion.down(t, p, n), false, true, 'j'); }
+    if (ch == 'k') { ret do_motion(e, motion.up(t, p, n), false, true, 'k'); }
+    if (ch == 'w') { ret do_motion(e, motion.word_forward(t, p, n, false), false, false, 'w'); }
+    if (ch == 'W') { ret do_motion(e, motion.word_forward(t, p, n, true), false, false, 'W'); }
+    if (ch == 'b') { ret do_motion(e, motion.word_back(t, p, n, false), false, false, 'b'); }
+    if (ch == 'B') { ret do_motion(e, motion.word_back(t, p, n, true), false, false, 'B'); }
+    if (ch == 'e') { ret do_motion(e, motion.word_end(t, p, n, false), true, false, 'e'); }
+    if (ch == 'E') { ret do_motion(e, motion.word_end(t, p, n, true), true, false, 'E'); }
+    if (ch == '0') { ret do_motion(e, motion.line_start(p), false, false, '0'); }
+    if (ch == '^') { ret do_motion(e, motion.line_first(t, p), false, false, '^'); }
+    if (ch == '$') { ret do_motion(e, motion.line_end(t, p), true, false, '$'); }
+    if (ch == 'G') { ret do_motion(e, motion.file_line(t, n, e.count_set), false, true, 'G'); }
+    if (ch == '%') { ret do_motion(e, motion.match_pair(t, p), true, false, '%'); }
+    if (ch == '{') { ret do_motion(e, motion.paragraph(t, p, n, true), false, true, '{'); }
+    if (ch == '}') { ret do_motion(e, motion.paragraph(t, p, n, false), false, true, '}'); }
+    if (ch == 'g') { e.g = true; ret err[A.Error].ok{}; }
+    if (ch == 'f') { e.find_kind = 1; ret err[A.Error].ok{}; }
+    if (ch == 'F') { e.find_kind = 2; ret err[A.Error].ok{}; }
+    if (ch == 't') { e.find_kind = 3; ret err[A.Error].ok{}; }
+    if (ch == 'T') { e.find_kind = 4; ret err[A.Error].ok{}; }
+    if (ch == ';' && e.has_find) {
+        val dest: motion.Pos = motion.find_char(t, p, e.find_ch, e.find_fwd, e.find_till, n);
+        ret do_motion(e, dest, true, false, ';');
+    }
+    if (ch == ',' && e.has_find) {
+        val dest: motion.Pos = motion.find_char(t, p, e.find_ch, !e.find_fwd, e.find_till, n);
+        ret do_motion(e, dest, true, false, ',');
+    }
+
+    if (ch == 'd') {
+        if (e.op == mode.OP_DELETE) {
+            var dest: motion.Pos = p;
+            dest.row = p.row + n - 1;
+            val s: obj.Span = obj.from_points(p, dest, false, true);
+            remember_dot(e, mode.OP_DELETE, 'd', 0, n, true);
+            e.count_set = false;
+            e.count = 0;
+            ret apply_span(e, s, mode.OP_DELETE);
+        }
+        e.op = mode.OP_DELETE;
+        ret err[A.Error].ok{};
+    }
+    if (ch == 'c') {
+        if (e.op == mode.OP_CHANGE) {
+            var dest: motion.Pos = p;
+            dest.row = p.row + n - 1;
+            val s: obj.Span = obj.from_points(p, dest, false, true);
+            remember_dot(e, mode.OP_CHANGE, 'c', 0, n, true);
+            e.count_set = false;
+            e.count = 0;
+            ret apply_span(e, s, mode.OP_CHANGE);
+        }
+        e.op = mode.OP_CHANGE;
+        ret err[A.Error].ok{};
+    }
+    if (ch == 'y') {
+        if (e.op == mode.OP_YANK) {
+            var dest: motion.Pos = p;
+            dest.row = p.row + n - 1;
+            val s: obj.Span = obj.from_points(p, dest, false, true);
+            e.count_set = false;
+            e.count = 0;
+            ret apply_span(e, s, mode.OP_YANK);
+        }
+        e.op = mode.OP_YANK;
+        ret err[A.Error].ok{};
+    }
+    if (ch == '>') { e.op = mode.OP_INDENT; ret err[A.Error].ok{}; }
+    if (ch == '<') { e.op = mode.OP_DEDENT; ret err[A.Error].ok{}; }
+    if (ch == '=') { e.op = mode.OP_FORMAT; ret err[A.Error].ok{}; }
+
+    if (ch == 'i' && e.op != mode.OP_NONE) { e.find_kind = 10; ret err[A.Error].ok{}; }
+    if (ch == 'a' && e.op != mode.OP_NONE) { e.find_kind = 11; ret err[A.Error].ok{}; }
+
+    if (ch == 'x') {
+        var dest: motion.Pos = p;
+        dest.col = p.col;
+        val s: obj.Span = obj.from_points(p, motion.right(t, p, n), false, false);
+        remember_dot(e, mode.OP_DELETE, 'x', 0, n, false);
+        ret apply_span(e, s, mode.OP_DELETE);
+    }
+    if (ch == '~') {
+        val s: obj.Span = obj.from_points(p, p, true, false);
+        val r: err[A.Error] = apply_span(e, s, mode.OP_TOGGLE);
+        move_to(e, motion.right(t, p, 1));
+        ret r;
+    }
+    if (ch == 'r') { e.find_kind = 12; ret err[A.Error].ok{}; }
+    if (ch == 'J') { ret op.join_line(?e.bufs, b.some.id); }
+    if (ch == 'p' || ch == 'P') {
+        val times: i64 = take_count(e);
+        var i: i64 = 0;
+        for (i < times) {
+            val put: err[A.Error] = op.put(?e.bufs, b.some.id, ?e.regs, '"', ch == 'p');
+            if (sel put.err) { ret put; }
+            i = i + 1;
+        }
+        ret err[A.Error].ok{};
+    }
+    if (ch == 'u' && (k.mods & keys.MOD_CTRL) == 0) { ret buffer.undo(?e.bufs); }
+    if ((k.mods & keys.MOD_CTRL) != 0 && (ch == 'r' || ch == 18)) { ret buffer.redo(?e.bufs); }
+
+    if (ch == 'i') {
+        begin_insert(e);
+        ret err[A.Error].ok{};
+    }
+    if (ch == 'a') {
+        b.some.col = b.some.col + 1;
+        buffer.clamp_col(b.some);
+        begin_insert(e);
+        ret err[A.Error].ok{};
+    }
+    if (ch == 'I') {
+        set_pos(b.some, motion.line_first(t, p));
+        begin_insert(e);
+        ret err[A.Error].ok{};
+    }
+    if (ch == 'A') {
+        set_pos(b.some, motion.line_end(t, p));
+        begin_insert(e);
+        ret err[A.Error].ok{};
+    }
+    if (ch == 'o') {
+        val opened: err[A.Error] = op.open_line(?e.bufs, b.some.id, true);
+        if (sel opened.err) { ret opened; }
+        begin_insert(e);
+        ret err[A.Error].ok{};
+    }
+    if (ch == 'O') {
+        val opened: err[A.Error] = op.open_line(?e.bufs, b.some.id, false);
+        if (sel opened.err) { ret opened; }
+        begin_insert(e);
+        ret err[A.Error].ok{};
+    }
+    if (ch == 'v') {
+        b.some.anchor_row = b.some.row;
+        b.some.anchor_col = b.some.col;
+        e.mode = mode.VISUAL;
+        ret err[A.Error].ok{};
+    }
+    if (ch == 'V') {
+        b.some.anchor_row = b.some.row;
+        b.some.anchor_col = 0;
+        e.mode = mode.VLINE;
+        ret err[A.Error].ok{};
+    }
+    if (ch == ':') {
+        e.mode = mode.COMMAND;
+        e.cmd_len = 0;
+        if (e.cmd != nil) { e.cmd[0] = 0; }
+        ret err[A.Error].ok{};
+    }
+    if (ch == 'q') {
+        if (regs.is_recording(?e.regs)) { regs.record(?e.regs, 0); }
+        or { e.find_kind = 16; }
+        ret err[A.Error].ok{};
+    }
+    if (ch == '@') { e.find_kind = 13; ret err[A.Error].ok{}; }
+    if (ch == '.') { ret replay_dot(e); }
+    if (ch == 'n' || ch == 'N' || ch == '*' || ch == '#' || ch == '/' || ch == '?') {
+        ret search_key(e, ch);
+    }
+    if (ch == 'm') { e.find_kind = 14; ret err[A.Error].ok{}; }
+    if (ch == '\'') { e.find_kind = 15; ret err[A.Error].ok{}; }
+    ret err[A.Error].ok{};
+}
+
+fun replay_dot(e: *Engine) err[A.Error] {
+    if (!e.has_dot) { ret err[A.Error].ok{}; }
+    if (e.dot_text != nil && e.dot_op == mode.OP_NONE) {
+        val bdot: opt[*buffer.Buffer] = cur(e);
+        if (!sel bdot.some) { ret err[A.Error].ok{}; }
+        ret op.insert_text(?e.bufs, bdot.some.id, e.dot_text, str_len(e.dot_text));
+    }
+    e.op = e.dot_op;
+    e.count = e.dot_count;
+    e.count_set = true;
+    var k: keys.Key = keys.byte_key(e.dot_motion);
+    ret handle_normal(e, k);
+}
+
+fun search_key(e: *Engine, ch: u8) err[A.Error] {
+    val b: opt[*buffer.Buffer] = cur(e);
+    if (!sel b.some) { ret err[A.Error].ok{}; }
+    if (ch == '/' || ch == '?') {
+        e.mode = mode.COMMAND;
+        e.cmd_len = 0;
+        e.search_fwd = ch == '/';
+        val ap: err[A.Error] = util.append_byte(e.a, ?e.cmd, ?e.cmd_len, ?e.cmd_cap, ch);
+        if (sel ap.err) { ret ap; }
+        ret err[A.Error].ok{};
+    }
+    if (ch == '*' || ch == '#') {
+        val w: res[str, A.Error] = search.word_under(e.a, buf_text(e), b.some.row, b.some.col);
+        if (sel w.err) { ret err[A.Error].err{w.err}; }
+        util.free(e.a, e.search_pat);
+        e.search_pat = w.ok;
+        e.search_fwd = ch == '*';
+    }
+    if (e.search_pat == nil) { ret err[A.Error].ok{}; }
+    val prog: res[re.Prog, A.Error] = re.compile(e.a, e.search_pat, str_len(e.search_pat));
+    if (sel prog.err) { ret err[A.Error].err{prog.err}; }
+    var pv: re.Prog = prog.ok;
+    var fwd: bool = e.search_fwd;
+    if (ch == 'N') { fwd = !fwd; }
+    val hit: search.Hit = search.next(buf_text(e), b.some.row, b.some.col, ?pv, fwd);
+    re.dnit(?pv);
+    if (hit.ok) { move_to(e, motion.Pos{row: hit.row, col: hit.col}); }
+    ret err[A.Error].ok{};
+}
+
+fun handle_insert(e: *Engine, k: keys.Key) err[A.Error] {
+    val b: opt[*buffer.Buffer] = cur(e);
+    if (!sel b.some) { ret err[A.Error].ok{}; }
+    if (k.kind == keys.KIND_SPEC && k.special == keys.SP_ESC) {
+        e.mode = mode.NORMAL;
+        if (e.ins_repeat > 1 && e.ins_text != nil && e.ins_len > 0) {
+            var i: i64 = 1;
+            for (i < e.ins_repeat) {
+                val again: err[A.Error] = op.insert_text(?e.bufs, b.some.id, e.ins_text, e.ins_len);
+                if (sel again.err) { ret again; }
+                i = i + 1;
+            }
+        }
+        e.ins_repeat = 0;
+        if (b.some.col > 0) { b.some.col = b.some.col - 1; }
+        if (e.ins_text != nil) {
+            util.free(e.a, e.dot_text);
+            val d: res[str, A.Error] = util.dup(e.a, e.ins_text);
+            if (sel d.ok) { e.dot_text = d.ok; }
+            e.dot_op = mode.OP_NONE;
+            e.has_dot = true;
+        }
+        ret err[A.Error].ok{};
+    }
+    if (k.kind == keys.KIND_SPEC && (k.special == keys.SP_CR)) {
+        var nl: [1]u8;
+        nl[0] = '\n';
+        val ins: err[A.Error] = op.insert_text(?e.bufs, b.some.id, ?nl[0], 1);
+        if (sel ins.err) { ret ins; }
+        ret util.append_byte(e.a, ?e.ins_text, ?e.ins_len, ?e.ins_cap, '\n');
+    }
+    if (k.kind == keys.KIND_SPEC && k.special == keys.SP_BS) {
+        if (b.some.col > 0) {
+            b.some.col = b.some.col - 1;
+            val s: obj.Span = obj.from_points(pos_of(b.some), motion.right(buf_text(e), pos_of(b.some), 1), false, false);
+            e.op = mode.OP_NONE;
+            ret apply_span(e, s, mode.OP_DELETE);
+        }
+        ret err[A.Error].ok{};
+    }
+    if (k.kind == keys.KIND_SPEC && k.special == keys.SP_TAB) {
+        var i: i64 = 0;
+        var spaces: [8]u8;
+        var nsp: usize = e.shift::usize;
+        if (nsp > 8) { nsp = 8; }
+        if (!e.expandtab) {
+            spaces[0] = '\t';
+            nsp = 1;
+        }
+        or {
+            i = 0;
+            for (i < nsp::i64) {
+                spaces[i::usize] = ' ';
+                i = i + 1;
+            }
+        }
+        val ins: err[A.Error] = op.insert_text(?e.bufs, b.some.id, ?spaces[0], nsp);
+        if (sel ins.err) { ret ins; }
+        ret util.append(e.a, ?e.ins_text, ?e.ins_len, ?e.ins_cap, ?spaces[0], nsp);
+    }
+    if (k.kind == keys.KIND_BYTE && k.mods == 0) {
+        var tmp: [1]u8;
+        tmp[0] = k.byte;
+        val ins: err[A.Error] = op.insert_text(?e.bufs, b.some.id, ?tmp[0], 1);
+        if (sel ins.err) { ret ins; }
+        ret util.append_byte(e.a, ?e.ins_text, ?e.ins_len, ?e.ins_cap, k.byte);
+    }
+    if (k.kind == keys.KIND_SPEC && k.special == keys.SP_LEFT) {
+        move_to(e, motion.left(buf_text(e), pos_of(b.some), 1));
+    }
+    if (k.kind == keys.KIND_SPEC && k.special == keys.SP_RIGHT) {
+        move_to(e, motion.right(buf_text(e), pos_of(b.some), 1));
+    }
+    ret err[A.Error].ok{};
+}
+
+fun handle_visual(e: *Engine, k: keys.Key) err[A.Error] {
+    if (k.kind == keys.KIND_SPEC && k.special == keys.SP_ESC) {
+        e.mode = mode.NORMAL;
+        ret err[A.Error].ok{};
+    }
+    if (k.kind == keys.KIND_BYTE && (k.byte == 'd' || k.byte == 'c' || k.byte == 'y' || k.byte == 'x')) {
+        val b: opt[*buffer.Buffer] = cur(e);
+        if (!sel b.some) { ret err[A.Error].ok{}; }
+        val linewise: bool = e.mode == mode.VLINE;
+        val s: obj.Span = visual_span(b.some, linewise);
+        var opv: u8 = mode.OP_DELETE;
+        if (k.byte == 'y') { opv = mode.OP_YANK; }
+        if (k.byte == 'c') { opv = mode.OP_CHANGE; }
+        ret apply_span(e, s, opv);
+    }
+    ret handle_normal(e, k);
+}
+
+fun handle_command(e: *Engine, k: keys.Key) err[A.Error] {
+    if (k.kind == keys.KIND_SPEC && k.special == keys.SP_ESC) {
+        e.mode = mode.NORMAL;
+        e.cmd_len = 0;
+        ret err[A.Error].ok{};
+    }
+    if (k.kind == keys.KIND_SPEC && k.special == keys.SP_CR) {
+        if (e.cmd_len > 0 && e.cmd[0] == '/') {
+            util.free(e.a, e.search_pat);
+            val d: res[str, A.Error] = util.dup_n(e.a, (e.cmd::usize + 1)::*u8, e.cmd_len - 1);
+            if (sel d.ok) { e.search_pat = d.ok; }
+            e.search_fwd = true;
+            e.mode = mode.NORMAL;
+            ret search_key(e, 'n');
+        }
+        if (e.cmd_len > 0 && e.cmd[0] == '?') {
+            util.free(e.a, e.search_pat);
+            val d: res[str, A.Error] = util.dup_n(e.a, (e.cmd::usize + 1)::*u8, e.cmd_len - 1);
+            if (sel d.ok) { e.search_pat = d.ok; }
+            e.search_fwd = false;
+            e.mode = mode.NORMAL;
+            ret search_key(e, 'n');
+        }
+        e.mode = mode.NORMAL;
+        var line: ex.Ex;
+        line.a = e.a;
+        line.bufs = ?e.bufs;
+        line.quit = ?e.quit;
+        line.shift = ?e.shift;
+        line.expandtab = ?e.expandtab;
+        line.msg = ?e.msg;
+        line.sandbox = e.sandbox;
+        line.hooks.ctx = (e::usize)::*u8;
+        line.hooks.write = hook_write;
+        line.hooks.shell = hook_shell;
+        line.hooks.lisp = hook_lisp_str;
+        line.hooks.normal = hook_normal;
+        line.hooks.source = hook_source;
+        line.hooks.map = hook_map;
+        val ran: err[A.Error] = ex.exec(?line, e.cmd);
+        e.cmd_len = 0;
+        ret ran;
+    }
+    if (k.kind == keys.KIND_SPEC && k.special == keys.SP_BS) {
+        if (e.cmd_len > 0) {
+            e.cmd_len = e.cmd_len - 1;
+            e.cmd[e.cmd_len] = 0;
+        }
+        ret err[A.Error].ok{};
+    }
+    if (k.kind == keys.KIND_BYTE) {
+        ret util.append_byte(e.a, ?e.cmd, ?e.cmd_len, ?e.cmd_cap, k.byte);
+    }
+    ret err[A.Error].ok{};
+}
+
+fun hook_write(ctx: *u8, id: i64) i64 {
+    val e: *Engine = ctx::*Engine;
+    ev.fire(?e.events, ev.EV_WRITE_PRE, "?", ctx, hook_lisp_id);
+    if (e.hooks.write != nil) { e.hooks.write(e.hooks.ctx, id); }
+    ev.fire(?e.events, ev.EV_WRITE_POST, "?", ctx, hook_lisp_id);
+    ret 0;
+}
+
+fun hook_shell(ctx: *u8, cmd: str) i64 {
+    val e: *Engine = ctx::*Engine;
+    if (e.hooks.shell != nil) { ret e.hooks.shell(e.hooks.ctx, cmd); }
+    ret 0;
+}
+
+fun hook_lisp_str(ctx: *u8, src: str) i64 {
+    val e: *Engine = ctx::*Engine;
+    if (e.hooks.lisp != nil) { ret e.hooks.lisp(e.hooks.ctx, 0); }
+    ret 0;
+}
+
+fun hook_lisp_id(ctx: *u8, id: u32) i64 {
+    val e: *Engine = ctx::*Engine;
+    if (e.hooks.lisp != nil) { ret e.hooks.lisp(e.hooks.ctx, id); }
+    ret 0;
+}
+
+fun hook_normal(ctx: *u8, keys_s: str) i64 {
+    val e: *Engine = ctx::*Engine;
+    val fed: err[A.Error] = feed(e, keys_s);
+    if (sel fed.err) { ret 1; }
+    ret 0;
+}
+
+fun hook_source(ctx: *u8, path: str) i64 {
+    val e: *Engine = ctx::*Engine;
+    if (e.hooks.source != nil) { ret e.hooks.source(e.hooks.ctx, path); }
+    ret 0;
+}
+
+fun hook_map(ctx: *u8, modeb: u8, lhs: str, rhs: str, remap: u8) i64 {
+    val e: *Engine = ctx::*Engine;
+    val bound: err[A.Error] = km.bind(?e.map, modeb, lhs, km.ACT_KEYS, rhs, 0, remap != 0);
+    if (sel bound.err) { ret 1; }
+    ret 0;
+}
+
+# handle one key
+pub fun handle(e: *Engine, k: keys.Key) err[A.Error] {
+    if (regs.is_recording(?e.regs) && !(k.kind == keys.KIND_BYTE && k.byte == 'q')) {
+        macro.note(?e.regs, k);
+    }
+    if (e.mode == mode.INSERT) { ret handle_insert(e, k); }
+    if (e.mode == mode.COMMAND) { ret handle_command(e, k); }
+    if (mode.is_visual(e.mode)) { ret handle_visual(e, k); }
+    ret handle_normal(e, k);
+}
+
+# parse notation and handle every key
+pub fun feed(e: *Engine, spec: str) err[A.Error] {
+    var seq: keys.Seq = keys.seq_init(e.a);
+    val parsed: err[A.Error] = keys.parse(spec, ?seq);
+    if (sel parsed.err) {
+        keys.seq_dnit(?seq);
+        ret parsed;
+    }
+    var i: usize = 0;
+    for (i < seq.len) {
+        val step: err[A.Error] = handle(e, seq.data[i]);
+        if (sel step.err) {
+            keys.seq_dnit(?seq);
+            ret step;
+        }
+        i = i + 1;
+    }
+    keys.seq_dnit(?seq);
+    ret err[A.Error].ok{};
+}
+
+# load bytes into the current buffer and set its name and filetype
+pub fun load_current(e: *Engine, name: str, src: *u8, n: usize) err[A.Error] {
+    val b: opt[*buffer.Buffer] = cur(e);
+    if (!sel b.some) { ret err[A.Error].err{A.Error.invalid{}}; }
+    val loaded: err[A.Error] = buffer.load(?e.bufs, b.some.id, src, n);
+    if (sel loaded.err) { ret loaded; }
+    val named: err[A.Error] = buffer.set_name(?e.bufs, b.some.id, name);
+    if (sel named.err) { ret named; }
+    ret buffer.set_ft(?e.bufs, b.some.id, ft.from_name(name));
+}
+
+# run an ex command
+pub fun command(e: *Engine, line: str) err[A.Error] {
+    var exs: ex.Ex;
+    exs.a = e.a;
+    exs.bufs = ?e.bufs;
+    exs.quit = ?e.quit;
+    exs.shift = ?e.shift;
+    exs.expandtab = ?e.expandtab;
+    exs.msg = ?e.msg;
+    exs.sandbox = e.sandbox;
+    exs.hooks.ctx = (e::usize)::*u8;
+    exs.hooks.write = hook_write;
+    exs.hooks.shell = hook_shell;
+    exs.hooks.lisp = hook_lisp_str;
+    exs.hooks.normal = hook_normal;
+    exs.hooks.source = hook_source;
+    exs.hooks.map = hook_map;
+    ret ex.exec(?exs, line);
+}
+
+# joined text of the current buffer, owned by the caller
+pub fun current_text(e: *Engine) res[str, A.Error] {
+    val b: opt[*buffer.Buffer] = cur(e);
+    if (!sel b.some) { ret res[str, A.Error].err{A.Error.invalid{}}; }
+    ret text.join(?b.some.text);
+}
+
+use std.system.capability;
+
+$if (capability.HOSTED) {
+    use page: std.allocator.page;
+
+    fun play(before: str, spec: str, expect: str, row: i64, col: i64) i32 {
+        var a: A.Allocator;
+        val made: err[A.Error] = page.make(?a);
+        if (sel made.err) { ret 1; }
+        val eng: res[Engine, A.Error] = init(?a);
+        if (sel eng.err) { ret 2; }
+        var e: Engine = eng.ok;
+        val loaded: err[A.Error] = load_current(?e, "t", before, str_len(before));
+        if (sel loaded.err) { ret 3; }
+        val fed: err[A.Error] = feed(?e, spec);
+        if (sel fed.err) { ret 4; }
+        val got: res[str, A.Error] = current_text(?e);
+        if (sel got.err) { ret 5; }
+        if (!str_equals(got.ok, expect)) { ret 6; }
+        val b: opt[*buffer.Buffer] = cur(?e);
+        if (!sel b.some) { ret 7; }
+        if (b.some.row != row || b.some.col != col) { ret 8; }
+        util.free(?a, got.ok);
+        dnit(?e);
+        ret 0;
+    }
+
+    test feed__deletes_a_word_and_undoes_it {
+        val c0: i32 = play("hello world\n", "dw", "world\n", 0, 0);
+        if (c0 != 0) { ret c0; }
+        if (play("hello world\n", "dwu", "hello world\n", 0, 0) != 0) { ret 2; }
+        if (play("alpha\nbeta\n", "dd", "beta\n", 0, 0) != 0) { ret 3; }
+        if (play("hello\n", "0iX<Esc>", "Xhello\n", 0, 0) != 0) { ret 4; }
+        if (play("abc\n", "x", "bc\n", 0, 0) != 0) { ret 5; }
+        if (play("\n", "3ix<Esc>", "xxx\n", 0, 2) != 0) { ret 6; }
+        if (play("hi\n", "5Ay<Esc>", "hiyyyyy\n", 0, 6) != 0) { ret 7; }
+        if (play("ab\n", "yy3p", "ab\nab\nab\nab\n", 3, 0) != 0) { ret 8; }
+        if (play("a\nb\nc\nd\n", "3dd", "d\n", 0, 0) != 0) { ret 9; }
+        ret 0;
+    }
+}

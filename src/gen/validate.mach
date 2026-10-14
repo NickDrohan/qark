@@ -1,0 +1,104 @@
+# identifier and keyword checks for generated code
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+
+use util: qark.util;
+
+val PY_WORDS: str = "False None True and as assert async await break class continue def del elif else except finally for from global if import in is lambda nonlocal not or pass raise return try while with yield";
+val JS_WORDS: str = "await break case catch class const continue debugger default delete do else enum export extends false finally for function if implements import in instanceof interface let new null package private protected public return static super switch this throw true try typeof var void while with yield";
+val PS_WORDS: str = "begin break catch class continue data define do dynamicparam else elseif end exit filter finally for foreach from function if in param process return switch throw trap try until using var while workflow";
+val SH_WORDS: str = "if then else elif fi case esac for select while until do done in function time coproc";
+val MACH_WORDS: str = "fun ret val var if or for brk cnt use pub rec tag uni def ext fwd test fin sel asm nil";
+
+# true when name is one of the space-separated words
+fun listed(words: str, name: str) bool {
+    val n: usize = str_len(name);
+    var i: usize = 0;
+    for (words[i] != 0) {
+        var j: usize = i;
+        for (words[j] != 0 && words[j] != ' ') { j = j + 1; }
+        if (j - i == n) {
+            var k: usize = 0;
+            var same: bool = true;
+            for (k < n && same) {
+                if (words[i + k] != name[k]) { same = false; }
+                k = k + 1;
+            }
+            if (same) { ret true; }
+        }
+        i = j;
+        if (words[i] == ' ') { i = i + 1; }
+    }
+    ret false;
+}
+
+fun is_lang(lang: str, a: str, b: str) bool {
+    ret util.eq(lang, a) || util.eq(lang, b);
+}
+
+# true when name is reserved in lang
+pub fun keyword(lang: str, name: str) bool {
+    if (is_lang(lang, "python", "py")) { ret listed(PY_WORDS, name); }
+    if (is_lang(lang, "javascript", "js") || is_lang(lang, "node", "typescript")) { ret listed(JS_WORDS, name); }
+    if (is_lang(lang, "powershell", "ps")) {
+        var low: [64]u8;
+        val n: usize = str_len(name);
+        if (n >= 64) { ret false; }
+        var i: usize = 0;
+        for (i < n) {
+            var c: u8 = name[i];
+            if (c >= 'A' && c <= 'Z') { c = c + 32; }
+            low[i] = c;
+            i = i + 1;
+        }
+        low[n] = 0;
+        ret listed(PS_WORDS, ?low[0]);
+    }
+    if (is_lang(lang, "bash", "sh")) { ret listed(SH_WORDS, name); }
+    if (util.eq(lang, "mach")) { ret listed(MACH_WORDS, name); }
+    ret false;
+}
+
+# true when name is a usable identifier in lang
+pub fun ident_ok(lang: str, name: str) bool {
+    if (name == nil) { ret false; }
+    val n: usize = str_len(name);
+    if (n == 0) { ret false; }
+    val c0: u8 = name[0];
+    if (c0 >= '0' && c0 <= '9') { ret false; }
+    var i: usize = 0;
+    for (i < n) {
+        val c: u8 = name[i];
+        var ok: bool = util.is_ident(c);
+        if (!ok && c == '$' && is_lang(lang, "javascript", "js")) { ok = true; }
+        if (!ok) { ret false; }
+        i = i + 1;
+    }
+    if (keyword(lang, name)) { ret false; }
+    ret true;
+}
+
+use std.system.capability;
+
+$if (capability.HOSTED) {
+    test ident_ok__rejects_keywords_and_digits {
+        if (!ident_ok("python", "double")) { ret 1; }
+        if (ident_ok("python", "def")) { ret 2; }
+        if (ident_ok("python", "1abc")) { ret 3; }
+        if (ident_ok("mach", "fun")) { ret 4; }
+        if (!ident_ok("javascript", "emitLine")) { ret 5; }
+        if (ident_ok("python", "yield")) { ret 6; }
+        if (ident_ok("python", "None")) { ret 7; }
+        if (!ident_ok("python", "none")) { ret 8; }
+        if (ident_ok("node", "class")) { ret 9; }
+        if (!ident_ok("javascript", "$el")) { ret 10; }
+        if (ident_ok("powershell", "Foreach")) { ret 11; }
+        if (ident_ok("python", "my-name")) { ret 12; }
+        ret 0;
+    }
+}

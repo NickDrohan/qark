@@ -1,0 +1,4 @@
+# editor surface. the implementation is split under qark.core.*
+
+use qark.core.engine;
+use qark.core.text;

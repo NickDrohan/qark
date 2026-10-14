@@ -1,0 +1,44 @@
+# a-z buffer marks
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.option.opt;
+use std.types.size.usize;
+
+use buffer: qark.core.buffer;
+
+# store a mark named a-z; other names are ignored
+# ---
+# name: mark letter
+# row:  zero-based line
+# col:  zero-based column
+# ret:  true when the mark was stored
+pub fun set(buf: *buffer.Buffer, name: u8, row: i64, col: i64) bool {
+    if (name < 'a' || name > 'z') { ret false; }
+    val i: usize = (name - 'a')::usize;
+    buf.marks[i].row = row;
+    buf.marks[i].col = col;
+    buf.marks[i].set = true;
+    ret true;
+}
+
+# read a mark; none when unset or the name is not a-z
+pub fun get(buf: *buffer.Buffer, name: u8) opt[buffer.Mark] {
+    if (name < 'a' || name > 'z') { ret opt[buffer.Mark].none{}; }
+    val i: usize = (name - 'a')::usize;
+    if (!buf.marks[i].set) { ret opt[buffer.Mark].none{}; }
+    ret opt[buffer.Mark].some{buf.marks[i]};
+}
+
+# move the cursor to a mark
+# ---
+# ret: true when the mark was set
+pub fun jump(buf: *buffer.Buffer, name: u8) bool {
+    val m: opt[buffer.Mark] = get(buf, name);
+    if (!sel m.some) { ret false; }
+    buf.row = m.some.row;
+    buf.col = m.some.col;
+    buffer.clamp_col(buf);
+    ret true;
+}

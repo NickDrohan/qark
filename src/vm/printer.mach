@@ -1,0 +1,86 @@
+# print a lisp value into an owned string
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+
+use A: std.allocator;
+use h: qark.vm.heap;
+use util: qark.util;
+use v: qark.vm.value;
+
+fun emit(vm: *v.Vm, idx: u32, buf: **u8, len: *usize, cap: *usize, depth: i64) err[A.Error] {
+    if (depth > 32) { ret util.append_str(vm.a, buf, len, cap, "..."); }
+    if (idx == v.NIL) { ret util.append_str(vm.a, buf, len, cap, "nil"); }
+    val c: *v.Cell = h.cell(vm, idx);
+    if (c.kind == v.K_BOOL) {
+        if (c.n == 0) { ret util.append_str(vm.a, buf, len, cap, "#f"); }
+        ret util.append_str(vm.a, buf, len, cap, "#t");
+    }
+    if (c.kind == v.K_INT) {
+        var tmp: [32]u8;
+        val n: usize = util.fmt_i64(?tmp[0], 32, c.n);
+        ret util.append(vm.a, buf, len, cap, ?tmp[0], n);
+    }
+    if (c.kind == v.K_SYM) { ret util.append_str(vm.a, buf, len, cap, h.sym_name(vm, idx)); }
+    if (c.kind == v.K_STR) {
+        var sl: usize = 0;
+        val s: *u8 = h.str_data(vm, idx, ?sl);
+        val q1: err[A.Error] = util.append_byte(vm.a, buf, len, cap, '"');
+        if (sel q1.err) { ret q1; }
+        if (s != nil && sl > 0) {
+            val body: err[A.Error] = util.append(vm.a, buf, len, cap, s, sl);
+            if (sel body.err) { ret body; }
+        }
+        ret util.append_byte(vm.a, buf, len, cap, '"');
+    }
+    if (c.kind == v.K_BUILTIN) { ret util.append_str(vm.a, buf, len, cap, "#<builtin>"); }
+    if (c.kind == v.K_CLOSURE) { ret util.append_str(vm.a, buf, len, cap, "#<closure>"); }
+    if (c.kind == v.K_MACRO) { ret util.append_str(vm.a, buf, len, cap, "#<macro>"); }
+    if (c.kind == v.K_PAIR) {
+        val open: err[A.Error] = util.append_byte(vm.a, buf, len, cap, '(');
+        if (sel open.err) { ret open; }
+        var e: u32 = idx;
+        var first: bool = true;
+        var guard: i64 = 0;
+        for (e != v.NIL && guard < 64) {
+            guard = guard + 1;
+            val k: u8 = h.cell(vm, e).kind;
+            if (k != v.K_PAIR) {
+                val dot: err[A.Error] = util.append_str(vm.a, buf, len, cap, " . ");
+                if (sel dot.err) { ret dot; }
+                val tail: err[A.Error] = emit(vm, e, buf, len, cap, depth + 1);
+                if (sel tail.err) { ret tail; }
+                brk;
+            }
+            val item: u32 = h.cell(vm, e).a;
+            val next: u32 = h.cell(vm, e).b;
+            if (!first) {
+                val sp: err[A.Error] = util.append_byte(vm.a, buf, len, cap, ' ');
+                if (sel sp.err) { ret sp; }
+            }
+            first = false;
+            val one: err[A.Error] = emit(vm, item, buf, len, cap, depth + 1);
+            if (sel one.err) { ret one; }
+            e = next;
+        }
+        ret util.append_byte(vm.a, buf, len, cap, ')');
+    }
+    ret util.append_str(vm.a, buf, len, cap, "#<value>");
+}
+
+# owned printed form; free it with qark.util.free
+pub fun print(vm: *v.Vm, idx: u32) res[str, A.Error] {
+    var buf: *u8 = nil;
+    var len: usize = 0;
+    var cap: usize = 0;
+    val wrote: err[A.Error] = emit(vm, idx, ?buf, ?len, ?cap, 0);
+    if (sel wrote.err) { ret res[str, A.Error].err{wrote.err}; }
+    val exact: res[str, A.Error] = util.dup_n(vm.a, buf, len);
+    if (buf != nil) { A.deallocate[u8](vm.a, buf, cap + 1); }
+    ret exact;
+}

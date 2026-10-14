@@ -1,0 +1,94 @@
+# qark lisp values: cells in an explicit heap, roots named by the caller
+
+use std.collections.vector;
+use std.types.size.usize;
+use std.types.string.str;
+
+use A: std.allocator;
+
+pub val NIL: u32 = 0;
+
+pub val K_NIL:     u8 = 0;
+pub val K_BOOL:    u8 = 1;
+pub val K_INT:     u8 = 2;
+pub val K_FLOAT:   u8 = 3;
+pub val K_SYM:     u8 = 4;
+pub val K_STR:     u8 = 5;
+pub val K_PAIR:    u8 = 6;
+pub val K_VEC:     u8 = 7;
+pub val K_CLOSURE: u8 = 8;
+pub val K_BUILTIN: u8 = 9;
+pub val K_MACRO:   u8 = 10;
+pub val K_BUF:     u8 = 11;
+pub val K_ERR:     u8 = 12;
+
+# one heap cell; a/b/c are child indexes, n is an integer or builtin id
+pub rec Cell {
+    kind:   u8;
+    marked: u8;
+    a:      u32;
+    b:      u32;
+    c:      u32;
+    n:      i64;
+}
+
+# an owned lisp string
+pub rec StrObj {
+    data:   *u8;
+    len:    usize;
+    marked: u8;
+    live:   u8;
+}
+
+# an interned symbol and its unique cell
+pub rec Sym {
+    name: str;
+    cell: u32;
+}
+
+# host services the editor installs; every pointer may be nil
+pub rec Api {
+    ctx:       *u8;
+    cur_buf:   fun(*u8) i64;
+    line_count: fun(*u8, i64) i64;
+    line_at:   fun(*u8, i64, i64, *usize) *u8;
+    set_lines: fun(*u8, i64, i64, i64, **u8, *usize, i64) i64;
+    filetype:  fun(*u8, i64) str;
+    command:   fun(*u8, str) i64;
+    normal:    fun(*u8, str) i64;
+    map:       fun(*u8, u8, str, u32) i64;
+    autocmd:   fun(*u8, u8, str, u32) i64;
+    reg_get:   fun(*u8, u8, *usize) *u8;
+    reg_set:   fun(*u8, u8, *u8, usize) i64;
+    defop:     fun(*u8, str, u32) i64;
+    defkeys:   fun(*u8, str, str) i64;
+}
+
+# the machine
+pub rec Vm {
+    a:        *A.Allocator;
+    cells:    vector.Vector[Cell];
+    free:     vector.Vector[u32];
+    strs:     vector.Vector[StrObj];
+    syms:     vector.Vector[Sym];
+    roots:    vector.Vector[u32];
+    global:   u32;
+    err:      str;
+    depth:    i64;
+    since_gc: i64;
+    live:     i64;
+    api:      Api;
+}
+
+# why eval or read stopped
+pub tag VmError: u8 {
+    oom;
+    syntax;
+    unbound;
+    apply;
+    args;
+    type;
+    div0;
+    depth;
+    user;
+}

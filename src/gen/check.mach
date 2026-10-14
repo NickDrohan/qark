@@ -1,0 +1,833 @@
+# syntax checks on change-set bytes before anything is published
+#
+# json and toml parse in this process. python, node, and powershell each get
+# one helper process for all of their files. bash gets one `bash -n` per file.
+# .qark/checks.json can add a command for any other extension; that command
+# sees the new bytes at a preview path and a non-zero exit refuses the apply.
+
+use std.collections.vector;
+use std.data.json;
+use toml: std.data.toml;
+use std.filesystem;
+use std.process.env;
+use std.process.exec;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.OwnedString;
+use std.types.string.str;
+use std.types.string.str_len;
+
+use A: std.allocator;
+use commit: qark.gen.commit;
+use path: std.types.path;
+use pathx: qark.gen.pathx;
+use warm: qark.gen.warm;
+use jw: qark.rpc.jw;
+use runner: qark.run.runner;
+use util: qark.util;
+
+#[embed("../../scripts/checkers/check.py")]
+val PY_SRC: [_]u8;
+#[embed("../../scripts/checkers/check.js")]
+val JS_SRC: [_]u8;
+#[embed("../../scripts/checkers/check.ps1")]
+val PS_SRC: [_]u8;
+
+pub val TIMEOUT_MS: i64 = 20000;
+
+# checker programs found on this host, each looked up on first use; nil when absent
+# ---
+# warm: the session's long-lived checkers for python, node, and powershell
+pub rec Tools {
+    seen:   [4]bool;
+    python: str;
+    node:   str;
+    pwsh:   str;
+    bash:   str;
+    warm:   [3]warm.Warm;
+}
+
+rec Run {
+    lang:    str;
+    batch:   bool;
+    items:   vector.Vector[usize];
+    job:     runner.Job;
+    started: bool;
+    warm:    bool;
+    argv:    [12]*u8;
+    argc:    usize;
+    input:   *u8;
+    input_n: usize;
+    external: bool;
+    stage:   bool;
+    preview: str;
+    cwd:     str;
+}
+
+fun from_env(a: *A.Allocator, name: str) str {
+    val v: res[opt[OwnedString], env.EnvError] = env.value(a, name);
+    if (sel v.ok) {
+        if (sel v.ok.some) {
+            if (v.ok.some.data != nil && v.ok.some.data[0] != 0) { ret v.ok.some.data; }
+        }
+    }
+    ret nil;
+}
+
+fun locate(a: *A.Allocator, var_name: str, first: str, second: str) str {
+    val set: str = from_env(a, var_name);
+    if (set != nil) { ret set; }
+    if (first != nil) {
+        val r: res[str, exec.Error] = exec.resolve(a, first);
+        if (sel r.ok) { ret r.ok; }
+    }
+    if (second != nil) {
+        val r: res[str, exec.Error] = exec.resolve(a, second);
+        if (sel r.ok) { ret r.ok; }
+    }
+    ret nil;
+}
+
+# the program for a checker, found once and remembered; a is a long-lived allocator
+pub fun tool(a: *A.Allocator, t: *Tools, lang: str) str {
+    if (util.eq(lang, "python")) {
+        if (!t.seen[0]) {
+            t.python = locate(a, "QARK_PYTHON", "python", "python3");
+            t.seen[0] = true;
+        }
+        ret t.python;
+    }
+    if (util.eq(lang, "node")) {
+        if (!t.seen[1]) {
+            t.node = locate(a, "QARK_NODE", "node", nil);
+            t.seen[1] = true;
+        }
+        ret t.node;
+    }
+    if (util.eq(lang, "powershell")) {
+        if (!t.seen[2]) {
+            t.pwsh = locate(a, "QARK_PWSH", "pwsh", "powershell");
+            t.seen[2] = true;
+        }
+        ret t.pwsh;
+    }
+    if (!t.seen[3]) {
+        $if ($mach.build.os == $mach.os.windows) {
+            t.bash = from_env(a, "QARK_BASH");
+        }
+        $or {
+            t.bash = locate(a, "QARK_BASH", "bash", nil);
+        }
+        t.seen[3] = true;
+    }
+    ret t.bash;
+}
+
+# look up every checker, for reporting
+pub fun probe(a: *A.Allocator, t: *Tools) {
+    tool(a, t, "python");
+    tool(a, t, "node");
+    tool(a, t, "powershell");
+    tool(a, t, "bash");
+}
+
+fun line_at(p: *u8, off: usize, n: usize, col: *i64) i64 {
+    var line: i64 = 1;
+    var last: usize = 0;
+    var i: usize = 0;
+    for (i < off && i < n) {
+        if (p[i] == '\n') {
+            line = line + 1;
+            last = i + 1;
+        }
+        i = i + 1;
+    }
+    @col = (off - last + 1)::i64;
+    ret line;
+}
+
+fun native_json(a: *A.Allocator, e: *commit.Entry) {
+    val parsed: res[json.Value, json.JsonError] = json.parse(e.data, e.len, a);
+    if (sel parsed.ok) {
+        e.check = commit.CK_OK;
+        ret;
+    }
+    var off: usize = 0;
+    var msg: str = "invalid json";
+    if (sel parsed.err) {
+        if (sel parsed.err.syntax) { off = parsed.err.syntax; }
+        or (sel parsed.err.depth) {
+            off = parsed.err.depth;
+            msg = "json nests deeper than 128 levels";
+        }
+        or {
+            e.check = commit.CK_SKIPPED;
+            e.ck_msg = "out of memory while checking json";
+            ret;
+        }
+    }
+    e.check = commit.CK_FAILED;
+    e.ck_line = line_at(e.data, off, e.len, ?e.ck_col);
+    e.ck_msg = msg;
+}
+
+fun native_toml(a: *A.Allocator, e: *commit.Entry) {
+    val parsed: res[toml.Table, toml.TomlError] = toml.parse(a, e.data);
+    if (sel parsed.ok) {
+        e.check = commit.CK_OK;
+        ret;
+    }
+    var off: usize = 0;
+    if (sel parsed.err) {
+        if (sel parsed.err.syntax) { off = parsed.err.syntax; }
+        or (sel parsed.err.overflow) { off = parsed.err.overflow; }
+        or (sel parsed.err.depth) { off = parsed.err.depth; }
+    }
+    e.check = commit.CK_FAILED;
+    e.ck_line = line_at(e.data, off, e.len, ?e.ck_col);
+    e.ck_msg = "invalid toml";
+}
+
+fun embedded_py(a: *A.Allocator) res[str, A.Error] {
+    val n: usize = $length_of(PY_SRC);
+    val got: res[*u8, A.Error] = A.allocate[u8](a, n + 1);
+    if (sel got.err) { ret res[str, A.Error].err{got.err}; }
+    var i: usize = 0;
+    for (i < n) {
+        got.ok[i] = PY_SRC[i];
+        i = i + 1;
+    }
+    got.ok[n] = 0;
+    ret res[str, A.Error].ok{got.ok};
+}
+
+fun embedded_js(a: *A.Allocator) res[str, A.Error] {
+    val n: usize = $length_of(JS_SRC);
+    val got: res[*u8, A.Error] = A.allocate[u8](a, n + 1);
+    if (sel got.err) { ret res[str, A.Error].err{got.err}; }
+    var i: usize = 0;
+    for (i < n) {
+        got.ok[i] = JS_SRC[i];
+        i = i + 1;
+    }
+    got.ok[n] = 0;
+    ret res[str, A.Error].ok{got.ok};
+}
+
+fun embedded_ps(a: *A.Allocator) res[str, A.Error] {
+    val n: usize = $length_of(PS_SRC);
+    val got: res[*u8, A.Error] = A.allocate[u8](a, n + 1);
+    if (sel got.err) { ret res[str, A.Error].err{got.err}; }
+    var i: usize = 0;
+    for (i < n) {
+        got.ok[i] = PS_SRC[i];
+        i = i + 1;
+    }
+    got.ok[n] = 0;
+    ret res[str, A.Error].ok{got.ok};
+}
+
+# install a helper script under .qark/checkers when it is missing or stale; returns its host path
+fun script(a: *A.Allocator, root: str, name: str, body: str) str {
+    val rel: res[str, A.Error] = pathx.join(a, ".qark/checkers", name);
+    if (sel rel.err) { ret nil; }
+    val full: res[str, A.Error] = pathx.native(a, root, rel.ok);
+    if (sel full.err) { ret nil; }
+    val cur: res[str, filesystem.FsError] = filesystem.read_string(a, full.ok);
+    if (sel cur.ok) {
+        if (util.eq(cur.ok, body)) { ret full.ok; }
+    }
+    val wrote: err[filesystem.FsError] = filesystem.replace_bytes_atomic(a, full.ok, body, str_len(body), 420, 493);
+    if (sel wrote.err) { ret nil; }
+    ret full.ok;
+}
+
+fun skip_all(set: *commit.Set, r: *Run, why: str) {
+    mark_all(set, r, why, false);
+}
+
+fun fail_all(set: *commit.Set, r: *Run, why: str) {
+    mark_all(set, r, why, true);
+}
+
+fun mark_all(set: *commit.Set, r: *Run, why: str, failed: bool) {
+    var i: usize = 0;
+    for (i < r.items.len) {
+        val e: *commit.Entry = commit.entry(set, r.items.data[i]);
+        if (failed) { e.check = commit.CK_FAILED; }
+        or { e.check = commit.CK_SKIPPED; }
+        e.ck_msg = why;
+        i = i + 1;
+    }
+}
+
+fun first_line(a: *A.Allocator, s: str) str {
+    if (s == nil) { ret ""; }
+    var n: usize = 0;
+    for (s[n] != 0 && s[n] != '\n' && s[n] != '\r') { n = n + 1; }
+    val d: res[str, A.Error] = util.dup_n(a, s, n);
+    if (sel d.err) { ret ""; }
+    ret d.ok;
+}
+
+fun pending(e: *commit.Entry) bool {
+    ret e.status == commit.ST_CREATE || e.status == commit.ST_REPLACE;
+}
+
+fun warm_index(lang: str) usize {
+    if (util.eq(lang, "python")) { ret 0; }
+    if (util.eq(lang, "node")) { ret 1; }
+    ret 2;
+}
+
+# find the program, install the helper, and build argv and stdin; false when the run was skipped
+fun prepare(a: *A.Allocator, keep: *A.Allocator, root: str, set: *commit.Set, tools: *Tools, r: *Run) bool {
+    val program: str = tool(keep, tools, r.lang);
+    var helper: str = nil;
+    if (util.eq(r.lang, "python")) {
+        if (program == nil) {
+            skip_all(set, r, "python was not found; install it or set QARK_PYTHON");
+            ret false;
+        }
+        val body: res[str, A.Error] = embedded_py(a);
+        if (sel body.ok) { helper = script(a, root, "check.py", body.ok); }
+    }
+    or (util.eq(r.lang, "node")) {
+        if (program == nil) {
+            skip_all(set, r, "node was not found; install it or set QARK_NODE");
+            ret false;
+        }
+        val body: res[str, A.Error] = embedded_js(a);
+        if (sel body.ok) { helper = script(a, root, "check.js", body.ok); }
+    }
+    or (util.eq(r.lang, "powershell")) {
+        if (program == nil) {
+            skip_all(set, r, "powershell was not found; set QARK_PWSH");
+            ret false;
+        }
+        val body: res[str, A.Error] = embedded_ps(a);
+        if (sel body.ok) { helper = script(a, root, "check.ps1", body.ok); }
+    }
+    or {
+        if (program == nil) {
+            skip_all(set, r, "bash was not found; set QARK_BASH");
+            ret false;
+        }
+    }
+    if (r.batch && helper == nil) {
+        skip_all(set, r, "the checker helper could not be installed under .qark/checkers");
+        ret false;
+    }
+    r.argv[0] = program;
+    var argc: usize = 1;
+    if (util.eq(r.lang, "powershell")) {
+        r.argv[1] = "-NoProfile";
+        r.argv[2] = "-NonInteractive";
+        r.argv[3] = "-ExecutionPolicy";
+        r.argv[4] = "Bypass";
+        r.argv[5] = "-File";
+        r.argv[6] = helper;
+        argc = 7;
+    }
+    or (r.batch) {
+        r.argv[1] = helper;
+        argc = 2;
+    }
+    or {
+        r.argv[1] = "-n";
+        argc = 2;
+    }
+    r.argc = argc;
+    r.argv[argc] = nil;
+    if (r.batch) {
+        var w: jw.Jw = jw.init(a);
+        jw.arr(?w);
+        var i: usize = 0;
+        for (i < r.items.len) {
+            val e: *commit.Entry = commit.entry(set, r.items.data[i]);
+            jw.obj(?w);
+            jw.f_str(?w, "name", e.rel);
+            jw.key(?w, "text");
+            jw.str_n(?w, e.data, e.len);
+            jw.obj_end(?w);
+            i = i + 1;
+        }
+        jw.arr_end(?w);
+        if (w.failed) {
+            skip_all(set, r, "out of memory while preparing a check");
+            ret false;
+        }
+        r.input = w.buf;
+        r.input_n = w.len;
+    }
+    or {
+        val e: *commit.Entry = commit.entry(set, r.items.data[0]);
+        r.input = e.data;
+        r.input_n = e.len;
+        if (r.input == nil) { r.input = ""; }
+    }
+    ret true;
+}
+
+fun spawn_once(a: *A.Allocator, set: *commit.Set, r: *Run, timeout_ms: i64) {
+    if (r.external) {
+        val found: res[str, exec.Error] = exec.resolve(a, r.argv[0]);
+        if (sel found.err) {
+            fail_all(set, r, "the project checker was not found on PATH");
+            ret;
+        }
+        r.argv[0] = found.ok;
+    }
+    val started: err[exec.Error] = runner.start(a, ?r.argv[0], r.cwd, r.input, r.input_n, timeout_ms, ?r.job);
+    if (sel started.err) {
+        if (r.external) { fail_all(set, r, "the project checker could not be started"); }
+        or { skip_all(set, r, "the checker could not be started"); }
+        ret;
+    }
+    r.started = true;
+}
+
+# send the run to this session's warm checker, starting one when needed
+fun send_warm(keep: *A.Allocator, tools: *Tools, r: *Run) bool {
+    val w: *warm.Warm = ?tools.warm[warm_index(r.lang)];
+    warm.reap_if_dead(w);
+    if (!w.alive) {
+        var argv: [12]*u8;
+        var i: usize = 0;
+        for (i < r.argc) {
+            argv[i] = r.argv[i];
+            i = i + 1;
+        }
+        if (util.eq(r.lang, "powershell")) {
+            argv[r.argc] = "-serve";
+            argv[r.argc + 1] = "-idle";
+            argv[r.argc + 2] = "120";
+            argv[r.argc + 3] = nil;
+        }
+        or {
+            argv[r.argc] = "--serve";
+            argv[r.argc + 1] = "120";
+            argv[r.argc + 2] = nil;
+        }
+        if (!warm.start(keep, w, ?argv[0])) { ret false; }
+    }
+    ret warm.send(w, r.input, r.input_n);
+}
+
+# stop every warm checker; the session calls this when it closes
+pub fun shutdown(tools: *Tools) {
+    var i: usize = 0;
+    for (i < 3) {
+        warm.stop(?tools.warm[i]);
+        i = i + 1;
+    }
+}
+
+fun bash_line(s: str) i64 {
+    if (s == nil) { ret 0; }
+    var i: usize = 0;
+    for (s[i] != 0) {
+        if (s[i] == 'l' && s[i + 1] == 'i' && s[i + 2] == 'n' && s[i + 3] == 'e' && s[i + 4] == ' ') {
+            var j: usize = i + 5;
+            var v: i64 = 0;
+            var any: bool = false;
+            for (s[j] >= '0' && s[j] <= '9') {
+                v = v * 10 + (s[j] - '0')::i64;
+                any = true;
+                j = j + 1;
+            }
+            if (any) { ret v; }
+        }
+        i = i + 1;
+    }
+    ret 0;
+}
+
+fun finish_run(a: *A.Allocator, set: *commit.Set, r: *Run) {
+    val done: res[runner.RunResult, exec.Error] = runner.finish(a, ?r.job);
+    if (sel done.err) {
+        if (r.external) { fail_all(set, r, "the project checker failed to run"); }
+        or { skip_all(set, r, "the checker failed to run"); }
+        ret;
+    }
+    val out: runner.RunResult = done.ok;
+    if (out.timed_out) {
+        if (r.external) { fail_all(set, r, "the project checker timed out"); }
+        or { skip_all(set, r, "the checker timed out"); }
+        ret;
+    }
+    if (!r.batch) {
+        var code: u8 = commit.CK_OK;
+        var line: i64 = 0;
+        var msg: str = nil;
+        if (out.exit != 0) {
+            code = commit.CK_FAILED;
+            line = bash_line(out.stderr);
+            msg = first_line(a, out.stderr);
+        }
+        var i: usize = 0;
+        for (i < r.items.len) {
+            val e: *commit.Entry = commit.entry(set, r.items.data[i]);
+            e.check = code;
+            e.ck_line = line;
+            e.ck_msg = msg;
+            i = i + 1;
+        }
+        ret;
+    }
+    if (out.stdout == nil) {
+        skip_all(set, r, first_line(a, out.stderr));
+        ret;
+    }
+    if (!assign(a, set, r, out.stdout, str_len(out.stdout))) { skip_all(set, r, "the checker's output was not understood"); }
+}
+
+# put a checker's json answer onto the run's entries; false when it does not fit the run
+fun assign(a: *A.Allocator, set: *commit.Set, r: *Run, text: *u8, n: usize) bool {
+    val parsed: res[json.Value, json.JsonError] = json.parse(text, n, a);
+    if (sel parsed.err) { ret false; }
+    var doc: json.Value = parsed.ok;
+    if (!json.value_is_array(?doc) || json.value_count(?doc) != r.items.len) { ret false; }
+    var i: usize = 0;
+    for (i < r.items.len) {
+        val e: *commit.Entry = commit.entry(set, r.items.data[i]);
+        val g: opt[*json.Value] = json.value_get(?doc, i);
+        e.check = commit.CK_SKIPPED;
+        if (sel g.some) {
+            val okf: opt[*json.Value] = json.value_find(g.some, "ok");
+            var ok: bool = false;
+            if (sel okf.some) {
+                if (json.value_is_bool(okf.some)) { ok = json.value_bool(okf.some); }
+            }
+            if (ok) { e.check = commit.CK_OK; }
+            or {
+                e.check = commit.CK_FAILED;
+                val lf: opt[*json.Value] = json.value_find(g.some, "line");
+                if (sel lf.some) {
+                    if (json.value_is_number(lf.some)) { e.ck_line = json.value_number(lf.some); }
+                }
+                val cf: opt[*json.Value] = json.value_find(g.some, "col");
+                if (sel cf.some) {
+                    if (json.value_is_number(cf.some)) { e.ck_col = json.value_number(cf.some); }
+                }
+                e.ck_msg = "syntax error";
+                val mf: opt[*json.Value] = json.value_find(g.some, "msg");
+                if (sel mf.some) {
+                    if (json.value_is_string(mf.some)) {
+                        var raw_n: usize = 0;
+                        json.value_string(mf.some, ?raw_n);
+                        val buf: res[*u8, A.Error] = A.allocate[u8](a, raw_n + 1);
+                        if (sel buf.ok) {
+                            val dec: res[usize, json.JsonError] = json.value_string_decode(mf.some, buf.ok, raw_n + 1);
+                            if (sel dec.ok) {
+                                if (dec.ok <= raw_n) {
+                                    buf.ok[dec.ok] = 0;
+                                    e.ck_msg = buf.ok;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun same_cmd(r: *Run, argv: **u8, argc: usize) bool {
+    if (!r.stage || r.argc != argc) { ret false; }
+    var i: usize = 0;
+    for (i < argc) {
+        if (!util.eq(r.argv[i], argv[i])) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# put the previous bytes back. n is how many items of this run were staged.
+fun unplace_staged(a: *A.Allocator, set: *commit.Set, r: *Run, n: usize) {
+    if (!r.stage) { ret; }
+    var i: usize = 0;
+    var lim: usize = n;
+    if (lim > r.items.len) { lim = r.items.len; }
+    for (i < lim) {
+        val e: *commit.Entry = commit.entry(set, r.items.data[i]);
+        if (e.existed) {
+            var perm: i32 = 420;
+            if (e.old_perm != 0) { perm = (e.old_perm & 511)::i32; }
+            var oldp: *u8 = e.old;
+            if (oldp == nil) { oldp = ""; }
+            filesystem.replace_bytes_atomic(a, e.full, oldp, e.old_len, perm, 493);
+        }
+        or { filesystem.remove_file(e.full); }
+        i = i + 1;
+    }
+}
+
+fun place_staged(a: *A.Allocator, set: *commit.Set, r: *Run) bool {
+    if (!r.stage) { ret true; }
+    var i: usize = 0;
+    for (i < r.items.len) {
+        val e: *commit.Entry = commit.entry(set, r.items.data[i]);
+        var perm: i32 = 420;
+        if (e.existed && e.old_perm != 0) { perm = (e.old_perm & 511)::i32; }
+        val wr: err[filesystem.FsError] = filesystem.replace_bytes_atomic(a, e.full, e.data, e.len, perm, 493);
+        if (sel wr.err) {
+            unplace_staged(a, set, r, i);
+            ret false;
+        }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# .qark/checks.json maps an extension to a command. {file} is one file's new
+# bytes under .qark/preview. {root} is the workspace: those files are placed
+# at their real paths for the check and restored afterward, so a project
+# checker such as `mach check` sees the edit. a command with neither token
+# gets the preview path appended. agents cannot write .qark themselves.
+fun queue_project_checks(a: *A.Allocator, root: str, set: *commit.Set, runs: *vector.Vector[Run], want_root: bool) {
+    val cfg_rel: res[str, A.Error] = pathx.native(a, root, ".qark/checks.json");
+    if (sel cfg_rel.err) { ret; }
+    val text: res[str, filesystem.FsError] = filesystem.read_string(a, cfg_rel.ok);
+    if (sel text.err) { ret; }
+    var src: *u8 = text.ok;
+    var n: usize = str_len(src);
+    if (n >= 3 && src[0] == 239 && src[1] == 187 && src[2] == 191) {
+        src = (src::usize + 3)::*u8;
+        n = n - 3;
+    }
+    val parsed: res[json.Value, json.JsonError] = json.parse(src, n, a);
+    if (sel parsed.err) { ret; }
+    var doc: json.Value = parsed.ok;
+    var i: usize = 0;
+    for (i < commit.count(set)) {
+        val e: *commit.Entry = commit.entry(set, i);
+        if (pending(e) && e.lang == nil) {
+            val ext: str = path.extension(e.rel);
+            val spec: opt[*json.Value] = json.value_find(?doc, ext);
+            if (sel spec.some) {
+                if (json.value_is_array(spec.some) && json.value_count(spec.some) > 0 && json.value_count(spec.some) < 10) {
+                    var argv: [12]*u8;
+                    var argc: usize = 0;
+                    var is_root: bool = false;
+                    var has_file: bool = false;
+                    var bad: bool = false;
+                    var w: usize = 0;
+                    val words: usize = json.value_count(spec.some);
+                    for (w < words && !bad && argc < 12) {
+                        val g: opt[*json.Value] = json.value_get(spec.some, w);
+                        if (sel g.some) {
+                            if (json.value_is_string(g.some)) {
+                                var raw_n: usize = 0;
+                                json.value_string(g.some, ?raw_n);
+                                val buf: res[*u8, A.Error] = A.allocate[u8](a, raw_n + 1);
+                                if (sel buf.ok) {
+                                    val dec: res[usize, json.JsonError] = json.value_string_decode(g.some, buf.ok, raw_n + 1);
+                                    if (sel dec.ok) {
+                                        val n: usize = dec.ok;
+                                        if (n <= raw_n) {
+                                            buf.ok[n] = 0;
+                                            if (util.eq(buf.ok, "{root}")) {
+                                                is_root = true;
+                                                argv[argc] = root;
+                                            }
+                                            or (util.eq(buf.ok, "{file}")) {
+                                                has_file = true;
+                                                argv[argc] = nil;
+                                            }
+                                            or { argv[argc] = buf.ok; }
+                                            argc = argc + 1;
+                                        }
+                                        or { bad = true; }
+                                    }
+                                    or { bad = true; }
+                                }
+                                or { bad = true; }
+                            }
+                        }
+                        w = w + 1;
+                    }
+                    if (!bad && argc > 0 && is_root == want_root) {
+                        if (is_root) {
+                            var found: i64 = -1;
+                            var k: usize = 0;
+                            for (k < runs.len) {
+                                if (same_cmd(?runs.data[k], ?argv[0], argc)) { found = k::i64; }
+                                k = k + 1;
+                            }
+                            if (found >= 0) {
+                                vector.push[usize](?runs.data[found::usize].items, i);
+                                e.lang = ext;
+                            }
+                            or {
+                                var r: Run;
+                                r.lang = ext;
+                                r.external = true;
+                                r.stage = true;
+                                r.cwd = root;
+                                r.argc = argc;
+                                var c: usize = 0;
+                                for (c < argc) {
+                                    r.argv[c] = argv[c];
+                                    c = c + 1;
+                                }
+                                r.argv[argc] = nil;
+                                r.items = vector.init[usize](a);
+                                vector.push[usize](?r.items, i);
+                                e.lang = ext;
+                                vector.push[Run](runs, r);
+                            }
+                        }
+                        or {
+                            val rel: res[str, A.Error] = pathx.join(a, ".qark/preview", e.rel);
+                            if (sel rel.ok) {
+                                val full: res[str, A.Error] = pathx.native(a, root, rel.ok);
+                                if (sel full.ok) {
+                                    val parent: res[str, A.Error] = path.parent(a, full.ok);
+                                    if (sel parent.ok) { filesystem.create_dir_all(a, parent.ok, 493); }
+                                    val wr: err[filesystem.FsError] = filesystem.write_bytes(full.ok, e.data, e.len, 420);
+                                    if (sel wr.ok) {
+                                        var c: usize = 0;
+                                        for (c < argc) {
+                                            if (argv[c] == nil) { argv[c] = full.ok; }
+                                            c = c + 1;
+                                        }
+                                        if (!has_file && argc < 11) {
+                                            argv[argc] = full.ok;
+                                            argc = argc + 1;
+                                        }
+                                        var r: Run;
+                                        r.lang = ext;
+                                        r.external = true;
+                                        r.cwd = root;
+                                        r.preview = full.ok;
+                                        r.argc = argc;
+                                        c = 0;
+                                        for (c < argc) {
+                                            r.argv[c] = argv[c];
+                                            c = c + 1;
+                                        }
+                                        r.argv[argc] = nil;
+                                        r.items = vector.init[usize](a);
+                                        vector.push[usize](?r.items, i);
+                                        e.lang = ext;
+                                        vector.push[Run](runs, r);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        i = i + 1;
+    }
+}
+
+# check every entry that would be written; results land on the entries
+# ---
+# a:    request allocator for inputs and outputs
+# keep: long-lived allocator for the program paths remembered in tools
+pub fun run(a: *A.Allocator, keep: *A.Allocator, root: str, set: *commit.Set, tools: *Tools, timeout_ms: i64) {
+    var runs: vector.Vector[Run] = vector.init[Run](a);
+    val langs: [3]str = [3]str{"python", "node", "powershell"};
+    var li: usize = 0;
+    for (li < 3) {
+        var r: Run;
+        r.lang = langs[li];
+        r.batch = true;
+        r.items = vector.init[usize](a);
+        var i: usize = 0;
+        for (i < commit.count(set)) {
+            val e: *commit.Entry = commit.entry(set, i);
+            if (pending(e) && util.eq(e.lang, r.lang)) { vector.push[usize](?r.items, i); }
+            i = i + 1;
+        }
+        if (r.items.len > 0) { vector.push[Run](?runs, r); }
+        li = li + 1;
+    }
+    var i: usize = 0;
+    for (i < commit.count(set)) {
+        val e: *commit.Entry = commit.entry(set, i);
+        if (pending(e)) {
+            if (util.eq(e.lang, "json")) { native_json(a, e); }
+            or (util.eq(e.lang, "toml")) { native_toml(a, e); }
+            or (util.eq(e.lang, "bash")) {
+                var r: Run;
+                r.lang = "bash";
+                r.batch = false;
+                r.items = vector.init[usize](a);
+                vector.push[usize](?r.items, i);
+                vector.push[Run](?runs, r);
+            }
+        }
+        i = i + 1;
+    }
+    queue_project_checks(a, root, set, ?runs, false);
+    var k: usize = 0;
+    for (k < runs.len) {
+        val r: *Run = ?runs.data[k];
+        if (r.external) { spawn_once(a, set, r, timeout_ms); }
+        or {
+            if (prepare(a, keep, root, set, tools, r)) {
+                if (r.batch && send_warm(keep, tools, r)) { r.warm = true; }
+                or { spawn_once(a, set, r, timeout_ms); }
+            }
+        }
+        k = k + 1;
+    }
+    k = 0;
+    for (k < runs.len) {
+        val r: *Run = ?runs.data[k];
+        if (r.warm) {
+            var line: *u8 = nil;
+            var n: usize = 0;
+            val w: *warm.Warm = ?tools.warm[warm_index(r.lang)];
+            var done: bool = false;
+            if (warm.receive(w, timeout_ms, a, ?line, ?n)) { done = assign(a, set, r, line, n); }
+            if (!done) {
+                warm.stop(w);
+                spawn_once(a, set, r, timeout_ms);
+            }
+        }
+        if (r.started) { finish_run(a, set, r); }
+        if (r.preview != nil) { filesystem.remove_file(r.preview); }
+        k = k + 1;
+    }
+}
+
+# project checkers whose command names {root}. the new bytes are placed at
+# their real paths for the check and the previous bytes are put back before
+# this returns, whether the checker accepts or refuses.
+pub fun run_staged(a: *A.Allocator, root: str, set: *commit.Set, timeout_ms: i64) {
+    var runs: vector.Vector[Run] = vector.init[Run](a);
+    queue_project_checks(a, root, set, ?runs, true);
+    var k: usize = 0;
+    for (k < runs.len) {
+        val r: *Run = ?runs.data[k];
+        if (!place_staged(a, set, r)) { fail_all(set, r, "the project checker could not stage the new files"); }
+        or { spawn_once(a, set, r, timeout_ms); }
+        k = k + 1;
+    }
+    k = 0;
+    for (k < runs.len) {
+        val r: *Run = ?runs.data[k];
+        if (r.started) { finish_run(a, set, r); }
+        unplace_staged(a, set, r, r.items.len);
+        k = k + 1;
+    }
+}
+
+pub fun check_name(ck: u8) str {
+    if (ck == commit.CK_OK) { ret "ok"; }
+    if (ck == commit.CK_FAILED) { ret "failed"; }
+    if (ck == commit.CK_SKIPPED) { ret "skipped"; }
+    ret "none";
+}

@@ -1,0 +1,103 @@
+# autocmd bus; handlers are lisp ids or builtin ids
+
+use std.collections.vector;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+
+use A: std.allocator;
+use util: qark.util;
+
+pub val EV_WRITE_PRE:  u8 = 1;
+pub val EV_WRITE_POST: u8 = 2;
+pub val EV_ENTER:      u8 = 3;
+pub val EV_TEXT:       u8 = 4;
+pub val EV_LEAVE:      u8 = 5;
+
+# one handler
+pub rec Handler {
+    ev:   u8;
+    pat:  str;
+    lisp: u32;
+}
+
+# the handler list
+pub rec Bus {
+    a:     *A.Allocator;
+    items: vector.Vector[Handler];
+}
+
+# an empty bus
+pub fun init(a: *A.Allocator) Bus {
+    var b: Bus;
+    b.a = a;
+    b.items = vector.init[Handler](a);
+    ret b;
+}
+
+# release patterns
+pub fun dnit(b: *Bus) {
+    var i: usize = 0;
+    for (i < b.items.len) {
+        val g: opt[*Handler] = vector.get[Handler](?b.items, i);
+        if (sel g.some) { util.free(b.a, g.some.pat); }
+        i = i + 1;
+    }
+    vector.dnit[Handler](?b.items);
+}
+
+fun match_pat(pat: str, name: str) bool {
+    if (pat == nil || name == nil) { ret false; }
+    if (pat[0] == '*' && pat[1] == 0) { ret true; }
+    val pn: usize = str_len(pat);
+    val nn: usize = str_len(name);
+    if (pn > 0 && pat[0] == '*') {
+        if (pn - 1 > nn) { ret false; }
+        var i: usize = 0;
+        for (i < pn - 1) {
+            if (name[nn - (pn - 1) + i] != pat[1 + i]) { ret false; }
+            i = i + 1;
+        }
+        ret true;
+    }
+    ret util.eq(pat, name);
+}
+
+# register a handler; the pattern is copied
+pub fun on(b: *Bus, ev: u8, pat: str, lisp: u32) err[A.Error] {
+    val copied: res[str, A.Error] = util.dup(b.a, pat);
+    if (sel copied.err) { ret err[A.Error].err{copied.err}; }
+    var h: Handler;
+    h.ev = ev;
+    h.pat = copied.ok;
+    h.lisp = lisp;
+    val pushed: res[usize, A.Error] = vector.push[Handler](?b.items, h);
+    if (sel pushed.err) {
+        util.free(b.a, copied.ok);
+        ret err[A.Error].err{pushed.err};
+    }
+    ret err[A.Error].ok{};
+}
+
+# invoke every matching handler; `call` receives the lisp id
+pub fun fire(b: *Bus, ev: u8, name: str, ctx: *u8, call: fun(*u8, u32) i64) i64 {
+    var i: usize = 0;
+    var n: i64 = 0;
+    for (i < b.items.len) {
+        val g: opt[*Handler] = vector.get[Handler](?b.items, i);
+        if (sel g.some) {
+            if (g.some.ev == ev && match_pat(g.some.pat, name)) {
+                if (call != nil) { call(ctx, g.some.lisp); }
+                n = n + 1;
+            }
+        }
+        i = i + 1;
+    }
+    ret n;
+}

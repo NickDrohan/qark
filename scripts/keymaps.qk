@@ -1,0 +1,4 @@
+;; example bindings. leader is backslash.
+
+(nmap "<leader>w" ":w<CR>")
+(nmap "<leader>q" ":q<CR>")

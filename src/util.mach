@@ -1,0 +1,274 @@
+# owned bytes, decimal formatting, and small scanners
+
+use std.memory;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_equals;
+use std.types.string.str_len;
+
+use A: std.allocator;
+
+# copy n bytes and nul-terminate; the result is owned by a
+# ---
+# a:   allocator
+# src: source bytes (may be nil when n is 0)
+# n:   byte count
+# ret: owned string, or the allocator's refusal
+pub fun dup_n(a: *A.Allocator, src: *u8, n: usize) res[str, A.Error] {
+    val got: res[*u8, A.Error] = A.allocate[u8](a, n + 1);
+    if (sel got.err) { ret res[str, A.Error].err{got.err}; }
+    if (n > 0 && src != nil) { memory.copy[u8](got.ok, src, n); }
+    got.ok[n] = 0;
+    ret res[str, A.Error].ok{got.ok};
+}
+
+# copy a nul-terminated string; nil becomes an empty owned string
+# ---
+# a: allocator
+# s: borrowed string, or nil
+# ret: owned string, or the allocator's refusal
+pub fun dup(a: *A.Allocator, s: str) res[str, A.Error] {
+    if (s == nil) { ret dup_n(a, nil, 0); }
+    ret dup_n(a, s, str_len(s));
+}
+
+# release a string from dup or dup_n; nil is a no-op
+# ---
+# a: allocator the string came from
+# s: owned string
+# ret: the allocator's answer
+pub fun free(a: *A.Allocator, s: str) err[A.Error] {
+    if (s == nil) { ret err[A.Error].ok{}; }
+    ret A.deallocate[u8](a, s, str_len(s) + 1);
+}
+
+# grow a buffer so it can hold `need` bytes plus a trailing nul
+# ---
+# buf: pointer to the buffer pointer (updated on growth)
+# cap: pointer to the capacity in bytes, not counting the nul
+# need: minimum content capacity required
+# ret: ok, or the allocator's refusal (the old buffer stays)
+pub fun grow(a: *A.Allocator, buf: **u8, cap: *usize, need: usize) err[A.Error] {
+    if (@cap >= need) { ret err[A.Error].ok{}; }
+    var ncap: usize = 64;
+    if (@cap > ncap) { ncap = @cap; }
+    for (ncap < need) {
+        if (ncap > 0xffffffffffffff) { ret err[A.Error].err{A.Error.overflow{}}; }
+        ncap = ncap * 2;
+    }
+    var got: res[*u8, A.Error];
+    if (@buf == nil || @cap == 0) {
+        got = A.allocate[u8](a, ncap + 1);
+    }
+    or {
+        got = A.reallocate[u8](a, @buf, @cap + 1, ncap + 1);
+    }
+    if (sel got.err) { ret err[A.Error].err{got.err}; }
+    @buf = got.ok;
+    @cap = ncap;
+    ret err[A.Error].ok{};
+}
+
+# append n bytes to a growable nul-terminated buffer
+# ---
+# buf: buffer pointer
+# len: current length
+# cap: current capacity
+# src: bytes to append
+# n:   count
+# ret: ok, or the allocator's refusal
+pub fun append(a: *A.Allocator, buf: **u8, len: *usize, cap: *usize, src: *u8, n: usize) err[A.Error] {
+    if (n == 0) { ret err[A.Error].ok{}; }
+    val need: usize = @len + n;
+    if (need < @len) { ret err[A.Error].err{A.Error.overflow{}}; }
+    val g: err[A.Error] = grow(a, buf, cap, need);
+    if (sel g.err) { ret g; }
+    memory.copy[u8](((@buf)::usize + @len)::*u8, src, n);
+    @len = need;
+    (@buf)[@len] = 0;
+    ret err[A.Error].ok{};
+}
+
+# append one byte
+# ---
+# b: byte to append
+# ret: ok, or the allocator's refusal
+pub fun append_byte(a: *A.Allocator, buf: **u8, len: *usize, cap: *usize, b: u8) err[A.Error] {
+    var tmp: [1]u8;
+    tmp[0] = b;
+    ret append(a, buf, len, cap, ?tmp[0], 1);
+}
+
+# append a nul-terminated string
+# ---
+# s: string, nil is a no-op
+# ret: ok, or the allocator's refusal
+pub fun append_str(a: *A.Allocator, buf: **u8, len: *usize, cap: *usize, s: str) err[A.Error] {
+    if (s == nil) { ret err[A.Error].ok{}; }
+    ret append(a, buf, len, cap, s, str_len(s));
+}
+
+# write a signed integer into buf; returns the digit count, or 0 if it does not fit
+# ---
+# buf: destination
+# cap: capacity including the nul
+# n:   value
+# ret: characters written, excluding the nul
+pub fun fmt_i64(buf: *u8, cap: usize, n: i64) usize {
+    if (cap < 2) { ret 0; }
+    var x: i64 = n;
+    var neg: bool = false;
+    if (x < 0) {
+        neg = true;
+        if (x == -9223372036854775808) {
+            val lit: str = "-9223372036854775808";
+            val ln: usize = 20;
+            if (cap < ln + 1) { ret 0; }
+            memory.copy[u8](buf, lit, ln);
+            buf[ln] = 0;
+            ret ln;
+        }
+        x = 0 - x;
+    }
+    var tmp: [24]u8;
+    var i: usize = 0;
+    if (x == 0) {
+        tmp[0] = '0';
+        i = 1;
+    }
+    or {
+        for (x > 0) {
+            tmp[i] = ((x % 10)::u8) + '0';
+            x = x / 10;
+            i = i + 1;
+        }
+    }
+    var o: usize = 0;
+    if (neg) {
+        if (o + 1 >= cap) { ret 0; }
+        buf[o] = '-';
+        o = o + 1;
+    }
+    if (o + i >= cap) { ret 0; }
+    var k: usize = 0;
+    for (k < i) {
+        buf[o + k] = tmp[i - 1 - k];
+        k = k + 1;
+    }
+    buf[o + i] = 0;
+    ret o + i;
+}
+
+# write an unsigned integer into buf
+# ---
+# n: value
+# ret: characters written, excluding the nul, or 0 if it does not fit
+pub fun fmt_u64(buf: *u8, cap: usize, n: u64) usize {
+    if (cap < 2) { ret 0; }
+    var tmp: [24]u8;
+    var x: u64 = n;
+    var i: usize = 0;
+    if (x == 0) {
+        tmp[0] = '0';
+        i = 1;
+    }
+    or {
+        for (x > 0) {
+            tmp[i] = ((x % 10)::u8) + '0';
+            x = x / 10;
+            i = i + 1;
+        }
+    }
+    if (i + 1 > cap) { ret 0; }
+    var k: usize = 0;
+    for (k < i) {
+        buf[k] = tmp[i - 1 - k];
+        k = k + 1;
+    }
+    buf[i] = 0;
+    ret i;
+}
+
+# hex-encode n bytes into a caller buffer; needs 2*n+1 bytes
+# ---
+# ret: characters written, or 0 if the buffer is short
+pub fun fmt_hex(buf: *u8, cap: usize, src: *u8, n: usize) usize {
+    if (cap < n * 2 + 1) { ret 0; }
+    val hexd: str = "0123456789abcdef";
+    var i: usize = 0;
+    for (i < n) {
+        val b: u8 = src[i];
+        buf[i * 2] = hexd[(b >> 4)::usize];
+        buf[i * 2 + 1] = hexd[(b & 15)::usize];
+        i = i + 1;
+    }
+    buf[n * 2] = 0;
+    ret n * 2;
+}
+
+# true when s equals the literal t
+# ---
+# s: candidate, may be nil
+# t: literal
+# ret: content equality
+pub fun eq(s: str, t: str) bool {
+    if (s == nil || t == nil) { ret false; }
+    ret str_equals(s, t);
+}
+
+# index of c in s, or none
+# ---
+# s: haystack
+# c: byte
+# ret: index, or none
+pub fun index_byte(s: *u8, n: usize, c: u8) opt[usize] {
+    var i: usize = 0;
+    for (i < n) {
+        if (s[i] == c) { ret opt[usize].some{i}; }
+        i = i + 1;
+    }
+    ret opt[usize].none{};
+}
+
+# true when c is an ascii letter, digit, or underscore
+pub fun is_ident(c: u8) bool {
+    if (c >= 'a' && c <= 'z') { ret true; }
+    if (c >= 'A' && c <= 'Z') { ret true; }
+    if (c >= '0' && c <= '9') { ret true; }
+    if (c == '_') { ret true; }
+    ret false;
+}
+
+# true when c is ascii whitespace
+pub fun is_space(c: u8) bool {
+    if (c == ' ' || c == '\t' || c == '\n' || c == '\r') { ret true; }
+    ret false;
+}
+
+use std.system.capability;
+
+$if (capability.HOSTED) {
+    use page: std.allocator.page;
+
+    test dup__round_trip {
+        var a: A.Allocator;
+        val made: err[A.Error] = page.make(?a);
+        if (sel made.err) { ret 1; }
+        val s: res[str, A.Error] = dup(?a, "qark");
+        if (sel s.err) { ret 2; }
+        if (!str_equals(s.ok, "qark")) { ret 3; }
+        val freed: err[A.Error] = free(?a, s.ok);
+        if (sel freed.err) { ret 4; }
+        var buf: [8]u8;
+        if (fmt_i64(?buf[0], 8, -42) != 3) { ret 5; }
+        if (!str_equals(?buf[0], "-42")) { ret 6; }
+        if (fmt_u64(?buf[0], 8, 0) != 1) { ret 7; }
+        ret 0;
+    }
+}

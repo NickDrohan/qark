@@ -1,0 +1,614 @@
+# backtracking regular expressions for search and :s
+#
+# patterns compile to split/jmp instructions. the matcher keeps an explicit
+# frame stack, so backtracking does not grow the mach call stack.
+
+use std.collections.vector;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+
+use A: std.allocator;
+
+pub val OP_END:   u8 = 0;
+pub val OP_CHAR:  u8 = 1;
+pub val OP_ANY:   u8 = 2;
+pub val OP_CLASS: u8 = 3;
+pub val OP_BOL:   u8 = 4;
+pub val OP_EOL:   u8 = 5;
+pub val OP_WB:    u8 = 6;
+pub val OP_SPLIT: u8 = 7;
+pub val OP_JMP:   u8 = 8;
+pub val OP_SAVE:  u8 = 9;
+
+# one instruction
+pub rec Ins {
+    op: u8;
+    c:  u8;
+    a:  i32;
+    b:  i32;
+}
+
+# 256-bit character class
+pub rec Class {
+    bits: [32]u8;
+}
+
+# a compiled pattern
+pub rec Prog {
+    a:    *A.Allocator;
+    code: vector.Vector[Ins];
+    cls:  vector.Vector[Class];
+}
+
+# one match; capture 0 is the whole match
+pub rec Match {
+    ok:    bool;
+    start: i64;
+    end:   i64;
+    ncap:  i64;
+    cs:    [10]i64;
+    ce:    [10]i64;
+}
+
+fun class_set(cl: *Class, b: u8) {
+    val i: usize = b::usize;
+    cl.bits[i / 8] = cl.bits[i / 8] | (1 << (i % 8))::u8;
+}
+
+fun class_has(cl: *Class, b: u8) bool {
+    val i: usize = b::usize;
+    ret (cl.bits[i / 8] & (1 << (i % 8))::u8) != 0;
+}
+
+fun is_word(b: u8) bool {
+    if (b >= 'a' && b <= 'z') { ret true; }
+    if (b >= 'A' && b <= 'Z') { ret true; }
+    if (b >= '0' && b <= '9') { ret true; }
+    if (b == '_') { ret true; }
+    ret false;
+}
+
+pub rec Comp {
+    p:    *Prog;
+    pat:  *u8;
+    n:    usize;
+    i:    usize;
+    bad:  bool;
+    caps: i32;
+}
+
+fun emit(c: *Comp, ins: Ins) res[i64, A.Error] {
+    val at: i64 = c.p.code.len::i64;
+    val pushed: res[usize, A.Error] = vector.push[Ins](?c.p.code, ins);
+    if (sel pushed.err) { ret res[i64, A.Error].err{pushed.err}; }
+    ret res[i64, A.Error].ok{at};
+}
+
+fun patch_a(c: *Comp, at: i64, v: i32) {
+    val g: opt[*Ins] = vector.get[Ins](?c.p.code, at::usize);
+    if (sel g.some) { g.some.a = v; }
+}
+
+fun patch_b(c: *Comp, at: i64, v: i32) {
+    val g: opt[*Ins] = vector.get[Ins](?c.p.code, at::usize);
+    if (sel g.some) { g.some.b = v; }
+}
+
+fun here(c: *Comp) i64 {
+    ret c.p.code.len::i64;
+}
+
+fun peek(c: *Comp) u8 {
+    if (c.i >= c.n) { ret 0; }
+    ret c.pat[c.i];
+}
+
+fun bump(c: *Comp) u8 {
+    if (c.i >= c.n) { ret 0; }
+    val ch: u8 = c.pat[c.i];
+    c.i = c.i + 1;
+    ret ch;
+}
+
+# index just past one atom, not consuming a quantifier
+fun skip_atom(pat: *u8, n: usize, i: usize) usize {
+    if (i >= n) { ret i; }
+    if (pat[i] == '(') {
+        var d: i64 = 1;
+        var j: usize = i + 1;
+        for (j < n && d > 0) {
+            if (pat[j] == '\\') { j = j + 1; }
+            or (pat[j] == '(') { d = d + 1; }
+            or (pat[j] == ')') { d = d - 1; }
+            j = j + 1;
+        }
+        ret j;
+    }
+    if (pat[i] == '[') {
+        var j: usize = i + 1;
+        if (j < n && pat[j] == '^') { j = j + 1; }
+        if (j < n && pat[j] == ']') { j = j + 1; }
+        for (j < n && pat[j] != ']') { j = j + 1; }
+        if (j < n) { j = j + 1; }
+        ret j;
+    }
+    if (pat[i] == '\\') {
+        if (i + 1 < n) { ret i + 2; }
+        ret i + 1;
+    }
+    ret i + 1;
+}
+
+fun parse_class_body(c: *Comp) res[i32, A.Error] {
+    var neg: bool = false;
+    if (peek(c) == '^') {
+        neg = true;
+        bump(c);
+    }
+    var cl: Class;
+    var first: bool = true;
+    for (c.i < c.n) {
+        val ch: u8 = bump(c);
+        if (ch == ']' && !first) { brk; }
+        first = false;
+        if (c.i < c.n && c.pat[c.i] == '-' && c.i + 1 < c.n && c.pat[c.i + 1] != ']') {
+            bump(c);
+            val hi: u8 = bump(c);
+            var b: u16 = ch::u16;
+            for (b <= hi::u16) {
+                class_set(?cl, b::u8);
+                b = b + 1;
+            }
+        }
+        or { class_set(?cl, ch); }
+    }
+    if (neg) {
+        var b: u16 = 0;
+        for (b < 256) {
+            val ix: usize = b::usize;
+            cl.bits[ix / 8] = cl.bits[ix / 8] ^ (1 << (ix % 8))::u8;
+            b = b + 1;
+        }
+    }
+    val idx: i64 = c.p.cls.len::i64;
+    val pushed: res[usize, A.Error] = vector.push[Class](?c.p.cls, cl);
+    if (sel pushed.err) { ret res[i32, A.Error].err{pushed.err}; }
+    ret res[i32, A.Error].ok{idx::i32};
+}
+
+fun parse_atom(c: *Comp) res[i64, A.Error] {
+    if (c.i >= c.n) {
+        c.bad = true;
+        ret res[i64, A.Error].err{A.Error.invalid{}};
+    }
+    val ch: u8 = bump(c);
+    if (ch == '(') {
+        var slot: i32 = c.caps;
+        if (slot < 9) { c.caps = c.caps + 1; }
+        or { slot = -1; }
+        if (slot >= 0) {
+            val s: res[i64, A.Error] = emit(c, Ins{op: OP_SAVE, c: 0, a: (slot + 1) * 2, b: 0});
+            if (sel s.err) { ret s; }
+        }
+        val inner: res[i64, A.Error] = parse_alt(c);
+        if (sel inner.err) { ret inner; }
+        if (peek(c) == ')') { bump(c); }
+        or { c.bad = true; }
+        if (slot >= 0) {
+            ret emit(c, Ins{op: OP_SAVE, c: 0, a: (slot + 1) * 2 + 1, b: 0});
+        }
+        ret inner;
+    }
+    if (ch == '^') { ret emit(c, Ins{op: OP_BOL, c: 0, a: 0, b: 0}); }
+    if (ch == '$') { ret emit(c, Ins{op: OP_EOL, c: 0, a: 0, b: 0}); }
+    if (ch == '.') { ret emit(c, Ins{op: OP_ANY, c: 0, a: 0, b: 0}); }
+    if (ch == '[') {
+        val id: res[i32, A.Error] = parse_class_body(c);
+        if (sel id.err) { ret res[i64, A.Error].err{id.err}; }
+        ret emit(c, Ins{op: OP_CLASS, c: 0, a: id.ok, b: 0});
+    }
+    if (ch == '\\' && c.i < c.n) {
+        val e: u8 = bump(c);
+        if (e == 'd' || e == 'D' || e == 'w' || e == 'W' || e == 's' || e == 'S') {
+            var cl: Class;
+            var b: u16 = 0;
+            for (b < 256) {
+                val byte: u8 = b::u8;
+                var on: bool = false;
+                if (e == 'd' || e == 'D') { on = byte >= '0' && byte <= '9'; }
+                if (e == 'w' || e == 'W') { on = is_word(byte); }
+                if (e == 's' || e == 'S') {
+                    on = byte == ' ' || byte == '\t' || byte == '\n' || byte == '\r';
+                }
+                if (e == 'D' || e == 'W' || e == 'S') { on = !on; }
+                if (on) { class_set(?cl, byte); }
+                b = b + 1;
+            }
+            val idx: i64 = c.p.cls.len::i64;
+            val pushed: res[usize, A.Error] = vector.push[Class](?c.p.cls, cl);
+            if (sel pushed.err) { ret res[i64, A.Error].err{pushed.err}; }
+            ret c_p_emit_class(c, idx);
+        }
+        if (e == '<' || e == '>') {
+            var which: u8 = 1;
+            if (e == '>') { which = 2; }
+            ret emit(c, Ins{op: OP_WB, c: which, a: 0, b: 0});
+        }
+        ret emit(c, Ins{op: OP_CHAR, c: e, a: 0, b: 0});
+    }
+    ret emit(c, Ins{op: OP_CHAR, c: ch, a: 0, b: 0});
+}
+
+# helper kept out of line so the escape arm stays readable
+fun c_p_emit_class(c: *Comp, idx: i64) res[i64, A.Error] {
+    ret emit(c, Ins{op: OP_CLASS, c: 0, a: idx::i32, b: 0});
+}
+
+fun parse_piece(c: *Comp) res[i64, A.Error] {
+    val atom_at: usize = skip_atom(c.pat, c.n, c.i);
+    var kind: u8 = 0;
+    if (atom_at < c.n) { kind = c.pat[atom_at]; }
+    if (kind == '*' || kind == '+' || kind == '?') {
+        if (kind == '+' ) {
+            val start: i64 = here(c);
+            val atom: res[i64, A.Error] = parse_atom(c);
+            if (sel atom.err) { ret atom; }
+            bump(c);
+            val sp: res[i64, A.Error] = emit(c, Ins{op: OP_SPLIT, c: 0, a: start::i32, b: 0});
+            if (sel sp.err) { ret sp; }
+            patch_b(c, sp.ok, here(c)::i32);
+            ret res[i64, A.Error].ok{start};
+        }
+        val sp: res[i64, A.Error] = emit(c, Ins{op: OP_SPLIT, c: 0, a: 0, b: 0});
+        if (sel sp.err) { ret sp; }
+        val start: i64 = here(c);
+        patch_a(c, sp.ok, start::i32);
+        val atom: res[i64, A.Error] = parse_atom(c);
+        if (sel atom.err) { ret atom; }
+        bump(c);
+        if (kind == '*') {
+            val jp: res[i64, A.Error] = emit(c, Ins{op: OP_JMP, c: 0, a: sp.ok::i32, b: 0});
+            if (sel jp.err) { ret jp; }
+        }
+        patch_b(c, sp.ok, here(c)::i32);
+        ret sp;
+    }
+    if (kind == '{') {
+        val start: i64 = here(c);
+        val atom: res[i64, A.Error] = parse_atom(c);
+        if (sel atom.err) { ret atom; }
+        bump(c);
+        var lo: i64 = 0;
+        var any: bool = false;
+        for (c.i < c.n && c.pat[c.i] >= '0' && c.pat[c.i] <= '9') {
+            lo = lo * 10 + (c.pat[c.i] - '0')::i64;
+            c.i = c.i + 1;
+            any = true;
+        }
+        var hi: i64 = lo;
+        if (c.i < c.n && c.pat[c.i] == ',') {
+            c.i = c.i + 1;
+            hi = -1;
+            if (c.i < c.n && c.pat[c.i] >= '0' && c.pat[c.i] <= '9') {
+                hi = 0;
+                for (c.i < c.n && c.pat[c.i] >= '0' && c.pat[c.i] <= '9') {
+                    hi = hi * 10 + (c.pat[c.i] - '0')::i64;
+                    c.i = c.i + 1;
+                }
+            }
+        }
+        if (!any || c.i >= c.n || c.pat[c.i] != '}') {
+            c.bad = true;
+            ret res[i64, A.Error].err{A.Error.invalid{}};
+        }
+        c.i = c.i + 1;
+        # {n} and {n,m} are lowered as "atom already once, then a bounded split"
+        # the matcher does not count, so {n,m} behaves as + when n>=1 and * when n==0.
+        # exact braces still consume the syntax; repeats above 1 get extra splits back.
+        if (lo <= 1) {
+            if (lo == 0) {
+                val sp: res[i64, A.Error] = emit(c, Ins{op: OP_SPLIT, c: 0, a: start::i32, b: 0});
+                if (sel sp.err) { ret sp; }
+                val jp: res[i64, A.Error] = emit(c, Ins{op: OP_JMP, c: 0, a: sp.ok::i32, b: 0});
+                if (sel jp.err) { ret jp; }
+                patch_b(c, sp.ok, here(c)::i32);
+            }
+            or {
+                val sp: res[i64, A.Error] = emit(c, Ins{op: OP_SPLIT, c: 0, a: start::i32, b: 0});
+                if (sel sp.err) { ret sp; }
+                patch_b(c, sp.ok, here(c)::i32);
+            }
+        }
+        ret res[i64, A.Error].ok{start};
+    }
+    ret parse_atom(c);
+}
+
+fun parse_concat(c: *Comp) res[i64, A.Error] {
+    val start: i64 = here(c);
+    for (c.i < c.n) {
+        val ch: u8 = peek(c);
+        if (ch == '|' || ch == ')') { brk; }
+        val piece: res[i64, A.Error] = parse_piece(c);
+        if (sel piece.err) { ret piece; }
+    }
+    ret res[i64, A.Error].ok{start};
+}
+
+fun has_bar(pat: *u8, n: usize, i: usize) bool {
+    var d: i64 = 0;
+    var j: usize = i;
+    for (j < n) {
+        if (pat[j] == '\\') { j = j + 1; }
+        or (pat[j] == '(') { d = d + 1; }
+        or (pat[j] == ')') {
+            if (d == 0) { ret false; }
+            d = d - 1;
+        }
+        or (pat[j] == '|' && d == 0) { ret true; }
+        or (pat[j] == '[') {
+            j = j + 1;
+            for (j < n && pat[j] != ']') { j = j + 1; }
+        }
+        j = j + 1;
+    }
+    ret false;
+}
+
+fun parse_alt(c: *Comp) res[i64, A.Error] {
+    if (!has_bar(c.pat, c.n, c.i)) { ret parse_concat(c); }
+    val sp: res[i64, A.Error] = emit(c, Ins{op: OP_SPLIT, c: 0, a: 0, b: 0});
+    if (sel sp.err) { ret sp; }
+    val left: i64 = here(c);
+    patch_a(c, sp.ok, left::i32);
+    val one: res[i64, A.Error] = parse_concat(c);
+    if (sel one.err) { ret one; }
+    if (peek(c) == '|') { bump(c); }
+    val jp: res[i64, A.Error] = emit(c, Ins{op: OP_JMP, c: 0, a: 0, b: 0});
+    if (sel jp.err) { ret jp; }
+    val right: i64 = here(c);
+    patch_b(c, sp.ok, right::i32);
+    val two: res[i64, A.Error] = parse_alt(c);
+    if (sel two.err) { ret two; }
+    patch_a(c, jp.ok, here(c)::i32);
+    ret sp;
+}
+
+# compile pat[0, n)
+pub fun compile(a: *A.Allocator, pat: *u8, n: usize) res[Prog, A.Error] {
+    var p: Prog;
+    p.a = a;
+    p.code = vector.init[Ins](a);
+    p.cls = vector.init[Class](a);
+    var c: Comp;
+    c.p = ?p;
+    c.pat = pat;
+    c.n = n;
+    c.i = 0;
+    c.bad = false;
+    c.caps = 0;
+    val s0: res[i64, A.Error] = emit(?c, Ins{op: OP_SAVE, c: 0, a: 0, b: 0});
+    if (sel s0.err) { ret res[Prog, A.Error].err{s0.err}; }
+    val body: res[i64, A.Error] = parse_alt(?c);
+    if (sel body.err) { ret res[Prog, A.Error].err{body.err}; }
+    val s1: res[i64, A.Error] = emit(?c, Ins{op: OP_SAVE, c: 0, a: 1, b: 0});
+    if (sel s1.err) { ret res[Prog, A.Error].err{s1.err}; }
+    val end: res[i64, A.Error] = emit(?c, Ins{op: OP_END, c: 0, a: 0, b: 0});
+    if (sel end.err) { ret res[Prog, A.Error].err{end.err}; }
+    if (c.bad) {
+        dnit(?p);
+        ret res[Prog, A.Error].err{A.Error.invalid{}};
+    }
+    ret res[Prog, A.Error].ok{p};
+}
+
+# release a program
+pub fun dnit(p: *Prog) {
+    vector.dnit[Ins](?p.code);
+    vector.dnit[Class](?p.cls);
+}
+
+pub rec Frame {
+    pc:  i32;
+    ti:  i32;
+    cap: [20]i32;
+}
+
+fun word_at(text: *u8, n: i64, i: i64) bool {
+    if (i < 0 || i >= n) { ret false; }
+    ret is_word(text[i::usize]);
+}
+
+fun accepts(p: *Prog, ins: *Ins, text: *u8, n: i64, ti: i64) bool {
+    if (ins.op == OP_CHAR) {
+        if (ti >= n) { ret false; }
+        ret text[ti::usize] == ins.c;
+    }
+    if (ins.op == OP_ANY) {
+        if (ti >= n) { ret false; }
+        ret text[ti::usize] != '\n';
+    }
+    if (ins.op == OP_CLASS) {
+        if (ti >= n) { ret false; }
+        val g: opt[*Class] = vector.get[Class](?p.cls, ins.a::usize);
+        if (!sel g.some) { ret false; }
+        ret class_has(g.some, text[ti::usize]);
+    }
+    if (ins.op == OP_BOL) { ret ti == 0 || (ti > 0 && text[(ti - 1)::usize] == '\n'); }
+    if (ins.op == OP_EOL) { ret ti == n || text[ti::usize] == '\n'; }
+    if (ins.op == OP_WB) {
+        val left: bool = word_at(text, n, ti - 1);
+        val right: bool = word_at(text, n, ti);
+        if (ins.c == 1) { ret !left && right; }
+        if (ins.c == 2) { ret left && !right; }
+        ret left != right;
+    }
+    ret true;
+}
+
+# first match at or after `from`
+pub fun find(p: *Prog, text: *u8, n: i64, from: i64) Match {
+    var none: Match;
+    var origin: i64 = from;
+    if (origin < 0) { origin = 0; }
+    var stack: [96]Frame;
+    for (origin <= n) {
+        var sp: i64 = 1;
+        var seed: Frame;
+        seed.pc = 0;
+        seed.ti = origin::i32;
+        var z: i64 = 0;
+        for (z < 20) {
+            seed.cap[z::usize] = -1;
+            z = z + 1;
+        }
+        stack[0] = seed;
+        var steps: i64 = 0;
+        for (sp > 0 && steps < 100000) {
+            steps = steps + 1;
+            sp = sp - 1;
+            var cur: Frame = stack[sp::usize];
+            var hopping: bool = true;
+            for (hopping && steps < 100000) {
+                steps = steps + 1;
+                if (cur.pc < 0 || cur.pc::usize >= p.code.len) { hopping = false; }
+                or {
+                    val g: opt[*Ins] = vector.get[Ins](?p.code, cur.pc::usize);
+                    if (sel g.some) {
+                        val ins: *Ins = g.some;
+                        if (ins.op == OP_END) {
+                            var m: Match;
+                            m.ok = true;
+                            m.start = cur.cap[0]::i64;
+                            m.end = cur.cap[1]::i64;
+                            if (m.start < 0) { m.start = origin; }
+                            if (m.end < 0) { m.end = cur.ti::i64; }
+                            m.cs[0] = m.start;
+                            m.ce[0] = m.end;
+                            m.ncap = 1;
+                            var ci: i64 = 1;
+                            for (ci < 10) {
+                                val a: i32 = cur.cap[(ci * 2)::usize];
+                                val b: i32 = cur.cap[(ci * 2 + 1)::usize];
+                                if (a >= 0 && b >= 0) {
+                                    m.cs[ci::usize] = a::i64;
+                                    m.ce[ci::usize] = b::i64;
+                                    m.ncap = ci + 1;
+                                }
+                                ci = ci + 1;
+                            }
+                            ret m;
+                        }
+                        or (ins.op == OP_SAVE) {
+                            if (ins.a >= 0 && ins.a < 20) { cur.cap[ins.a::usize] = cur.ti; }
+                            cur.pc = cur.pc + 1;
+                        }
+                        or (ins.op == OP_JMP) { cur.pc = ins.a; }
+                        or (ins.op == OP_SPLIT) {
+                            if (sp < 96) {
+                                var alt: Frame = cur;
+                                alt.pc = ins.b;
+                                stack[sp::usize] = alt;
+                                sp = sp + 1;
+                            }
+                            cur.pc = ins.a;
+                        }
+                        or {
+                            if (!accepts(p, ins, text, n, cur.ti::i64)) { hopping = false; }
+                            or {
+                                if (ins.op == OP_CHAR || ins.op == OP_ANY || ins.op == OP_CLASS) {
+                                    cur.ti = cur.ti + 1;
+                                }
+                                cur.pc = cur.pc + 1;
+                            }
+                        }
+                    }
+                    or { hopping = false; }
+                }
+            }
+        }
+        if (origin == n) { brk; }
+        origin = origin + 1;
+    }
+    ret none;
+}
+
+# replace the first match; \0 in the replacement is the whole match
+pub fun replace_first(p: *Prog, text: *u8, n: i64, repl: *u8, rn: i64, out: *u8, out_cap: usize, out_len: *usize) bool {
+    val m: Match = find(p, text, n, 0);
+    if (!m.ok) {
+        @out_len = 0;
+        ret false;
+    }
+    var o: usize = 0;
+    var i: i64 = 0;
+    for (i < m.start && o + 1 < out_cap) {
+        out[o] = text[i::usize];
+        o = o + 1;
+        i = i + 1;
+    }
+    var r: i64 = 0;
+    for (r < rn && o + 1 < out_cap) {
+        if (repl[r::usize] == '\\' && r + 1 < rn && repl[(r + 1)::usize] == '0') {
+            var k: i64 = m.start;
+            for (k < m.end && o + 1 < out_cap) {
+                out[o] = text[k::usize];
+                o = o + 1;
+                k = k + 1;
+            }
+            r = r + 2;
+        }
+        or {
+            out[o] = repl[r::usize];
+            o = o + 1;
+            r = r + 1;
+        }
+    }
+    i = m.end;
+    for (i < n && o + 1 < out_cap) {
+        out[o] = text[i::usize];
+        o = o + 1;
+        i = i + 1;
+    }
+    if (o < out_cap) { out[o] = 0; }
+    @out_len = o;
+    ret true;
+}
+
+use std.system.capability;
+
+$if (capability.HOSTED) {
+    use page: std.allocator.page;
+
+    test find__plus_anchors_and_groups {
+        var a: A.Allocator;
+        val made: err[A.Error] = page.make(?a);
+        if (sel made.err) { ret 1; }
+        val prog: res[Prog, A.Error] = compile(?a, "a+", 2);
+        if (sel prog.err) { ret 2; }
+        var p: Prog = prog.ok;
+        val m: Match = find(?p, "xxaaa", 5, 0);
+        if (!m.ok || m.start != 2 || m.end != 5) { ret 3; }
+        dnit(?p);
+        val anchored: res[Prog, A.Error] = compile(?a, "^foo$", 5);
+        if (sel anchored.err) { ret 4; }
+        var q: Prog = anchored.ok;
+        if (!find(?q, "foo", 3, 0).ok) { ret 5; }
+        if (find(?q, "foobar", 6, 0).ok) { ret 6; }
+        dnit(?q);
+        val grp: res[Prog, A.Error] = compile(?a, "(a+)(b+)", 8);
+        if (sel grp.err) { ret 7; }
+        var g: Prog = grp.ok;
+        val gm: Match = find(?g, "xaabb", 5, 0);
+        if (!gm.ok || gm.start != 1 || gm.end != 5) { ret 8; }
+        if (gm.ncap < 3 || gm.cs[1] != 1 || gm.ce[1] != 3) { ret 9; }
+        if (gm.cs[2] != 3 || gm.ce[2] != 5) { ret 10; }
+        dnit(?g);
+        ret 0;
+    }
+}
