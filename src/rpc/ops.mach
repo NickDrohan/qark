@@ -220,14 +220,33 @@ fun job_write(s: *session.Session, req: i64, root_rel: str, job_id: str, rel: st
 }
 
 fun write_op(op: str) bool {
-    ret util.eq(op, "apply") || util.eq(op, "read") || util.eq(op, "search") || util.eq(op, "template.list") || util.eq(op, "template.define") || util.eq(op, "template.render") || util.eq(op, "job.verify") || util.eq(op, "session.info");
+    ret util.eq(op, "apply") || util.eq(op, "undo") || util.eq(op, "redo") || util.eq(op, "read") || util.eq(op, "search") || util.eq(op, "impact") || util.eq(op, "events") || util.eq(op, "journal.read") || util.eq(op, "project.validate") || util.eq(op, "capabilities") || util.eq(op, "schema") || util.eq(op, "release.sign") || util.eq(op, "release.verify") || util.eq(op, "template.list") || util.eq(op, "template.define") || util.eq(op, "template.render") || util.eq(op, "job.verify") || util.eq(op, "session.info");
 }
 
 # run one write-layer op into w; true when w holds a result rather than an error
 pub fun run_write(s: *session.Session, op: str, args: *json.Value, w: *jw.Jw) bool {
+    if (json.value_is_object(args)) {
+        val rf: opt[*json.Value] = json.value_find(args, "root");
+        if (sel rf.some) {
+            if (!json.value_is_string(rf.some)) { ret write.simple_error(w, "spec_type", "root must be a directory path string"); }
+            var rp: *u8 = nil;
+            if (decode_string(?s.ra, rf.some, MAX_FIELD, ?rp) == 1 && rp != nil && rp[0] != 0) {
+                if (!session.set_root(s, rp)) { ret write.simple_error(w, "bad_root", "root is not an existing directory"); }
+            }
+        }
+    }
     if (util.eq(op, "apply")) { ret write.apply(s, args, w); }
+    if (util.eq(op, "undo")) { ret write.undo(s, args, w); }
+    if (util.eq(op, "redo")) { ret write.redo(s, args, w); }
     if (util.eq(op, "read")) { ret write.read(s, args, w); }
     if (util.eq(op, "search")) { ret write.search(s, args, w); }
+    if (util.eq(op, "impact")) { ret write.impact(s, args, w); }
+    if (util.eq(op, "events") || util.eq(op, "journal.read")) { ret write.events(s, args, w); }
+    if (util.eq(op, "project.validate")) { ret write.project_validate(s, args, w); }
+    if (util.eq(op, "capabilities")) { ret write.capabilities(s, w); }
+    if (util.eq(op, "schema")) { ret write.schema(s, args, w); }
+    if (util.eq(op, "release.sign")) { ret write.release_sign(s, args, w); }
+    if (util.eq(op, "release.verify")) { ret write.release_verify(s, args, w); }
     if (util.eq(op, "template.list")) { ret write.templates(s, args, w); }
     if (util.eq(op, "template.define")) { ret write.define(s, args, w); }
     if (util.eq(op, "template.render")) { ret write.render(s, args, w); }
@@ -564,7 +583,7 @@ $if (capability.HOSTED) {
         session.bind(?s);
         val out: res[str, A.Error] = dispatch(?s, "{\"id\":1,\"op\":\"session.info\"}");
         if (sel out.err) { ret 3; }
-        if (!str_contains(out.ok, "{\"id\":1,\"ok\":true,\"result\":{\"name\":\"qark\",\"version\":\"0.2.0\",\"protocol\":2,")) {
+        if (!str_contains(out.ok, "{\"id\":1,\"ok\":true,\"result\":{\"name\":\"qark\",\"version\":\"0.3.0\",\"protocol\":2,")) {
             ret 4;
         }
         util.free(?a, out.ok);

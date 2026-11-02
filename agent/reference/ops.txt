@@ -1,16 +1,25 @@
-apply            files, vars, templates, job, dest, run, prune, dry_run, preview, diff, check, tag -> receipt
-read             path | paths, content, lines, outline, max_bytes -> files with sha256 and symbols
-search           pattern?, regex, icase, glob, path, context, max, max_files, all -> matches per file with sha256;
+﻿apply            files (path | glob), vars, templates, job, dest, run, prune, dry_run, preview, diff, check, contract, rebase, base_text, validate, stream, undo, redo, tag -> receipt with semantic preview
+undo             txn? | list | redo, steps, dry_run, force, diff -> revert latest or N transactions from .qark/undo
+redo             txn?, dry_run, force, diff -> redo undone transaction from .qark/undo
+read             path | paths, content, lines, symbol, symbols, fold, outline, max_bytes -> files with sha256 and symbols
+search           pattern?, regex, icase, glob, path, context, max, max_files, all, impact -> matches per file with sha256 and enclosing symbol;
                  no pattern lists the matching paths
+impact           symbol | pattern, glob, path -> definitions, references, imports, dependents, affected_files, affected_symbols
+events           since_offset, offset, limit -> transaction events from .qark/journal.ndjson
+project.validate validate | cmd -> run project-wide validation
+capabilities     -> version, features, symbol_edit_modes, contract_fields, ops, languages, limits, checkers
+schema           op? -> machine-readable input/output schemas for operations
+release.sign     dir, key?, version? -> write SHA256SUMS and signed RELEASE.json
+release.verify   dir, key? -> verify SHA256SUMS, signature, and every file in RELEASE.json
 template.list    name? -> templates with vars, or one template's text
 template.define  name, text | lines, lang, description, persist
 template.render  template | tmpl, vars -> text
 job.verify       dir -> every manifest file checked against its sha256
-session.info     -> version, root, limits, checkers
-file edits       find, find_re (\0-\9 captures), lines, insert_before|after (line or anchor), append,
-                 prepend, ex, keys; within scopes them, occurrence picks one, all/count widen
+session.info     -> version, root, features, limits, checkers
+file edits       symbol (with | body | signature | rename), find, find_re (\0-\9 captures), lines, insert_before|after (line, anchor, or symbol; auto_indent),
+                 append, prepend, ex, keys; within/symbol scopes them, occurrence picks one, all/count widen
 file move        {path: dst, move: src} -> atomic rename; expect pins the source's sha256
 buf.create buf.set_lines keys.feed cmd.ex eval validate.ident job.write
-receipt          per file: status, sha256, notes[] (normalized eol, ignored keys); top: warnings[]
+receipt          per file: status, sha256, semantic{added,modified,removed}, rebased, notes[]; top: warnings[], events[]
                  unchanged carries reason no_change|same_content; not-found names line and column
-codes            conflict check_failed locked spec_* tmpl_* edit_* path_* too_large io_commit
+codes            conflict rebase_conflict contract_violation check_failed locked undo_* redo_* release_* spec_* tmpl_* edit_* path_* too_large io_commit

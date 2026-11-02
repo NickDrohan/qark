@@ -27,7 +27,7 @@ use write: qark.rpc.write;
 use ui: qark.ui.app;
 use util: qark.util;
 
-pub val VERSION: str = "0.2.0";
+pub val VERSION: str = "0.3.0";
 
 fun arg(argv: **u8, i: i64) str {
     if (argv == nil || i < 0) { ret nil; }
@@ -53,14 +53,23 @@ fun value_after(argc: i64, argv: **u8, flag: str) str {
 }
 
 fun help() {
-    print.println("qark 0.2.0 - the write layer for agents, and a modal editor");
+    print.println("qark 0.3.0 - the write layer for agents, and a modal editor");
     print.println("  qark mcp [--root DIR]                  model context protocol server on stdio");
     print.println("  qark --headless --stdio [--root DIR]   ndjson worker on stdio");
     print.println("  qark apply SPEC|- [--dry-run] [--root DIR]");
     print.println("                                         apply a json spec ('-' reads stdin); prints the receipt");
+    print.println("  qark undo [TXN] [--steps N] [--dry-run] [--force] [--root DIR]");
+    print.println("                                         revert transactions using .qark/undo/<txn>.json");
+    print.println("  qark redo [TXN] [--dry-run] [--force] [--root DIR]");
+    print.println("                                         redo an undone transaction from .qark/undo");
+    print.println("  qark impact SYMBOL [GLOB] [--root DIR] resolved reference and impact graph for a symbol");
+    print.println("  qark events [--root DIR]               read transaction events from .qark/journal.ndjson");
+    print.println("  qark check [--root DIR]                run project validation from .qark/checks.json");
+    print.println("  qark release sign|verify DIR [--key K] sign or verify a release directory");
     print.println("  qark validate JOB_DIR [--root DIR]     verify a job against its manifest");
     print.println("  qark templates [--root DIR]            list templates");
-    print.println("  qark --dump ops|keys|lisp              print a reference");
+    print.println("  qark --dump ops|keys|lisp|capabilities|schema");
+    print.println("                                         print a reference or machine-readable schema");
     print.println("  qark --script FILE | --repl            qark lisp");
     print.println("  qark trace export --sft IN OUT         wrap a trace as one chat example");
     print.println("  qark                                   open the terminal ui");
@@ -69,22 +78,31 @@ fun help() {
 
 fun dump(which: str) {
     if (str_equals(which, "ops")) {
-        print.println("apply            files, vars, templates, job, dest, run, prune, dry_run, preview, diff, check, tag -> receipt");
-        print.println("read             path | paths, content, lines, outline, max_bytes -> files with sha256 and symbols");
-        print.println("search           pattern?, regex, icase, glob, path, context, max, max_files, all -> matches per file with sha256;");
+        print.println("apply            files (path | glob), vars, templates, job, dest, run, prune, dry_run, preview, diff, check, contract, rebase, base_text, validate, stream, undo, redo, tag -> receipt with semantic preview");
+        print.println("undo             txn? | list | redo, steps, dry_run, force, diff -> revert latest or N transactions from .qark/undo");
+        print.println("redo             txn?, dry_run, force, diff -> redo undone transaction from .qark/undo");
+        print.println("read             path | paths, content, lines, symbol, symbols, fold, outline, max_bytes -> files with sha256 and symbols");
+        print.println("search           pattern?, regex, icase, glob, path, context, max, max_files, all, impact -> matches per file with sha256 and enclosing symbol;");
         print.println("                 no pattern lists the matching paths");
+        print.println("impact           symbol | pattern, glob, path -> definitions, references, imports, dependents, affected_files, affected_symbols");
+        print.println("events           since_offset, offset, limit -> transaction events from .qark/journal.ndjson");
+        print.println("project.validate validate | cmd -> run project-wide validation");
+        print.println("capabilities     -> version, features, symbol_edit_modes, contract_fields, ops, languages, limits, checkers");
+        print.println("schema           op? -> machine-readable input/output schemas for operations");
+        print.println("release.sign     dir, key?, version? -> write SHA256SUMS and signed RELEASE.json");
+        print.println("release.verify   dir, key? -> verify SHA256SUMS, signature, and every file in RELEASE.json");
         print.println("template.list    name? -> templates with vars, or one template's text");
         print.println("template.define  name, text | lines, lang, description, persist");
         print.println("template.render  template | tmpl, vars -> text");
         print.println("job.verify       dir -> every manifest file checked against its sha256");
-        print.println("session.info     -> version, root, limits, checkers");
-        print.println("file edits       find, find_re (\\0-\\9 captures), lines, insert_before|after (line or anchor), append,");
-        print.println("                 prepend, ex, keys; within scopes them, occurrence picks one, all/count widen");
+        print.println("session.info     -> version, root, features, limits, checkers");
+        print.println("file edits       symbol (with | body | signature | rename), find, find_re (\\0-\\9 captures), lines, insert_before|after (line, anchor, or symbol; auto_indent),");
+        print.println("                 append, prepend, ex, keys; within/symbol scopes them, occurrence picks one, all/count widen");
         print.println("file move        {path: dst, move: src} -> atomic rename; expect pins the source's sha256");
         print.println("buf.create buf.set_lines keys.feed cmd.ex eval validate.ident job.write");
-        print.println("receipt          per file: status, sha256, notes[] (normalized eol, ignored keys); top: warnings[]");
+        print.println("receipt          per file: status, sha256, semantic{added,modified,removed}, rebased, notes[]; top: warnings[], events[]");
         print.println("                 unchanged carries reason no_change|same_content; not-found names line and column");
-        print.println("codes            conflict check_failed locked spec_* tmpl_* edit_* path_* too_large io_commit");
+        print.println("codes            conflict rebase_conflict contract_violation check_failed locked undo_* redo_* release_* spec_* tmpl_* edit_* path_* too_large io_commit");
         ret;
     }
     if (str_equals(which, "keys")) {
@@ -199,7 +217,7 @@ fun apply_file(s: *session.Session, src: str, dry: bool) i64 {
 
 # parse argv and run the chosen mode
 pub fun run(argc: i64, argv: **u8) i64 {
-    if (has(argc, argv, "--version")) {
+    if (argc == 2 && str_equals(arg(argv, 1), "--version")) {
         print.println(VERSION);
         ret 0;
     }
@@ -208,7 +226,7 @@ pub fun run(argc: i64, argv: **u8) i64 {
         ret 0;
     }
     val dumped: str = value_after(argc, argv, "--dump");
-    if (dumped != nil) {
+    if (dumped != nil && !str_equals(dumped, "capabilities") && !str_equals(dumped, "schema")) {
         dump(dumped);
         ret 0;
     }
@@ -243,6 +261,20 @@ pub fun run(argc: i64, argv: **u8) i64 {
         session.close(?s);
         ret 2;
     }
+    if (dumped != nil) {
+        session.begin_request(?s);
+        var dw: jw.Jw = jw.init(?s.ra);
+        var dok: bool = false;
+        if (str_equals(dumped, "capabilities")) { dok = write.capabilities(?s, ?dw); }
+        or {
+            var empty_d: json.Value;
+            empty_d.kind = json.OBJECT;
+            dok = write.schema(?s, ?empty_d, ?dw);
+        }
+        val dcode: i64 = emit(?dw, dok);
+        session.close(?s);
+        ret dcode;
+    }
     val word: str = arg(argv, 1);
     if (argc >= 2 && str_equals(word, "mcp")) {
         session.headless(?s);
@@ -260,6 +292,96 @@ pub fun run(argc: i64, argv: **u8) i64 {
         session.headless(?s);
         session.begin_request(?s);
         val code: i64 = apply_file(?s, arg(argv, 2), has(argc, argv, "--dry-run"));
+        session.close(?s);
+        ret code;
+    }
+    if (argc >= 2 && (str_equals(word, "undo") || str_equals(word, "redo"))) {
+        session.headless(?s);
+        session.begin_request(?s);
+        s.force_dry = has(argc, argv, "--dry-run");
+        var uw: jw.Jw = jw.init(?s.ra);
+        jw.obj(?uw);
+        if (str_equals(word, "redo") || has(argc, argv, "--redo")) { jw.f_bool(?uw, "redo", true); }
+        if (argc >= 3 && arg(argv, 2)[0] != '-') { jw.f_str(?uw, "txn", arg(argv, 2)); }
+        if (has(argc, argv, "--list")) { jw.f_bool(?uw, "list", true); }
+        if (has(argc, argv, "--force")) { jw.f_bool(?uw, "force", true); }
+        if (has(argc, argv, "--diff")) { jw.f_bool(?uw, "diff", true); }
+        val steps_str: str = value_after(argc, argv, "--steps");
+        if (steps_str != nil && steps_str[0] >= '1' && steps_str[0] <= '9') {
+            jw.raw(?uw, ",\"steps\":");
+            jw.raw(?uw, steps_str);
+        }
+        jw.obj_end(?uw);
+        val uparsed: res[json.Value, json.JsonError] = json.parse(uw.buf, uw.len, ?s.ra);
+        var udoc: json.Value;
+        udoc.kind = json.OBJECT;
+        if (sel uparsed.ok) { udoc = uparsed.ok; }
+        var rw: jw.Jw = jw.init(?s.ra);
+        val ok: bool = write.undo(?s, ?udoc, ?rw);
+        val code: i64 = emit(?rw, ok);
+        session.close(?s);
+        ret code;
+    }
+    if (argc >= 3 && str_equals(word, "impact")) {
+        session.headless(?s);
+        session.begin_request(?s);
+        var iw: jw.Jw = jw.init(?s.ra);
+        jw.obj(?iw);
+        jw.f_str(?iw, "symbol", arg(argv, 2));
+        if (argc >= 4 && arg(argv, 3)[0] != '-') { jw.f_str(?iw, "glob", arg(argv, 3)); }
+        jw.obj_end(?iw);
+        val iparsed: res[json.Value, json.JsonError] = json.parse(iw.buf, iw.len, ?s.ra);
+        var idoc: json.Value;
+        idoc.kind = json.OBJECT;
+        if (sel iparsed.ok) { idoc = iparsed.ok; }
+        var rw: jw.Jw = jw.init(?s.ra);
+        val ok: bool = write.impact(?s, ?idoc, ?rw);
+        val code: i64 = emit(?rw, ok);
+        session.close(?s);
+        ret code;
+    }
+    if (argc >= 2 && str_equals(word, "events")) {
+        session.headless(?s);
+        session.begin_request(?s);
+        var empty_ev: json.Value;
+        empty_ev.kind = json.OBJECT;
+        var rw: jw.Jw = jw.init(?s.ra);
+        val ok: bool = write.events(?s, ?empty_ev, ?rw);
+        val code: i64 = emit(?rw, ok);
+        session.close(?s);
+        ret code;
+    }
+    if (argc >= 2 && str_equals(word, "check")) {
+        session.headless(?s);
+        session.begin_request(?s);
+        var empty_ck: json.Value;
+        empty_ck.kind = json.OBJECT;
+        var rw: jw.Jw = jw.init(?s.ra);
+        val ok: bool = write.project_validate(?s, ?empty_ck, ?rw);
+        val code: i64 = emit(?rw, ok);
+        session.close(?s);
+        ret code;
+    }
+    if (argc >= 4 && str_equals(word, "release") && (str_equals(arg(argv, 2), "sign") || str_equals(arg(argv, 2), "verify"))) {
+        session.headless(?s);
+        session.begin_request(?s);
+        var rel_w: jw.Jw = jw.init(?s.ra);
+        jw.obj(?rel_w);
+        jw.f_str(?rel_w, "dir", arg(argv, 3));
+        val kstr: str = value_after(argc, argv, "--key");
+        if (kstr != nil) { jw.f_str(?rel_w, "key", kstr); }
+        val vstr: str = value_after(argc, argv, "--version");
+        if (vstr != nil) { jw.f_str(?rel_w, "version", vstr); }
+        jw.obj_end(?rel_w);
+        val rparsed: res[json.Value, json.JsonError] = json.parse(rel_w.buf, rel_w.len, ?s.ra);
+        var rdoc: json.Value;
+        rdoc.kind = json.OBJECT;
+        if (sel rparsed.ok) { rdoc = rparsed.ok; }
+        var rw: jw.Jw = jw.init(?s.ra);
+        var ok: bool = false;
+        if (str_equals(arg(argv, 2), "sign")) { ok = write.release_sign(?s, ?rdoc, ?rw); }
+        or { ok = write.release_verify(?s, ?rdoc, ?rw); }
+        val code: i64 = emit(?rw, ok);
         session.close(?s);
         ret code;
     }

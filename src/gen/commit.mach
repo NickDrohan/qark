@@ -45,6 +45,7 @@ pub val CK_NONE:    u8 = 0;
 pub val CK_OK:      u8 = 1;
 pub val CK_FAILED:  u8 = 2;
 pub val CK_SKIPPED: u8 = 3;
+pub val CK_ERROR:   u8 = 4;
 
 # one file in a change set
 # ---
@@ -85,8 +86,14 @@ pub rec Entry {
     ck_line:    i64;
     ck_col:     i64;
     ck_msg:     str;
+    ck_cat:     str;
+    ck_exe:     str;
+    ck_exit:    i64;
+    ck_stderr:  str;
     notes:      vector.Vector[str];
     edited:     bool;
+    rebased:    bool;
+    base_sha:   [65]u8;
 }
 
 # a change set; every string and buffer it holds comes from `a`

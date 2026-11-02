@@ -133,7 +133,10 @@ fun skip_atom(pat: *u8, n: usize, i: usize) usize {
         var j: usize = i + 1;
         if (j < n && pat[j] == '^') { j = j + 1; }
         if (j < n && pat[j] == ']') { j = j + 1; }
-        for (j < n && pat[j] != ']') { j = j + 1; }
+        for (j < n && pat[j] != ']') {
+            if (pat[j] == '\\' && j + 1 < n) { j = j + 2; }
+            or { j = j + 1; }
+        }
         if (j < n) { j = j + 1; }
         ret j;
     }
@@ -142,6 +145,13 @@ fun skip_atom(pat: *u8, n: usize, i: usize) usize {
         ret i + 1;
     }
     ret i + 1;
+}
+
+fun class_esc_byte(e: u8) u8 {
+    if (e == 'n') { ret '\n'; }
+    if (e == 'r') { ret '\r'; }
+    if (e == 't') { ret '\t'; }
+    ret e;
 }
 
 fun parse_class_body(c: *Comp) res[i32, A.Error] {
@@ -153,12 +163,14 @@ fun parse_class_body(c: *Comp) res[i32, A.Error] {
     var cl: Class;
     var first: bool = true;
     for (c.i < c.n) {
-        val ch: u8 = bump(c);
+        var ch: u8 = bump(c);
         if (ch == ']' && !first) { brk; }
         first = false;
+        if (ch == '\\' && c.i < c.n) { ch = class_esc_byte(bump(c)); }
         if (c.i < c.n && c.pat[c.i] == '-' && c.i + 1 < c.n && c.pat[c.i + 1] != ']') {
             bump(c);
-            val hi: u8 = bump(c);
+            var hi: u8 = bump(c);
+            if (hi == '\\' && c.i < c.n) { hi = class_esc_byte(bump(c)); }
             var b: u16 = ch::u16;
             for (b <= hi::u16) {
                 class_set(?cl, b::u8);
@@ -234,13 +246,18 @@ fun parse_atom(c: *Comp) res[i64, A.Error] {
             if (sel pushed.err) { ret res[i64, A.Error].err{pushed.err}; }
             ret c_p_emit_class(c, idx);
         }
-        if (e == '<' || e == '>') {
-            var which: u8 = 1;
+        if (e == '<' || e == '>' || e == 'b') {
+            var which: u8 = 0;
+            if (e == '<') { which = 1; }
             if (e == '>') { which = 2; }
             ret emit(c, Ins{op: OP_WB, c: which, a: 0, b: 0});
         }
+        if (e == 'n') { ret emit(c, Ins{op: OP_CHAR, c: '\n', a: 0, b: 0}); }
+        if (e == 'r') { ret emit(c, Ins{op: OP_CHAR, c: '\r', a: 0, b: 0}); }
+        if (e == 't') { ret emit(c, Ins{op: OP_CHAR, c: '\t', a: 0, b: 0}); }
         ret emit(c, Ins{op: OP_CHAR, c: e, a: 0, b: 0});
     }
+    if (ch == 8) { ret emit(c, Ins{op: OP_WB, c: 0, a: 0, b: 0}); }
     ret emit(c, Ins{op: OP_CHAR, c: ch, a: 0, b: 0});
 }
 
@@ -538,52 +555,92 @@ pub fun find(p: *Prog, text: *u8, n: i64, from: i64) Match {
     ret none;
 }
 
-# replace the first match; \0 in the replacement is the whole match
-pub fun replace_first(p: *Prog, text: *u8, n: i64, repl: *u8, rn: i64, out: *u8, out_cap: usize, out_len: *usize) bool {
-    val m: Match = find(p, text, n, 0);
+# replace the first match or all non-overlapping matches; \0-\9 in the replacement expand captures
+pub fun replace_line(p: *Prog, text: *u8, n: i64, repl: *u8, rn: i64, global: bool, out: *u8, out_cap: usize, out_len: *usize) bool {
+    var m: Match = find(p, text, n, 0);
     if (!m.ok) {
         @out_len = 0;
         ret false;
     }
     var o: usize = 0;
-    var i: i64 = 0;
-    for (i < m.start && o + 1 < out_cap) {
-        out[o] = text[i::usize];
-        o = o + 1;
-        i = i + 1;
-    }
-    var r: i64 = 0;
-    for (r < rn && o + 1 < out_cap) {
-        if (repl[r::usize] == '\\' && r + 1 < rn && repl[(r + 1)::usize] == '0') {
-            var k: i64 = m.start;
-            for (k < m.end && o + 1 < out_cap) {
-                out[o] = text[k::usize];
-                o = o + 1;
-                k = k + 1;
-            }
-            r = r + 2;
-        }
-        or {
-            out[o] = repl[r::usize];
+    var copied: i64 = 0;
+    for {
+        var i: i64 = copied;
+        for (i < m.start && o + 1 < out_cap) {
+            out[o] = text[i::usize];
             o = o + 1;
-            r = r + 1;
+            i = i + 1;
         }
+        var r: i64 = 0;
+        for (r < rn && o + 1 < out_cap) {
+            if (repl[r::usize] == '\\' && r + 1 < rn) {
+                val nx: u8 = repl[(r + 1)::usize];
+                if (nx == '\\') {
+                    out[o] = '\\';
+                    o = o + 1;
+                    r = r + 2;
+                }
+                or (nx >= '0' && nx <= '9') {
+                    val g: usize = (nx - '0')::usize;
+                    if (g < m.ncap::usize && m.cs[g] >= 0 && m.ce[g] >= m.cs[g]) {
+                        var k: i64 = m.cs[g];
+                        for (k < m.ce[g] && o + 1 < out_cap) {
+                            out[o] = text[k::usize];
+                            o = o + 1;
+                            k = k + 1;
+                        }
+                    }
+                    r = r + 2;
+                }
+                or {
+                    out[o] = repl[r::usize];
+                    o = o + 1;
+                    r = r + 1;
+                }
+            }
+            or {
+                out[o] = repl[r::usize];
+                o = o + 1;
+                r = r + 1;
+            }
+        }
+        copied = m.end;
+        if (!global) { brk; }
+        var next_at: i64 = m.end;
+        if (m.end == m.start) {
+            if (next_at >= n) { brk; }
+            if (o + 1 < out_cap) {
+                out[o] = text[copied::usize];
+                o = o + 1;
+            }
+            copied = copied + 1;
+            next_at = copied;
+        }
+        if (next_at > n) { brk; }
+        m = find(p, text, n, next_at);
+        if (!m.ok) { brk; }
     }
-    i = m.end;
-    for (i < n && o + 1 < out_cap) {
-        out[o] = text[i::usize];
+    var tail: i64 = copied;
+    for (tail < n && o + 1 < out_cap) {
+        out[o] = text[tail::usize];
         o = o + 1;
-        i = i + 1;
+        tail = tail + 1;
     }
     if (o < out_cap) { out[o] = 0; }
     @out_len = o;
     ret true;
 }
 
+# replace the first match; \0-\9 in the replacement expand captures
+pub fun replace_first(p: *Prog, text: *u8, n: i64, repl: *u8, rn: i64, out: *u8, out_cap: usize, out_len: *usize) bool {
+    ret replace_line(p, text, n, repl, rn, false, out, out_cap, out_len);
+}
+
 use std.system.capability;
 
 $if (capability.HOSTED) {
     use page: std.allocator.page;
+    use std.types.string.str_equals;
 
     test find__plus_anchors_and_groups {
         var a: A.Allocator;
@@ -608,7 +665,17 @@ $if (capability.HOSTED) {
         if (!gm.ok || gm.start != 1 || gm.end != 5) { ret 8; }
         if (gm.ncap < 3 || gm.cs[1] != 1 || gm.ce[1] != 3) { ret 9; }
         if (gm.cs[2] != 3 || gm.ce[2] != 5) { ret 10; }
+        var out: [128]u8;
+        var out_len: usize = 0;
+        if (!replace_line(?g, "aabb aabb aabb", 14, "\\2-\\1", 5, true, ?out[0], 128, ?out_len)) { ret 11; }
+        if (!str_equals(?out[0], "bb-aa bb-aa bb-aa")) { ret 12; }
         dnit(?g);
+        val self_sub: res[Prog, A.Error] = compile(?a, "sandbox", 7);
+        if (sel self_sub.err) { ret 13; }
+        var sp: Prog = self_sub.ok;
+        if (!replace_line(?sp, "qark sandbox", 12, "verified sandbox", 16, true, ?out[0], 128, ?out_len)) { ret 14; }
+        if (!str_equals(?out[0], "qark verified sandbox")) { ret 15; }
+        dnit(?sp);
         ret 0;
     }
 }

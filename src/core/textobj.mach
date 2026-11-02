@@ -3,7 +3,6 @@
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
-use std.types.option.opt;
 
 use motion: qark.core.motion;
 use text: qark.core.text;

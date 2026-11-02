@@ -1,6 +1,6 @@
 [project]
 id = "qark"
-version = "0.2.0"
+version = "0.3.0"
 mach = "^6.0"
 src = "src"
 out = "out/{target.name}/{profile.name}"

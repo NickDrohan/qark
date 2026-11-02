@@ -142,6 +142,34 @@ pub fun message(r: i64) str {
     ret "ok";
 }
 
+# if p begins with the workspace root directory, return the relative suffix after it
+pub fun strip_root(root: str, p: str) str {
+    if (root == nil || p == nil || root[0] == 0 || p[0] == 0) { ret p; }
+    var rn: usize = str_len(root);
+    for (rn > 0 && (root[rn - 1] == '/' || root[rn - 1] == '\\')) { rn = rn - 1; }
+    if (rn == 0) { ret p; }
+    val pn: usize = str_len(p);
+    if (pn < rn) { ret p; }
+    var i: usize = 0;
+    for (i < rn) {
+        val rc: u8 = root[i];
+        val pc: u8 = p[i];
+        val rsep: bool = rc == '/' || rc == '\\';
+        val psep: bool = pc == '/' || pc == '\\';
+        if (rsep && psep) {
+            i = i + 1;
+            cnt;
+        }
+        if (lower(rc) != lower(pc)) { ret p; }
+        i = i + 1;
+    }
+    if (i == pn) { ret "."; }
+    if (p[i] != '/' && p[i] != '\\') { ret p; }
+    for (i < pn && (p[i] == '/' || p[i] == '\\')) { i = i + 1; }
+    if (i == pn) { ret "."; }
+    ret (p::usize + i)::*u8;
+}
+
 # a copy with every '\' turned into '/'
 pub fun canonical(a: *A.Allocator, rel: str) res[str, A.Error] {
     val d: res[str, A.Error] = util.dup(a, rel);
@@ -232,6 +260,9 @@ $if (capability.HOSTED) {
         if (check(".gitignore") != P_OK) { ret 20; }
         if (check("console.log") != P_OK) { ret 21; }
         if (check("com10.txt") != P_OK) { ret 22; }
+        if (!util.eq(strip_root("D:\\Dev\\Qark", "d:/dev/qark/src/cli.mach"), "src/cli.mach")) { ret 23; }
+        if (!util.eq(strip_root("D:\\Dev\\Qark\\", "D:\\Dev\\Qark"), ".")) { ret 24; }
+        if (!util.eq(strip_root("D:\\Dev\\Qark", "D:\\Dev\\Qark2\\x.txt"), "D:\\Dev\\Qark2\\x.txt")) { ret 25; }
         ret 0;
     }
 }

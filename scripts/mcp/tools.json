@@ -1,115 +1,253 @@
 [
   {
     "name": "qark_apply",
-    "title": "Write files",
-    "description": "Create, replace, edit, move, or delete files under the workspace root in one atomic change set. Every file is rendered and syntax-checked (Python, Node, PowerShell, Bash, JSON, TOML) before anything is written; a conflict or failed check writes nothing. Re-sending the same request is safe: identical files report unchanged. The receipt lists each file's status, sha256, bytes, and check result. A new file must not exist unless mode is replace or upsert; to change an existing file, pass edits (exact find, regex find_re, a line range, or anchored inserts) or mode replace with expect set to its current sha256 from qark_read. move renames a file atomically: path is the destination and expect pins the source's sha256. Set diff true to get a unified diff of every change in the receipt, and combine it with dry_run to preview before writing. Use templates with each to fan one template out over a list (one call, many scripts). For a template that already exists, prefer expand: an @template block, a header row, and one record per line. job writes a self-contained directory under jobs/<job> with a manifest.json for the executor.",
+    "title": "Write or edit files atomically",
+    "description": "Create, replace, edit, move, or delete one or many files under the workspace root in one atomic change set. Every file is rendered, contract-checked, and syntax-checked (Python, Node, PowerShell, Bash, JSON, TOML, plus staged project checks) before anything is written; a conflict, contract violation, or failed check writes nothing. Accepts either a multi-file files:[...] array OR top-level single-file shorthand (path + text|lines|tmpl|template|json|edits|move|delete, or flat edit fields). Relative paths and full paths inside the workspace root both work. Returns a receipt with each file's sha256, status, and AST semantic change preview (added/modified/removed symbols).",
     "inputSchema": {
       "type": "object",
       "properties": {
+        "path": { "type": "string", "description": "Single-file shorthand path (relative to workspace root, or full path inside root). May use {{vars}}." },
+        "glob": { "type": "string", "description": "Single-glob shorthand: apply edits across every workspace file matching this glob (e.g. src/**/*.py) in one atomic commit." },
+        "text": { "type": "string", "description": "Single-file shorthand: the file's full text as written." },
+        "lines": { "description": "Single-file shorthand: array of strings joined with \\n, OR [first, last] 1-based line range when used with 'with'." },
+        "tmpl": { "type": "string", "description": "Single-file shorthand: inline Handlebars-style template ({{name}}, {{#each xs}}, {{#if x}}, {{x|py}})." },
+        "template": { "type": "string", "description": "Single-file shorthand: name of a template from templates, qark_templates, or builtins." },
+        "json": { "description": "Single-file shorthand: any JSON value, written as pretty JSON." },
+        "edits": { "description": "Single-file shorthand: array of edit objects (or one edit object) applied in order." },
+        "move": { "type": "string", "description": "Single-file shorthand: source path moved to path atomically." },
+        "delete": { "type": "boolean", "description": "Single-file shorthand: true removes the file." },
         "files": {
           "type": "array",
-          "description": "What should exist afterwards. Each entry has a path and exactly one of text, lines, tmpl, template, json, edits, move, or delete.",
+          "description": "Multi-file change set. Each entry has path (or glob) and one content source (text, lines, tmpl, template, json, edits, move, delete, or flat edit keys).",
           "items": {
             "type": "object",
             "properties": {
-              "path": { "type": "string", "description": "Relative to the workspace root (or to jobs/<job>). May use {{vars}}." },
+              "path": { "type": "string", "description": "Relative to workspace root (or full path inside root). May use {{vars}}." },
+              "glob": { "type": "string", "description": "Apply edits across every workspace file matching this glob (e.g. src/**/*.py) in one atomic commit." },
               "text": { "type": "string", "description": "The file's bytes as written." },
-              "lines": { "type": "array", "items": { "type": "string" }, "description": "Lines joined with \\n, ending in \\n." },
-              "tmpl": { "type": "string", "description": "Inline Handlebars-style template: {{name}}, {{#each xs}}, {{#if x}}, {{x|py}} literal filters for py js json ps sh." },
-              "template": { "type": "string", "description": "Name of a template from templates, qark_templates, or the builtins (py/script, py/pytest, js/script, ps1/script, sh/script)." },
+              "lines": { "description": "Lines joined with \\n, or [first, last] line range when paired with 'with'." },
+              "tmpl": { "type": "string", "description": "Inline Handlebars-style template: {{name}}, {{#each xs}}, {{#if x}}, {{x|py}} literal filters." },
+              "template": { "type": "string", "description": "Name of a template from templates, qark_templates, or builtins." },
               "json": { "description": "Any JSON value, written as pretty JSON." },
               "edits": {
                 "type": "array",
-                "description": "Edits to the current file, in order. Each is one of: {find, replace, all?, count?, occurrence?, within?}; {find_re: regex, replace: text with \\0-\\9 captures, all?, count?, occurrence?, within?}; {lines:[first,last], with}; {insert_before|insert_after: N or \"text\" or {find|find_re, occurrence?}, with}; {append}, {prepend}; {ex: vim ex command like %s/a/b/g}; {keys: vim normal-mode keys}. within limits an edit to a span: [first,last] lines, a string, or {find|find_re, occurrence?} naming the span's text. occurrence picks the Nth match, -N counts back; ambiguous matches are refused unless occurrence, count, or all is set.",
+                "description": "Edits to the current file, in order: {symbol, with|body|signature|rename}; {find, replace|with, all?, count?, occurrence?, within?, symbol?}; {find_re, replace|with, ...}; {lines:[first,last], with}; {insert_before|insert_after, with, auto_indent?}; {append}; {prepend}; {ex}; {keys}.",
                 "items": { "type": "object" }
               },
-              "move": { "type": "string", "description": "Source path moved to this path atomically: the destination gets the source's bytes and the source is deleted in the same commit. expect pins the source's sha256; a stale source refuses the whole apply." },
+              "symbol": { "type": "string", "description": "Flat edit shorthand: AST symbol name (e.g. 'process' or 'Worker.run') to edit with body, signature, rename, or with." },
+              "body": { "description": "Flat edit shorthand: replace only the symbol's body (string or string[]) while preserving its signature and braces/indentation." },
+              "signature": { "type": "string", "description": "Flat edit shorthand: replace only the symbol's declaration signature." },
+              "rename": { "type": "string", "description": "Flat edit shorthand: rename the symbol declaration and identifier references in scope." },
+              "find": { "type": "string", "description": "Flat edit shorthand: exact text to find and replace." },
+              "find_re": { "type": "string", "description": "Flat edit shorthand: regex to find and replace (supports \\0-\\9 captures)." },
+              "replace": { "type": "string", "description": "Flat edit shorthand: replacement text for find or find_re." },
+              "insert_before": { "description": "Flat edit shorthand: 1-based line, anchor string, or {symbol|find|find_re} to insert before." },
+              "insert_after": { "description": "Flat edit shorthand: 1-based line, anchor string, or {symbol|find|find_re} to insert after." },
+              "auto_indent": { "type": "boolean", "description": "Flat edit shorthand: match indentation of anchor line on insert." },
+              "contract": {
+                "type": "object",
+                "description": "Enforced scope contract: {symbol?, symbols?, methods?, lines?: [first, last], preserve_signatures?, max_lines_changed?, forbid_delete?}."
+              },
+              "rebase": { "type": "boolean", "description": "When expect is stale, perform a 3-way line merge against the historical base in .qark/undo (or base_text)." },
+              "base_text": { "type": "string", "description": "Explicit base text for 3-way proposal rebasing." },
+              "move": { "type": "string", "description": "Source path moved to this path atomically." },
               "delete": { "type": "boolean", "description": "true removes the file." },
-              "with": { "type": "object", "description": "Variables for this entry's template, layered over vars." },
-              "each": { "description": "A list (or the name of a list in vars) to fan this entry out over; the item's fields become variables, plus {{@index}}." },
-              "mode": { "type": "string", "enum": ["create", "replace", "upsert"], "description": "create (default) refuses an existing file with different content; replace requires it to exist; upsert does either." },
-              "expect": { "type": "string", "description": "sha256 the current file must have, from qark_read or a receipt. With move it pins the source." },
-              "check": { "description": "false to skip the syntax check, or a checker name: python, node, powershell, bash, json, toml." },
+              "with": { "description": "Template variables object for tmpl/template, OR replacement string/lines for flat edits." },
+              "each": { "description": "A list (or name of a list in vars) to fan this entry out over." },
+              "mode": { "type": "string", "enum": ["create", "replace", "upsert"], "description": "create (default), replace, or upsert." },
+              "expect": { "type": "string", "description": "sha256 the current file must have." },
+              "check": { "description": "false to skip syntax check, or checker name: python, node, powershell, bash, json, toml." },
               "executable": { "type": "boolean" }
-            },
-            "required": ["path"]
+            }
           }
         },
         "vars": { "type": "object", "description": "Variables every template can read." },
         "templates": { "type": "object", "description": "Inline templates by name: a string, or {text|lines, lang}." },
         "job": { "type": "string", "description": "Write under jobs/<job>/ and add manifest.json with every file's sha256." },
-        "dest": { "type": "string", "description": "Base directory for relative paths (default the workspace root, or jobs for a job)." },
-        "run": { "description": "With job: how the executor should run it, recorded in manifest.json, e.g. {\"argv\": [\"python\", \"main.py\"], \"timeout_ms\": 30000}." },
-        "prune": { "type": "boolean", "description": "With job: delete files the previous manifest listed that this spec no longer produces." },
-        "dry_run": { "type": "boolean", "description": "Render and check everything, report what would happen, write nothing." },
-        "preview": { "type": "boolean", "description": "With dry_run: include each file's rendered text in the receipt." },
-        "diff": { "type": "boolean", "description": "Include a unified diff of each changed file in the receipt. With dry_run it previews the change." },
-        "check": { "description": "true (default), false, or \"required\" to refuse when a checker is missing." },
-        "expand": { "type": "string", "description": "Shorthand tables. Each block is @template, a header row split on |, then one record per line. A blank line ends a block. A path column names the file; otherwise the template's path pattern is used. A pattern with no {{ and no path column writes one file and the template reads {{#each rows}}." },
-        "tag": { "type": "string", "description": "Who or what is writing, recorded in .qark/journal.ndjson." }
+        "dest": { "type": "string", "description": "Base directory for relative paths." },
+        "run": { "description": "With job: how the executor should run it, recorded in manifest.json." },
+        "prune": { "type": "boolean", "description": "With job: delete files from previous manifest no longer produced." },
+        "dry_run": { "type": "boolean", "description": "Render, check, and compute semantic diff, report what would happen, write nothing." },
+        "preview": { "type": "boolean", "description": "Include each file's rendered text in the receipt." },
+        "diff": { "type": "boolean", "description": "Include a unified diff of each changed file in the receipt." },
+        "check": { "description": "true/\"strict\" (default: fail closed on syntax error or checker crash), \"required\" (also reject skipped/missing runtimes), \"permissive\" (allow checker crashes as skipped with validation_complete: false), or false/\"off\"." },
+        "contract": { "type": "object", "description": "Enforced scope contract across all files: {symbol?, symbols?, methods?, lines?, preserve_signatures?, max_lines_changed?, forbid_delete?}." },
+        "rebase": { "type": "boolean", "description": "Enable 3-way proposal rebasing when expect hashes are stale against non-overlapping concurrent edits." },
+        "validate": { "description": "Project validation command (array of argv strings or {cmd: [...]}) staged and executed before commit; non-zero exit rolls back." },
+        "stream": { "type": "boolean", "description": "Include per-phase transaction timing and status events in receipt.events." },
+        "expand": { "type": "string", "description": "Shorthand @template pipe-table blocks." },
+        "tag": { "type": "string", "description": "Tag recorded in .qark/journal.ndjson and .qark/undo." },
+        "root": { "type": "string", "description": "Optional workspace root directory path to target." }
+      }
+    }
+  },
+  {
+    "name": "qark_edit",
+    "title": "Surgical AST symbol or text edit",
+    "description": "Edit an existing file (or glob of files) atomically using flat top-level parameters—no nested files/edits wrapper required. Supports AST-aware symbol edits (pass symbol + body, signature, rename, or with), exact find/replace, regex find_re/replace (with \\0-\\9 captures), line-range replacement (lines:[first,last] + with), and anchored insertions (insert_before/insert_after + with, auto_indent). Enforces optional scope contracts, 3-way rebasing on stale expect hashes, syntax checking, and returns a receipt with sha256 and semantic symbol diff.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "path": { "type": "string", "description": "File path to edit (relative to workspace root, or full path inside root)." },
+        "glob": { "type": "string", "description": "Apply this edit across all matching workspace files (e.g. src/**/*.py) in one atomic commit." },
+        "symbol": { "type": "string", "description": "AST symbol name (e.g. 'compute' or 'Service.run'). Combine with body, signature, rename, or with—or combine with find/find_re to scope the search to this symbol." },
+        "body": { "description": "Replace only the named symbol's body (string or array of line strings), automatically preserving its declaration signature, indentation, and closing brace." },
+        "signature": { "type": "string", "description": "Replace only the named symbol's declaration/signature line(s) while keeping its body intact." },
+        "rename": { "type": "string", "description": "Rename the symbol declaration and all word-bounded identifier occurrences in scope." },
+        "with": { "description": "Replacement text (string or array of line strings) when replacing a full symbol, a [first,last] line range, or inserting with insert_before/insert_after." },
+        "find": { "type": "string", "description": "Exact text to find in the file (or within the scoped symbol/range)." },
+        "find_re": { "type": "string", "description": "Qark regex (. [] () | * + ? {} ^ $ \\< \\> \\d \\w \\s) to find; replacement may use \\0-\\9 captures." },
+        "replace": { "type": "string", "description": "Replacement text for find or find_re." },
+        "lines": { "type": "array", "items": { "type": "integer" }, "description": "[first, last] 1-based inclusive line range to replace with 'with'." },
+        "insert_before": { "description": "1-based line number, anchor string, or {symbol|find|find_re, occurrence?} to insert 'with' before." },
+        "insert_after": { "description": "1-based line number, anchor string, or {symbol|find|find_re, occurrence?} to insert 'with' after." },
+        "auto_indent": { "type": "boolean", "description": "When inserting with insert_before/insert_after, automatically indent inserted lines to match the anchor line." },
+        "append": { "type": "string", "description": "Text to append to the end of the file." },
+        "prepend": { "type": "string", "description": "Text to prepend to the start of the file." },
+        "within": { "description": "Scope find/find_re/insert to [first, last] lines, an exact substring, or {symbol|find|find_re, occurrence?}." },
+        "all": { "type": "boolean", "description": "Replace all occurrences of find or find_re." },
+        "occurrence": { "type": "integer", "description": "Pick a specific match of find or find_re (1-based, or -1 for last)." },
+        "count": { "type": "integer", "description": "Require exactly this many matches of find or find_re." },
+        "edits": {
+          "type": "array",
+          "description": "Optional list of multiple edit objects to apply sequentially to path or glob.",
+          "items": { "type": "object" }
+        },
+        "contract": {
+          "type": "object",
+          "description": "Enforced scope contract: {symbol?: string, symbols?: string[], methods?: string[], lines?: [first, last], preserve_signatures?: boolean, max_lines_changed?: integer, forbid_delete?: boolean}."
+        },
+        "expect": { "type": "string", "description": "Expected sha256 of the file before editing." },
+        "rebase": { "type": "boolean", "description": "If true and expect is stale, 3-way merge the edit onto the current file using .qark/undo history or base_text." },
+        "base_text": { "type": "string", "description": "Optional explicit base text when rebase is true." },
+        "validate": { "description": "Project validation command (array of argv strings or {cmd: [...]}) to run before committing." },
+        "diff": { "type": "boolean", "description": "Include unified diff in the receipt." },
+        "dry_run": { "type": "boolean", "description": "Preview the edit, syntax check, and semantic diff without writing to disk." },
+        "check": { "description": "true/\"strict\" (default: fail closed on syntax error or checker crash), \"required\", \"permissive\", false, or a checker name." },
+        "tag": { "type": "string", "description": "Optional tag recorded in the undo snapshot and journal." },
+        "root": { "type": "string", "description": "Optional workspace root directory path to target." }
       }
     }
   },
   {
     "name": "qark_read",
-    "title": "Read files",
-    "description": "Read files under the workspace root with their sha256, byte count, and line count, so a later qark_apply can edit them with expect. A directory path lists its entries; \".\" is the root. Use lines [first, last] to read part of a file, and outline true to get a symbol list (functions, classes, types, sections) without the file's text.",
+    "title": "Read files, symbols, outlines, or folded views",
+    "description": "Read files under the workspace root with their sha256, byte count, and line count. A directory path lists its entries (\".\" is the root). Pass symbol or symbols to read only specific functions/classes/methods by AST span, outline: true to list all symbols in a file without reading its body, or fold: true to get a compact signature-folded view of the file (with optional symbols expanded).",
     "inputSchema": {
       "type": "object",
       "properties": {
-        "path": { "type": "string" },
-        "paths": { "type": "array", "items": { "type": "string" } },
-        "content": { "type": "boolean", "description": "false returns only hashes and sizes." },
-        "lines": { "type": "array", "items": { "type": "integer" }, "description": "[first, last], 1-based and inclusive." },
-        "outline": { "type": "boolean", "description": "Include the file's symbols: name, kind, line, and end line for functions, classes, records, and sections." },
-        "max_bytes": { "type": "integer" }
+        "path": { "type": "string", "description": "File or directory path (relative to workspace root, or full path inside root)." },
+        "paths": { "type": "array", "items": { "type": "string" }, "description": "Multiple file or directory paths to read in one call." },
+        "symbol": { "type": "string", "description": "Read only the named symbol (function, class, record, section, or Class.method) with first_line and last_line." },
+        "symbols": { "type": "array", "items": { "type": "string" }, "description": "Read multiple named symbols in one call (returns spans[]), or keep these symbols expanded when fold is true." },
+        "fold": { "type": "boolean", "description": "Return a compact signature-folded view of the file (keeping imports, types, and declarations while collapsing function bodies to ...)." },
+        "outline": { "type": "boolean", "description": "Include the file's symbol outline: name, kind, line, and end_line for functions, classes, records, and sections." },
+        "lines": { "type": "array", "items": { "type": "integer" }, "description": "[first, last], 1-based and inclusive line range." },
+        "content": { "type": "boolean", "description": "false returns only sha256, bytes, lines, and optional outline without file text." },
+        "max_bytes": { "type": "integer", "description": "Maximum bytes of text to return per file (default 262144)." },
+        "root": { "type": "string", "description": "Optional workspace root directory path to target." }
       }
     }
   },
   {
     "name": "qark_search",
-    "title": "Search files",
-    "description": "Search the workspace like ripgrep: pattern is literal text, or set regex true for the qark dialect (. [] () | * + ? {} ^ $ \\< \\> \\d \\w \\s). Matches come back grouped per file with that file's sha256, line and column numbers, and the matched text; context adds surrounding lines. glob narrows files (* stays within a directory, ** crosses; \"*.py\" matches by basename, \"src/*.py\" by path). path limits the search to a directory. With no pattern it lists the matching paths instead. Skips .git, .qark, node_modules, and build output unless all is true; skips binary files and files over 4 MiB.",
+    "title": "Search workspace or list files",
+    "description": "Search the workspace like ripgrep: pattern is literal text, or set regex: true for the Qark regex dialect (. [] () | * + ? {} ^ $ \\< \\> \\d \\w \\s). Matches are grouped per file with that file's sha256, line/col, matched text, and enclosing AST symbol name. Omit pattern to list matching file paths. Skips .git, .qark, node_modules, and build directories unless all: true.",
     "inputSchema": {
       "type": "object",
       "properties": {
-        "pattern": { "type": "string" },
-        "regex": { "type": "boolean" },
+        "pattern": { "type": "string", "description": "Literal text or regex pattern to search for. Omit to list workspace files." },
+        "regex": { "type": "boolean", "description": "Treat pattern as a Qark regex (. [] () | * + ? {} ^ $ \\< \\> \\d \\w \\s)." },
         "icase": { "type": "boolean", "description": "Case-insensitive matching." },
-        "glob": { "type": "string", "description": "e.g. *.py, src/**/*.mach, scripts/*.ps1" },
-        "path": { "type": "string", "description": "Directory to search, relative to the workspace root (default the root)." },
+        "glob": { "type": "string", "description": "Filter files by glob, e.g. *.py, src/**/*.mach, scripts/*.ps1." },
+        "path": { "type": "string", "description": "Directory to search, relative to workspace root (or full path inside root)." },
         "context": { "type": "integer", "description": "Lines of context around each match, 0-20." },
-        "max": { "type": "integer", "description": "Stop after this many matches (default 100); the reply reports truncated when capped." },
-        "max_files": { "type": "integer", "description": "Stop scanning after this many files (default 20000)." },
-        "all": { "type": "boolean", "description": "Include hidden and tool directories such as .qark." }
+        "max": { "type": "integer", "description": "Maximum matches to return (default 100)." },
+        "max_files": { "type": "integer", "description": "Maximum files to scan (default 20000)." },
+        "all": { "type": "boolean", "description": "Include hidden and ignored directories." },
+        "root": { "type": "string", "description": "Optional workspace root directory path to target." }
+      }
+    }
+  },
+  {
+    "name": "qark_impact",
+    "title": "Symbol reference & impact graph",
+    "description": "Trace a symbol across the workspace to build its resolved reference and impact graph before refactoring or changing a signature. Returns definitions (file, kind, line, end_line), references (file, line, col, text, and enclosing symbol), imports, dependents, affected_files, and affected_symbols.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "symbol": { "type": "string", "description": "The identifier or symbol name to trace across the workspace." },
+        "glob": { "type": "string", "description": "Optional file glob filter, e.g. **/*.py or src/**/*.mach." },
+        "path": { "type": "string", "description": "Optional subdirectory to restrict the impact analysis to." },
+        "root": { "type": "string", "description": "Optional workspace root directory path to target." }
+      },
+      "required": ["symbol"]
+    }
+  },
+  {
+    "name": "qark_undo",
+    "title": "Persistent multi-file undo & redo",
+    "description": "Atomically revert one or more applied transactions using persistent snapshots in .qark/undo, redo a previously undone transaction (redo: true), or list the undo history stack (list: true). Verifies each file's sha256 before reverting unless force: true is set.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "steps": { "type": "integer", "description": "Number of transactions to walk back and revert (default 1)." },
+        "redo": { "type": "boolean", "description": "true to redo the most recently undone transaction." },
+        "list": { "type": "boolean", "description": "true to list the undo transaction chain and any available redo_txn without changing files." },
+        "txn": { "type": "string", "description": "Specific transaction id to undo or redo (default 'latest')." },
+        "force": { "type": "boolean", "description": "Overwrite files even if they were modified after the transaction." },
+        "dry_run": { "type": "boolean", "description": "Preview what would be reverted or redone without writing to disk." },
+        "diff": { "type": "boolean", "description": "Include unified diffs of reverted/redone files in the receipt." },
+        "root": { "type": "string", "description": "Optional workspace root directory path to target." }
+      }
+    }
+  },
+  {
+    "name": "qark_check",
+    "title": "Validate project, verify job, or inspect capabilities",
+    "description": "Run standalone project-wide validation (using validate/cmd or .qark/checks.json), verify a job directory against its manifest.json (dir), read the transaction event journal (events: true), or query Qark's capabilities (capabilities: true) and operation schemas (schema: true).",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "validate": { "description": "Project validation command (array of argv strings such as [\"pytest\", \"-q\"] or {cmd: [...], timeout_ms?: 30000}). If omitted, uses project in .qark/checks.json." },
+        "cmd": { "description": "Alias for validate: command argv array to run in the workspace root." },
+        "dir": { "type": "string", "description": "Verify a job directory (e.g. jobs/etl) against its manifest.json hashes." },
+        "capabilities": { "type": "boolean", "description": "true to return Qark's version, features, symbol_edit_modes, contract_fields, languages, limits, and active checkers." },
+        "schema": { "description": "true (or an operation name string) to return machine-readable input/output schemas." },
+        "events": { "type": "boolean", "description": "true to read transaction events from .qark/journal.ndjson." },
+        "since_offset": { "type": "integer", "description": "With events: byte offset in .qark/journal.ndjson to read from." },
+        "limit": { "type": "integer", "description": "With events: max events to return (default 100)." },
+        "root": { "type": "string", "description": "Optional workspace root directory path to target." }
       }
     }
   },
   {
     "name": "qark_templates",
-    "title": "List templates",
+    "title": "List or inspect templates",
     "description": "List the templates qark_apply can name (session, workspace .qark/templates, and builtin), each with its language, description, and the variables it reads. Pass name to get one template's full text.",
     "inputSchema": {
       "type": "object",
       "properties": {
-        "name": { "type": "string" }
+        "name": { "type": "string", "description": "Optional template name to inspect its full source text." },
+        "root": { "type": "string", "description": "Optional workspace root directory path to target." }
       }
     }
   },
   {
     "name": "qark_define_template",
-    "title": "Define a template",
-    "description": "Keep a named template for later qark_apply calls in this session, so many files can share it. persist true also saves it under .qark/templates for every future session. A name ending in an extension such as loader.py sets the language its |ident filter checks.",
+    "title": "Define a reusable template",
+    "description": "Keep a named template for later qark_apply calls in this session, so many files can share it. Set persist: true to save it under .qark/templates for future sessions.",
     "inputSchema": {
       "type": "object",
       "properties": {
-        "name": { "type": "string" },
-        "text": { "type": "string" },
-        "lines": { "type": "array", "items": { "type": "string" } },
-        "lang": { "type": "string" },
+        "name": { "type": "string", "description": "Template name, e.g. etl/loader.py." },
+        "text": { "type": "string", "description": "Template source text." },
+        "lines": { "type": "array", "items": { "type": "string" }, "description": "Template source lines." },
+        "lang": { "type": "string", "description": "Language for literal/ident filters (py, js, json, ps, sh)." },
         "description": { "type": "string" },
-        "path": { "type": "string", "description": "Path pattern for an expand table, such as gen/{{who|snake}}.py. A constant path writes one file; the template then reads {{#each rows}}." },
-        "persist": { "type": "boolean" }
+        "path": { "type": "string", "description": "Default output path pattern for expand tables, e.g. gen/{{name|snake}}.py." },
+        "persist": { "type": "boolean", "description": "true to persist under .qark/templates/." },
+        "root": { "type": "string", "description": "Optional workspace root directory path to target." }
       },
       "required": ["name"]
     }

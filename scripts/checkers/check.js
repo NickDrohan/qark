@@ -2,6 +2,8 @@
 // without running it, and prints [{"ok"} | {"ok":false,"line","col","msg"}] in order.
 // with --serve [idle_seconds] it answers one json line per request line, and exits
 // when stdin closes or when no request arrives for idle_seconds.
+// Installed as check.cjs so Node always loads this helper as CommonJS even when the
+// target workspace or an ancestor directory has package.json with "type": "module".
 'use strict';
 const vm = require('vm');
 const fs = require('fs');
@@ -9,51 +11,99 @@ const os = require('os');
 const path = require('path');
 const { spawnSync } = require('child_process');
 
+const WORKSPACE_ROOT = path.resolve(__dirname, '../..');
+let seq = 0;
+
 function lineCount(text) {
   const n = text.split('\n').length;
   return text.endsWith('\n') ? n - 1 : n;
 }
 
-function lineOf(stack, text) {
-  const first = String(stack || '').split('\n')[0];
-  const m = /:(\d+)$/.exec(first);
-  if (!m) return 0;
-  return Math.max(1, Math.min(Number(m[1]), lineCount(text)));
+function parseDiag(raw, text, lineOffset) {
+  const lines = String(raw || '').split(/\r?\n/);
+  const first = lines[0] || '';
+  const m = /:(\d+)\s*$/.exec(first);
+  let line = 0;
+  if (m) {
+    const rawLine = Number(m[1]) + (lineOffset || 0);
+    line = Math.max(1, Math.min(rawLine, Math.max(1, lineCount(text))));
+  }
+  let col = 0;
+  for (let i = 1; i < Math.min(lines.length, 6); i++) {
+    const cm = /^(\s*)\^+\s*$/.exec(lines[i]);
+    if (cm) {
+      col = cm[1].length + 1;
+      break;
+    }
+  }
+  const errLine = lines.find((l) => /(SyntaxError|ReferenceError|TypeError|Error):/.test(l));
+  const msg = errLine ? errLine.trim() : 'syntax error';
+  return { ok: false, line, col, msg };
+}
+
+function isWorkspaceEsmFor(relName) {
+  try {
+    let dir = path.dirname(path.resolve(WORKSPACE_ROOT, relName || 'index.js'));
+    for (let depth = 0; depth < 32; depth++) {
+      const pkgPath = path.join(dir, 'package.json');
+      if (fs.existsSync(pkgPath)) {
+        const raw = fs.readFileSync(pkgPath, 'utf8');
+        const pkg = JSON.parse(raw);
+        return Boolean(pkg && pkg.type === 'module');
+      }
+      const parent = path.dirname(dir);
+      if (!parent || parent === dir) break;
+      dir = parent;
+    }
+  } catch (_) {
+    // ignore unreadable or malformed package.json during package boundary walk
+  }
+  return false;
 }
 
 function checkModule(name, text, index) {
-  const tmp = path.join(os.tmpdir(), 'qark-check-' + process.pid + '-' + index + '.mjs');
+  seq += 1;
+  const tmp = path.join(os.tmpdir(), 'qark-check-' + process.pid + '-' + index + '-' + seq + '.mjs');
   fs.writeFileSync(tmp, text);
   try {
     const r = spawnSync(process.execPath, ['--check', tmp], { encoding: 'utf8' });
     if (r.status === 0) return { ok: true };
-    const lines = String(r.stderr || '').split('\n');
-    const m = /:(\d+)\s*$/.exec(lines[0] || '');
-    const msg = lines.find((l) => /Error/.test(l)) || 'syntax error';
-    return { ok: false, line: m ? Math.min(Number(m[1]), lineCount(text)) : 0, col: 0, msg: msg.trim() };
+    return parseDiag(r.stderr || r.stdout, text, 0);
   } finally {
     fs.rmSync(tmp, { force: true });
   }
 }
 
-function check(name, source, index) {
-  let text = source;
-  if (text.startsWith('#!')) text = '//' + text.slice(2);
-  if (/\.mjs$/i.test(name) || /^\s*(import\s*[\w{*'"]|export\s)/m.test(text)) return checkModule(name, text, index);
+function checkCommonJS(name, text) {
   try {
     new vm.Script(text, { filename: name });
     return { ok: true };
   } catch (e) {
     if (/Illegal return/.test(String(e && e.message))) {
       try {
-        new vm.Script('(function (exports, require, module, __filename, __dirname) {' + text + '\n})', { filename: name });
+        new vm.Script('(function (exports, require, module, __filename, __dirname) {\n' + text + '\n})', { filename: name });
         return { ok: true };
       } catch (e2) {
-        return { ok: false, line: lineOf(e2.stack, text), col: 0, msg: String(e2.message || e2) };
+        return parseDiag(e2 && e2.stack, text, -1);
       }
     }
-    return { ok: false, line: lineOf(e && e.stack, text), col: 0, msg: String(e && e.message ? e.message : e) };
+    return parseDiag(e && e.stack, text, 0);
   }
+}
+
+function check(name, source, index) {
+  let text = source;
+  if (text.startsWith('#!')) text = '//' + text.slice(2);
+  if (/\.cjs$/i.test(name)) {
+    return checkCommonJS(name, text);
+  }
+  if (/\.mjs$/i.test(name)) {
+    return checkModule(name, text, index);
+  }
+  if (isWorkspaceEsmFor(name) || /^\s*(import\s*[\w{*'"]|export\s)/m.test(text)) {
+    return checkModule(name, text, index);
+  }
+  return checkCommonJS(name, text);
 }
 
 function answer(raw) {

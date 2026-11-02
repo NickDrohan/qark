@@ -1137,12 +1137,39 @@ pub fun prepare(a: *A.Allocator, body: *u8, n: usize, out: *Prog, e: *Err) bool 
     e.msg = nil;
     e.line = 0;
     e.tname = nil;
+    var src: *u8 = body;
+    var src_n: usize = n;
+    var has_cr: bool = false;
+    var ci: usize = 0;
+    for (ci < n) {
+        if (body[ci] == '\r') {
+            has_cr = true;
+            brk;
+        }
+        ci = ci + 1;
+    }
+    if (has_cr) {
+        val clean: res[*u8, A.Error] = A.allocate[u8](a, n + 1);
+        if (sel clean.err) { ret fail(a, e, "oom", "out of memory", 0); }
+        var wi: usize = 0;
+        var ri: usize = 0;
+        for (ri < n) {
+            if (!(body[ri] == '\r' && ri + 1 < n && body[ri + 1] == '\n')) {
+                clean.ok[wi] = body[ri];
+                wi = wi + 1;
+            }
+            ri = ri + 1;
+        }
+        clean.ok[wi] = 0;
+        src = clean.ok;
+        src_n = wi;
+    }
     var toks: vector.Vector[Tok] = vector.init[Tok](a);
-    if (!lex(a, body, n, ?toks, e)) { ret false; }
-    if (!pair(a, body, toks.data, toks.len, e)) { ret false; }
-    standalone(body, toks.data, toks.len);
-    out.body = body;
-    out.len = n;
+    if (!lex(a, src, src_n, ?toks, e)) { ret false; }
+    if (!pair(a, src, toks.data, toks.len, e)) { ret false; }
+    standalone(src, toks.data, toks.len);
+    out.body = src;
+    out.len = src_n;
     out.toks = toks.data;
     out.ntok = toks.len;
     out.slots = nil;
@@ -1154,7 +1181,7 @@ pub fun prepare(a: *A.Allocator, body: *u8, n: usize, out: *Prog, e: *Err) bool 
     for (i < toks.len) {
         slots.ok[i].on = false;
         if (toks.data[i].kind == T_VAR) {
-            if (!fill_slot(body, ?toks.data[i], ?slots.ok[i], a, e)) { ret false; }
+            if (!fill_slot(src, ?toks.data[i], ?slots.ok[i], a, e)) { ret false; }
         }
         i = i + 1;
     }

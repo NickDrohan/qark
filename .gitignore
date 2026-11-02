@@ -1,5 +1,6 @@
 out/
 jobs/
+release/
 .qark/
 agent/eval/svr-*.txt
 *.exe

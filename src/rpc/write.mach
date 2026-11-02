@@ -73,6 +73,16 @@ fun spec_error(w: *jw.Jw, e: *spec.Err) bool {
     if (e.path != nil) { jw.f_str(w, "path", e.path); }
     if (e.tname != nil) { jw.f_str(w, "template", e.tname); }
     if (e.line > 0) { jw.f_i64(w, "line", e.line); }
+    if (e.col > 0) { jw.f_i64(w, "col", e.col); }
+    if (e.cat != nil) { jw.f_str(w, "mismatch_category", e.cat); }
+    if (e.scope_lo > 0 && e.scope_hi >= e.scope_lo) {
+        jw.key(w, "target_lines");
+        jw.arr(w);
+        jw.i64_v(w, e.scope_lo);
+        jw.i64_v(w, e.scope_hi);
+        jw.arr_end(w);
+    }
+    if (e.actual != nil) { jw.f_str(w, "actual_line", e.actual); }
     jw.obj_end(w);
     ret false;
 }
@@ -87,6 +97,44 @@ fun lines_of(p: *u8, n: usize) i64 {
     }
     if (p[n - 1] != '\n') { k = k + 1; }
     ret k;
+}
+
+fun changed_line_range(old_p: *u8, old_n: usize, new_p: *u8, new_n: usize, out_lo: *i64, out_hi: *i64) {
+    val total_new: i64 = lines_of(new_p, new_n);
+    if (total_new <= 0) {
+        @out_lo = 0;
+        @out_hi = 0;
+        ret;
+    }
+    if (old_p == nil || old_n == 0) {
+        @out_lo = 1;
+        @out_hi = total_new;
+        ret;
+    }
+    var pfx: usize = 0;
+    var min_n: usize = old_n;
+    if (new_n < min_n) { min_n = new_n; }
+    var first_line: i64 = 1;
+    for (pfx < min_n && old_p[pfx] == new_p[pfx]) {
+        if (new_p[pfx] == '\n') { first_line = first_line + 1; }
+        pfx = pfx + 1;
+    }
+    var sfx: usize = 0;
+    for (sfx < (old_n - pfx) && sfx < (new_n - pfx) && old_p[old_n - 1 - sfx] == new_p[new_n - 1 - sfx]) {
+        sfx = sfx + 1;
+    }
+    val diff_end: usize = new_n - sfx;
+    var last_line: i64 = first_line;
+    var k: usize = pfx;
+    for (k < diff_end) {
+        if (new_p[k] == '\n' && k + 1 < diff_end) { last_line = last_line + 1; }
+        k = k + 1;
+    }
+    if (first_line > total_new) { first_line = total_new; }
+    if (last_line < first_line) { last_line = first_line; }
+    if (last_line > total_new) { last_line = total_new; }
+    @out_lo = first_line;
+    @out_hi = last_line;
 }
 
 fun txn_id(out: *u8) {
@@ -174,8 +222,27 @@ fun file_receipt(w: *jw.Jw, a: *A.Allocator, e: *commit.Entry, dry: bool, previe
         jw.f_i64(w, "bytes", e.len::i64);
         jw.f_i64(w, "lines", lines_of(e.data, e.len));
     }
+    if (e.status == commit.ST_CREATE || e.status == commit.ST_REPLACE) {
+        var clo: i64 = 0;
+        var chi: i64 = 0;
+        var oldp: *u8 = e.old;
+        var oldn: usize = e.old_len;
+        if (!e.existed) { oldp = nil; oldn = 0; }
+        changed_line_range(oldp, oldn, e.data, e.len, ?clo, ?chi);
+        if (clo > 0 && chi >= clo) {
+            jw.key(w, "changed_lines");
+            jw.arr(w);
+            jw.i64_v(w, clo);
+            jw.i64_v(w, chi);
+            jw.arr_end(w);
+        }
+    }
     if (e.existed && (e.status == commit.ST_REPLACE || e.status == commit.ST_DELETE)) {
         jw.f_str(w, "prev_sha256", ?e.old_sha[0]);
+    }
+    if (e.rebased) {
+        jw.f_bool(w, "rebased", true);
+        jw.f_str(w, "base_sha256", ?e.base_sha[0]);
     }
     if (e.lang != nil) { jw.f_str(w, "lang", e.lang); }
     if (e.check != commit.CK_NONE) {
@@ -184,7 +251,26 @@ fun file_receipt(w: *jw.Jw, a: *A.Allocator, e: *commit.Entry, dry: bool, previe
             if (e.ck_line > 0) { jw.f_i64(w, "line", e.ck_line); }
             if (e.ck_col > 0) { jw.f_i64(w, "col", e.ck_col); }
         }
+        if (e.ck_cat != nil && e.check != commit.CK_OK) { jw.f_str(w, "check_category", e.ck_cat); }
         if (e.ck_msg != nil && e.check != commit.CK_OK) { jw.f_str(w, "check_message", e.ck_msg); }
+        if (e.check == commit.CK_ERROR) {
+            if (e.ck_exe != nil) { jw.f_str(w, "check_executable", e.ck_exe); }
+            jw.f_i64(w, "check_exit_code", e.ck_exit);
+            if (e.ck_stderr != nil) { jw.f_str(w, "check_stderr", e.ck_stderr); }
+        }
+    }
+    var sl: str = e.lang;
+    if (sl == nil) { sl = scan.outline_lang(e.rel); }
+    if (sl != nil && (e.status == commit.ST_CREATE || e.status == commit.ST_REPLACE || e.status == commit.ST_DELETE)) {
+        var sop: *u8 = e.old;
+        var son: usize = e.old_len;
+        var snp: *u8 = e.data;
+        var snn: usize = e.len;
+        if (!e.existed) { sop = nil; son = 0; }
+        if (e.status == commit.ST_DELETE) { snp = nil; snn = 0; }
+        if (sop == nil) { son = 0; }
+        if (snp == nil) { snn = 0; }
+        scan.semantic_diff(a, sl, sop, son, snp, snn, w);
     }
     if (show_diff && (e.status == commit.ST_CREATE || e.status == commit.ST_REPLACE || e.status == commit.ST_DELETE)) {
         var op: *u8 = e.old;
@@ -218,7 +304,7 @@ fun files_list(w: *jw.Jw, set: *commit.Set, dry: bool, preview: bool, only_probl
     var i: usize = 0;
     for (i < commit.count(set)) {
         val e: *commit.Entry = commit.entry(set, i);
-        val problem: bool = e.status == commit.ST_CONFLICT || e.check == commit.CK_FAILED;
+        val problem: bool = e.status == commit.ST_CONFLICT || e.check == commit.CK_FAILED || e.check == commit.CK_ERROR;
         if (!only_problems || problem) { file_receipt(w, a, e, dry, preview, show_diff); }
         i = i + 1;
     }
@@ -243,15 +329,101 @@ fun check_tally(set: *commit.Set, ck: u8) i64 {
     ret n;
 }
 
+fun check_policy_name(chk: u8) str {
+    if (chk == spec.CHECK_OFF) { ret "off"; }
+    if (chk == spec.CHECK_REQUIRED) { ret "required"; }
+    if (chk == spec.CHECK_PERMISSIVE) { ret "permissive"; }
+    ret "strict";
+}
+
+fun is_validation_complete(set: *commit.Set, chk: u8, val_ran: bool, val_ok: bool) bool {
+    if (chk == spec.CHECK_OFF) { ret false; }
+    if (val_ran && !val_ok) { ret false; }
+    var i: usize = 0;
+    for (i < commit.count(set)) {
+        val e: *commit.Entry = commit.entry(set, i);
+        if ((e.status == commit.ST_CREATE || e.status == commit.ST_REPLACE) && e.lang != nil) {
+            if (e.check != commit.CK_OK) { ret false; }
+        }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun emit_checks_summary(w: *jw.Jw, set: *commit.Set) {
+    var ok_n: i64 = 0;
+    var fail_n: i64 = 0;
+    var err_n: i64 = 0;
+    var skip_n: i64 = 0;
+    var unchk_n: i64 = 0;
+    var i: usize = 0;
+    for (i < commit.count(set)) {
+        val e: *commit.Entry = commit.entry(set, i);
+        if (e.status == commit.ST_CREATE || e.status == commit.ST_REPLACE) {
+            if (e.check == commit.CK_OK) { ok_n = ok_n + 1; }
+            or (e.check == commit.CK_FAILED) { fail_n = fail_n + 1; }
+            or (e.check == commit.CK_ERROR) { err_n = err_n + 1; }
+            or (e.check == commit.CK_SKIPPED) { skip_n = skip_n + 1; }
+            or { unchk_n = unchk_n + 1; }
+        }
+        i = i + 1;
+    }
+    jw.key(w, "checks");
+    jw.obj(w);
+    jw.f_i64(w, "ok", ok_n);
+    jw.f_i64(w, "failed", fail_n);
+    jw.f_i64(w, "error", err_n);
+    jw.f_i64(w, "skipped", skip_n);
+    jw.f_i64(w, "unchecked", unchk_n);
+    jw.obj_end(w);
+}
+
+fun emit_checker_diagnostics(w: *jw.Jw, set: *commit.Set) {
+    var first: *commit.Entry = nil;
+    var i: usize = 0;
+    for (i < commit.count(set)) {
+        val e: *commit.Entry = commit.entry(set, i);
+        if (e.check == commit.CK_ERROR && first == nil) {
+            first = e;
+        }
+        i = i + 1;
+    }
+    if (first == nil) { ret; }
+    jw.key(w, "checker_diagnostics");
+    jw.obj(w);
+    if (first.ck_cat != nil) { jw.f_str(w, "category", first.ck_cat); }
+    or { jw.f_str(w, "category", "checker_error"); }
+    if (first.lang != nil) { jw.f_str(w, "lang", first.lang); }
+    if (first.ck_exe != nil) { jw.f_str(w, "executable", first.ck_exe); }
+    jw.f_i64(w, "exit_code", first.ck_exit);
+    if (first.ck_msg != nil) { jw.f_str(w, "message", first.ck_msg); }
+    if (first.ck_stderr != nil) { jw.f_str(w, "stderr", first.ck_stderr); }
+    jw.key(w, "affected_files");
+    jw.arr(w);
+    i = 0;
+    for (i < commit.count(set)) {
+        val e2: *commit.Entry = commit.entry(set, i);
+        if (e2.check == commit.CK_ERROR) {
+            jw.str_v(w, e2.rel);
+        }
+        i = i + 1;
+    }
+    jw.arr_end(w);
+    jw.obj_end(w);
+}
+
 fun journal_line(s: *session.Session, sp: *spec.Spec, txn: *u8) i64 {
     var w: jw.Jw = jw.init(?s.ra);
     jw.obj(?w);
+    jw.f_str(?w, "event", "transaction.committed");
     val clock: time.Clock = time.now();
     if (sel clock.ok) { jw.f_i64(?w, "ts_ms", time.time_unix_msec(clock.ok)); }
     jw.f_str(?w, "txn", txn);
     if (sp.job != nil) { jw.f_str(?w, "job", sp.job); }
     if (sp.tag != nil) { jw.f_str(?w, "tag", sp.tag); }
     jw.f_str(?w, "spec_sha256", ?sp.sha[0]);
+    jw.f_str(?w, "check_policy", check_policy_name(sp.check));
+    jw.f_bool(?w, "validation_complete", is_validation_complete(?sp.set, sp.check, false, true));
     jw.key(?w, "files");
     jw.arr(?w);
     var i: usize = 0;
@@ -263,6 +435,21 @@ fun journal_line(s: *session.Session, sp: *spec.Spec, txn: *u8) i64 {
             jw.f_str(?w, "status", commit.status_name(e.status));
             if (e.mode != commit.MODE_DELETE) { jw.f_str(?w, "sha256", ?e.sha[0]); }
             if (e.existed) { jw.f_str(?w, "prev_sha256", ?e.old_sha[0]); }
+            if (e.status == commit.ST_CREATE || e.status == commit.ST_REPLACE) {
+                var clo: i64 = 0;
+                var chi: i64 = 0;
+                var oldp: *u8 = e.old;
+                var oldn: usize = e.old_len;
+                if (!e.existed) { oldp = nil; oldn = 0; }
+                changed_line_range(oldp, oldn, e.data, e.len, ?clo, ?chi);
+                if (clo > 0 && chi >= clo) {
+                    jw.key(?w, "changed_lines");
+                    jw.arr(?w);
+                    jw.i64_v(?w, clo);
+                    jw.i64_v(?w, chi);
+                    jw.arr_end(?w);
+                }
+            }
             jw.obj_end(?w);
         }
         i = i + 1;
@@ -274,9 +461,573 @@ fun journal_line(s: *session.Session, sp: *spec.Spec, txn: *u8) i64 {
     ret commit.journal(?sp.set, w.buf, w.len);
 }
 
-# apply a spec: compile, observe, check, then publish under the workspace lock
+fun save_undo(s: *session.Session, sp: *spec.Spec, txn: *u8) {
+    val a: *A.Allocator = ?s.ra;
+    val lat_full: res[str, A.Error] = pathx.native(a, s.root, ".qark/undo/latest");
+    var prev_p: *u8 = nil;
+    var prev_n: usize = 0;
+    if (sel lat_full.ok) {
+        val lat_txt: res[str, filesystem.FsError] = filesystem.read_string(a, lat_full.ok);
+        if (sel lat_txt.ok) {
+            var lp: *u8 = lat_txt.ok;
+            var ln: usize = str_len(lp);
+            for (ln > 0 && (lp[ln - 1] == '\n' || lp[ln - 1] == '\r' || lp[ln - 1] == ' ')) { ln = ln - 1; }
+            if (ln > 0) {
+                prev_p = lp;
+                prev_n = ln;
+            }
+        }
+    }
+    var w: jw.Jw = jw.init(a);
+    jw.obj(?w);
+    jw.f_str(?w, "txn", txn);
+    if (sp.tag != nil) { jw.f_str(?w, "tag", sp.tag); }
+    if (prev_p != nil && prev_n > 0) {
+        jw.f_strn(?w, "prev_txn", prev_p, prev_n);
+    }
+    jw.key(?w, "files");
+    jw.arr(?w);
+    var i: usize = 0;
+    for (i < commit.count(?sp.set)) {
+        val e: *commit.Entry = commit.entry(?sp.set, i);
+        if (e.status == commit.ST_CREATE || e.status == commit.ST_REPLACE || e.status == commit.ST_DELETE) {
+            jw.obj(?w);
+            jw.f_str(?w, "path", e.rel);
+            jw.f_str(?w, "status", commit.status_name(e.status));
+            if (e.mode != commit.MODE_DELETE) {
+                jw.f_str(?w, "sha256", ?e.sha[0]);
+                if (e.data != nil && e.len <= 4194304 && utf8.validate(e.data, e.len)) {
+                    jw.f_strn(?w, "new_text", e.data, e.len);
+                }
+                or (e.len == 0) {
+                    jw.f_str(?w, "new_text", "");
+                }
+            }
+            if (e.existed) {
+                jw.f_str(?w, "prev_sha256", ?e.old_sha[0]);
+                if (e.old != nil && e.old_len <= 4194304 && utf8.validate(e.old, e.old_len)) {
+                    jw.f_strn(?w, "old_text", e.old, e.old_len);
+                }
+                or (e.old_len == 0) {
+                    jw.f_str(?w, "old_text", "");
+                }
+            }
+            jw.obj_end(?w);
+        }
+        i = i + 1;
+    }
+    jw.arr_end(?w);
+    jw.obj_end(?w);
+    jw.byte(?w, '\n');
+    if (w.failed || w.buf == nil) { ret; }
+    var pw: jw.Jw = jw.init(a);
+    jw.raw(?pw, ".qark/undo/");
+    jw.raw(?pw, txn);
+    jw.raw(?pw, ".json");
+    val snap_full: res[str, A.Error] = pathx.native(a, s.root, jw.text(?pw));
+    if (sel snap_full.ok) {
+        filesystem.replace_bytes_atomic(a, snap_full.ok, w.buf, w.len, 420, 493);
+    }
+    if (sel lat_full.ok) {
+        filesystem.replace_bytes_atomic(a, lat_full.ok, txn, str_len(txn), 420, 493);
+    }
+    val redo_full: res[str, A.Error] = pathx.native(a, s.root, ".qark/undo/redo");
+    if (sel redo_full.ok) {
+        filesystem.remove_file(redo_full.ok);
+    }
+}
+
+fun undo_list(s: *session.Session, w: *jw.Jw) bool {
+    val a: *A.Allocator = ?s.ra;
+    jw.obj(w);
+    jw.key(w, "txns");
+    jw.arr(w);
+    var count: i64 = 0;
+    val lat_full: res[str, A.Error] = pathx.native(a, s.root, ".qark/undo/latest");
+    var cur: *u8 = nil;
+    var cur_n: usize = 0;
+    if (sel lat_full.ok) {
+        val lat_txt: res[str, filesystem.FsError] = filesystem.read_string(a, lat_full.ok);
+        if (sel lat_txt.ok) {
+            var lp: *u8 = lat_txt.ok;
+            var ln: usize = str_len(lp);
+            for (ln > 0 && (lp[ln - 1] == '\n' || lp[ln - 1] == '\r' || lp[ln - 1] == ' ')) { ln = ln - 1; }
+            if (ln > 0) {
+                val d: res[str, A.Error] = util.dup_n(a, lp, ln);
+                if (sel d.ok) {
+                    cur = d.ok;
+                    cur_n = ln;
+                }
+            }
+        }
+    }
+    var steps: usize = 0;
+    for (cur != nil && cur_n > 0 && steps < 64 && pathx.check(cur) == pathx.P_OK) {
+        var pw: jw.Jw = jw.init(a);
+        jw.raw(?pw, ".qark/undo/");
+        jw.raw(?pw, cur);
+        jw.raw(?pw, ".json");
+        val snap_full: res[str, A.Error] = pathx.native(a, s.root, jw.text(?pw));
+        var next_cur: *u8 = nil;
+        var next_n: usize = 0;
+        if (sel snap_full.ok) {
+            val snap_txt: res[str, filesystem.FsError] = filesystem.read_string(a, snap_full.ok);
+            if (sel snap_txt.ok) {
+                val parsed: res[json.Value, json.JsonError] = json.parse(snap_txt.ok, str_len(snap_txt.ok), a);
+                if (sel parsed.ok) {
+                    var doc: json.Value = parsed.ok;
+                    var fcnt: i64 = 0;
+                    val ff: opt[*json.Value] = json.value_find(?doc, "files");
+                    if (sel ff.some) {
+                        if (json.value_is_array(ff.some)) { fcnt = json.value_count(ff.some)::i64; }
+                    }
+                    jw.obj(w);
+                    jw.f_str(w, "txn", cur);
+                    jw.f_i64(w, "files", fcnt);
+                    val tgf: opt[*json.Value] = json.value_find(?doc, "tag");
+                    if (sel tgf.some) {
+                        if (json.value_is_string(tgf.some)) {
+                            var tgp: *u8 = nil;
+                            var tgn: usize = 0;
+                            if (spec.decode_pub(a, tgf.some, ?tgp, ?tgn) && tgn > 0) {
+                                jw.f_str(w, "tag", tgp);
+                            }
+                        }
+                    }
+                    val pf: opt[*json.Value] = json.value_find(?doc, "prev_txn");
+                    if (sel pf.some) {
+                        if (json.value_is_string(pf.some)) {
+                            spec.decode_pub(a, pf.some, ?next_cur, ?next_n);
+                            if (next_cur != nil && next_n > 0) {
+                                jw.f_str(w, "prev_txn", next_cur);
+                            }
+                        }
+                    }
+                    jw.obj_end(w);
+                    count = count + 1;
+                }
+            }
+        }
+        cur = next_cur;
+        cur_n = next_n;
+        steps = steps + 1;
+    }
+    jw.arr_end(w);
+    jw.f_i64(w, "count", count);
+    val redo_full: res[str, A.Error] = pathx.native(a, s.root, ".qark/undo/redo");
+    if (sel redo_full.ok) {
+        val rtxt: res[str, filesystem.FsError] = filesystem.read_string(a, redo_full.ok);
+        if (sel rtxt.ok) {
+            var rp: *u8 = rtxt.ok;
+            var rn: usize = str_len(rp);
+            for (rn > 0 && (rp[rn - 1] == '\n' || rp[rn - 1] == '\r' || rp[rn - 1] == ' ')) { rn = rn - 1; }
+            if (rn > 0) { jw.f_strn(w, "redo_txn", rp, rn); }
+        }
+    }
+    jw.obj_end(w);
+    ret true;
+}
+
+# redo a previously undone transaction using its persistent .qark/undo/<txn>.json snapshot
+pub fun redo(s: *session.Session, args: *json.Value, w: *jw.Jw) bool {
+    val a: *A.Allocator = ?s.ra;
+    var txn: *u8 = nil;
+    var txn_n: usize = 0;
+    val tf: opt[*json.Value] = json.value_find(args, "txn");
+    if (sel tf.some) {
+        if (json.value_is_string(tf.some)) { spec.decode_pub(a, tf.some, ?txn, ?txn_n); }
+    }
+    if (txn == nil || txn_n == 0 || util.eq(txn, "latest")) {
+        val redo_full: res[str, A.Error] = pathx.native(a, s.root, ".qark/undo/redo");
+        if (sel redo_full.err) { ret simple_error(w, "oom", "out of memory"); }
+        val redo_txt: res[str, filesystem.FsError] = filesystem.read_string(a, redo_full.ok);
+        if (sel redo_txt.err) { ret simple_error(w, "redo_missing", "no undone transaction to redo in .qark/undo"); }
+        var rp: *u8 = redo_txt.ok;
+        var rn: usize = str_len(rp);
+        for (rn > 0 && (rp[rn - 1] == '\n' || rp[rn - 1] == '\r' || rp[rn - 1] == ' ')) { rn = rn - 1; }
+        val d: res[str, A.Error] = util.dup_n(a, rp, rn);
+        if (sel d.err) { ret simple_error(w, "oom", "out of memory"); }
+        txn = d.ok;
+        txn_n = rn;
+    }
+    if (txn_n == 0 || pathx.check(txn) != pathx.P_OK) {
+        ret simple_error(w, "redo_missing", "invalid transaction id");
+    }
+    var pw: jw.Jw = jw.init(a);
+    jw.raw(?pw, ".qark/undo/");
+    jw.raw(?pw, txn);
+    jw.raw(?pw, ".json");
+    val snap_full: res[str, A.Error] = pathx.native(a, s.root, jw.text(?pw));
+    if (sel snap_full.err) { ret simple_error(w, "oom", "out of memory"); }
+    val snap_txt: res[str, filesystem.FsError] = filesystem.read_string(a, snap_full.ok);
+    if (sel snap_txt.err) { ret simple_error(w, "redo_missing", "no snapshot found for that transaction"); }
+    val parsed: res[json.Value, json.JsonError] = json.parse(snap_txt.ok, str_len(snap_txt.ok), a);
+    if (sel parsed.err) { ret simple_error(w, "undo_corrupt", "the snapshot could not be parsed"); }
+    var doc: json.Value = parsed.ok;
+    val files_f: opt[*json.Value] = json.value_find(?doc, "files");
+    if (!sel files_f.some) { ret simple_error(w, "undo_corrupt", "the snapshot has no files list"); }
+    if (!json.value_is_array(files_f.some)) { ret simple_error(w, "undo_corrupt", "the snapshot has no files list"); }
+    val dry: bool = spec.fbool_pub(args, "dry_run") || s.force_dry;
+    val force: bool = spec.fbool_pub(args, "force");
+    val show_diff: bool = spec.fbool_pub(args, "diff");
+    var fwd_set: commit.Set = commit.init(a, s.root);
+    var i: usize = 0;
+    for (i < json.value_count(files_f.some)) {
+        val g: opt[*json.Value] = json.value_get(files_f.some, i);
+        if (sel g.some) {
+            var p: *u8 = nil;
+            var pn: usize = 0;
+            var st: *u8 = nil;
+            var stn: usize = 0;
+            var psha: *u8 = nil;
+            var pshan: usize = 0;
+            var new_t: *u8 = nil;
+            var new_n: usize = 0;
+            var has_new: bool = false;
+            val pf: opt[*json.Value] = json.value_find(g.some, "path");
+            val stf: opt[*json.Value] = json.value_find(g.some, "status");
+            val psf: opt[*json.Value] = json.value_find(g.some, "prev_sha256");
+            val ntf: opt[*json.Value] = json.value_find(g.some, "new_text");
+            if (sel pf.some) { spec.decode_pub(a, pf.some, ?p, ?pn); }
+            if (sel stf.some) { spec.decode_pub(a, stf.some, ?st, ?stn); }
+            if (sel psf.some) { spec.decode_pub(a, psf.some, ?psha, ?pshan); }
+            if (sel ntf.some) {
+                if (spec.decode_pub(a, ntf.some, ?new_t, ?new_n)) { has_new = true; }
+            }
+            if (p != nil && st != nil) {
+                if (util.eq(st, "created")) {
+                    if (!has_new) { ret simple_error(w, "redo_unavailable", "snapshot does not hold new_text for a created file"); }
+                    var mode: u8 = commit.MODE_CREATE;
+                    if (force) { mode = commit.MODE_UPSERT; }
+                    commit.add(?fwd_set, p, new_t, new_n, mode);
+                }
+                or (util.eq(st, "replaced")) {
+                    if (!has_new) { ret simple_error(w, "redo_unavailable", "snapshot does not hold new_text for a replaced file"); }
+                    var mode: u8 = commit.MODE_REPLACE;
+                    if (force) { mode = commit.MODE_UPSERT; }
+                    val added: res[usize, A.Error] = commit.add(?fwd_set, p, new_t, new_n, mode);
+                    if (sel added.ok) {
+                        if (!force && psha != nil) {
+                            commit.set_expect(commit.entry(?fwd_set, added.ok), psha);
+                        }
+                    }
+                }
+                or (util.eq(st, "deleted")) {
+                    val added: res[usize, A.Error] = commit.add(?fwd_set, p, nil, 0, commit.MODE_DELETE);
+                    if (sel added.ok) {
+                        if (!force && psha != nil) {
+                            commit.set_expect(commit.entry(?fwd_set, added.ok), psha);
+                        }
+                    }
+                }
+            }
+        }
+        i = i + 1;
+    }
+    commit.observe(?fwd_set);
+    val conflicts: i64 = commit.tally(?fwd_set, commit.ST_CONFLICT);
+    if (conflicts > 0 && !dry) {
+        error_obj(w, "conflict", "a file was modified since undo; nothing was redone. pass force: true to overwrite");
+        files_list(w, ?fwd_set, false, false, true, false, a);
+        jw.obj_end(w);
+        ret false;
+    }
+    var rtxn: [17]u8;
+    txn_id(?rtxn[0]);
+    if (!dry && commit.dirty(?fwd_set)) {
+        var held: commit.Lock;
+        val locked: i64 = commit.lock(?fwd_set, s.lock_ms, ?held);
+        if (locked != 0) { ret simple_error(w, "locked", "another qark process held the workspace lock"); }
+        commit.observe(?fwd_set);
+        if (commit.tally(?fwd_set, commit.ST_CONFLICT) > 0) {
+            commit.unlock(?held);
+            error_obj(w, "conflict", "a file changed while preparing redo; nothing was redone");
+            files_list(w, ?fwd_set, false, false, true, false, a);
+            jw.obj_end(w);
+            ret false;
+        }
+        val out: commit.Outcome = commit.publish(?fwd_set);
+        commit.unlock(?held);
+        if (!out.ok) {
+            error_obj(w, out.code, out.msg);
+            jw.obj_end(w);
+            ret false;
+        }
+        val lat_p: res[str, A.Error] = pathx.native(a, s.root, ".qark/undo/latest");
+        if (sel lat_p.ok) {
+            filesystem.replace_bytes_atomic(a, lat_p.ok, txn, txn_n, 420, 493);
+        }
+        val redo_p: res[str, A.Error] = pathx.native(a, s.root, ".qark/undo/redo");
+        if (sel redo_p.ok) {
+            filesystem.remove_file(redo_p.ok);
+        }
+    }
+    jw.obj(w);
+    jw.f_str(w, "txn", ?rtxn[0]);
+    jw.f_str(w, "redone_txn", txn);
+    jw.f_bool(w, "dry_run", dry);
+    counts(w, ?fwd_set);
+    files_list(w, ?fwd_set, dry, false, false, show_diff, a);
+    jw.obj_end(w);
+    ret true;
+}
+
+fun undo_single(s: *session.Session, args: *json.Value, w: *jw.Jw, steps_done: i64) bool {
+    val a: *A.Allocator = ?s.ra;
+    var txn: *u8 = nil;
+    var txn_n: usize = 0;
+    val tf: opt[*json.Value] = json.value_find(args, "txn");
+    if (sel tf.some) {
+        if (json.value_is_string(tf.some)) { spec.decode_pub(a, tf.some, ?txn, ?txn_n); }
+    }
+    if (txn == nil) {
+        val uf: opt[*json.Value] = json.value_find(args, "undo");
+        if (sel uf.some) {
+            if (json.value_is_string(uf.some)) { spec.decode_pub(a, uf.some, ?txn, ?txn_n); }
+        }
+    }
+    if (txn == nil || txn_n == 0 || util.eq(txn, "latest")) {
+        val lat_full: res[str, A.Error] = pathx.native(a, s.root, ".qark/undo/latest");
+        if (sel lat_full.err) { ret simple_error(w, "oom", "out of memory"); }
+        val lat_txt: res[str, filesystem.FsError] = filesystem.read_string(a, lat_full.ok);
+        if (sel lat_txt.err) { ret simple_error(w, "undo_missing", "no transaction to undo in .qark/undo"); }
+        var lp: *u8 = lat_txt.ok;
+        var ln: usize = str_len(lp);
+        for (ln > 0 && (lp[ln - 1] == '\n' || lp[ln - 1] == '\r' || lp[ln - 1] == ' ')) { ln = ln - 1; }
+        val d: res[str, A.Error] = util.dup_n(a, lp, ln);
+        if (sel d.err) { ret simple_error(w, "oom", "out of memory"); }
+        txn = d.ok;
+        txn_n = ln;
+    }
+    if (txn_n == 0 || pathx.check(txn) != pathx.P_OK) {
+        ret simple_error(w, "undo_missing", "invalid transaction id");
+    }
+    var pw: jw.Jw = jw.init(a);
+    jw.raw(?pw, ".qark/undo/");
+    jw.raw(?pw, txn);
+    jw.raw(?pw, ".json");
+    val snap_full: res[str, A.Error] = pathx.native(a, s.root, jw.text(?pw));
+    if (sel snap_full.err) { ret simple_error(w, "oom", "out of memory"); }
+    val snap_txt: res[str, filesystem.FsError] = filesystem.read_string(a, snap_full.ok);
+    if (sel snap_txt.err) { ret simple_error(w, "undo_missing", "no undo snapshot found for that transaction"); }
+    val parsed: res[json.Value, json.JsonError] = json.parse(snap_txt.ok, str_len(snap_txt.ok), a);
+    if (sel parsed.err) { ret simple_error(w, "undo_corrupt", "the undo snapshot could not be parsed"); }
+    var doc: json.Value = parsed.ok;
+    var prev_txn: *u8 = nil;
+    var prev_n: usize = 0;
+    val prev_f: opt[*json.Value] = json.value_find(?doc, "prev_txn");
+    if (sel prev_f.some) {
+        if (json.value_is_string(prev_f.some)) {
+            spec.decode_pub(a, prev_f.some, ?prev_txn, ?prev_n);
+        }
+    }
+    val files_f: opt[*json.Value] = json.value_find(?doc, "files");
+    if (!sel files_f.some) {
+        ret simple_error(w, "undo_corrupt", "the undo snapshot has no files list");
+    }
+    if (!json.value_is_array(files_f.some)) {
+        ret simple_error(w, "undo_corrupt", "the undo snapshot has no files list");
+    }
+    val dry: bool = spec.fbool_pub(args, "dry_run") || s.force_dry;
+    val force: bool = spec.fbool_pub(args, "force");
+    val show_diff: bool = spec.fbool_pub(args, "diff");
+    var rev_set: commit.Set = commit.init(a, s.root);
+    var i: usize = 0;
+    for (i < json.value_count(files_f.some)) {
+        val g: opt[*json.Value] = json.value_get(files_f.some, i);
+        if (sel g.some) {
+            var p: *u8 = nil;
+            var pn: usize = 0;
+            var st: *u8 = nil;
+            var stn: usize = 0;
+            var sha: *u8 = nil;
+            var shan: usize = 0;
+            var old_t: *u8 = nil;
+            var old_n: usize = 0;
+            var has_old: bool = false;
+            val pf: opt[*json.Value] = json.value_find(g.some, "path");
+            val stf: opt[*json.Value] = json.value_find(g.some, "status");
+            val shf: opt[*json.Value] = json.value_find(g.some, "sha256");
+            val otf: opt[*json.Value] = json.value_find(g.some, "old_text");
+            if (sel pf.some) { spec.decode_pub(a, pf.some, ?p, ?pn); }
+            if (sel stf.some) { spec.decode_pub(a, stf.some, ?st, ?stn); }
+            if (sel shf.some) { spec.decode_pub(a, shf.some, ?sha, ?shan); }
+            if (sel otf.some) {
+                if (spec.decode_pub(a, otf.some, ?old_t, ?old_n)) { has_old = true; }
+            }
+            if (p != nil && st != nil) {
+                if (util.eq(st, "created")) {
+                    val added: res[usize, A.Error] = commit.add(?rev_set, p, nil, 0, commit.MODE_DELETE);
+                    if (sel added.ok) {
+                        if (!force && sha != nil) {
+                            commit.set_expect(commit.entry(?rev_set, added.ok), sha);
+                        }
+                    }
+                }
+                or (util.eq(st, "replaced")) {
+                    if (!has_old) { ret simple_error(w, "undo_unavailable", "undo snapshot does not hold previous text for a replaced file"); }
+                    var mode: u8 = commit.MODE_REPLACE;
+                    if (force) { mode = commit.MODE_UPSERT; }
+                    val added: res[usize, A.Error] = commit.add(?rev_set, p, old_t, old_n, mode);
+                    if (sel added.ok) {
+                        if (!force && sha != nil) {
+                            commit.set_expect(commit.entry(?rev_set, added.ok), sha);
+                        }
+                    }
+                }
+                or (util.eq(st, "deleted")) {
+                    if (!has_old) { ret simple_error(w, "undo_unavailable", "undo snapshot does not hold previous text for a deleted file"); }
+                    var mode: u8 = commit.MODE_CREATE;
+                    if (force) { mode = commit.MODE_UPSERT; }
+                    commit.add(?rev_set, p, old_t, old_n, mode);
+                }
+            }
+        }
+        i = i + 1;
+    }
+    commit.observe(?rev_set);
+    val conflicts: i64 = commit.tally(?rev_set, commit.ST_CONFLICT);
+    if (conflicts > 0 && !dry) {
+        error_obj(w, "conflict", "a file was modified since that transaction; nothing was reverted. pass force: true to overwrite");
+        files_list(w, ?rev_set, false, false, true, false, a);
+        jw.obj_end(w);
+        ret false;
+    }
+    var utxn: [17]u8;
+    txn_id(?utxn[0]);
+    if (!dry && commit.dirty(?rev_set)) {
+        var held: commit.Lock;
+        val locked: i64 = commit.lock(?rev_set, s.lock_ms, ?held);
+        if (locked != 0) { ret simple_error(w, "locked", "another qark process held the workspace lock"); }
+        commit.observe(?rev_set);
+        if (commit.tally(?rev_set, commit.ST_CONFLICT) > 0) {
+            commit.unlock(?held);
+            error_obj(w, "conflict", "a file changed while preparing undo; nothing was reverted");
+            files_list(w, ?rev_set, false, false, true, false, a);
+            jw.obj_end(w);
+            ret false;
+        }
+        val out: commit.Outcome = commit.publish(?rev_set);
+        commit.unlock(?held);
+        if (!out.ok) {
+            error_obj(w, out.code, out.msg);
+            jw.obj_end(w);
+            ret false;
+        }
+        val redo_p: res[str, A.Error] = pathx.native(a, s.root, ".qark/undo/redo");
+        if (sel redo_p.ok) {
+            filesystem.replace_bytes_atomic(a, redo_p.ok, txn, txn_n, 420, 493);
+        }
+        val lat_p: res[str, A.Error] = pathx.native(a, s.root, ".qark/undo/latest");
+        if (sel lat_p.ok) {
+            if (prev_txn != nil && prev_n > 0) {
+                filesystem.replace_bytes_atomic(a, lat_p.ok, prev_txn, prev_n, 420, 493);
+            }
+            or {
+                filesystem.remove_file(lat_p.ok);
+            }
+        }
+    }
+    jw.obj(w);
+    jw.f_str(w, "txn", ?utxn[0]);
+    jw.f_str(w, "reverted_txn", txn);
+    if (prev_txn != nil && prev_n > 0) {
+        jw.f_str(w, "prev_txn", prev_txn);
+    }
+    if (steps_done > 1) {
+        jw.f_i64(w, "steps_reverted", steps_done);
+    }
+    jw.f_bool(w, "dry_run", dry);
+    counts(w, ?rev_set);
+    files_list(w, ?rev_set, dry, false, false, show_diff, a);
+    jw.obj_end(w);
+    ret true;
+}
+
+# revert a previously applied transaction using its .qark/undo/<txn>.json snapshot
+pub fun undo(s: *session.Session, args: *json.Value, w: *jw.Jw) bool {
+    if (spec.fbool_pub(args, "list")) {
+        ret undo_list(s, w);
+    }
+    if (spec.fbool_pub(args, "redo")) {
+        ret redo(s, args, w);
+    }
+    val a: *A.Allocator = ?s.ra;
+    var txn: *u8 = nil;
+    var txn_n: usize = 0;
+    val tf: opt[*json.Value] = json.value_find(args, "txn");
+    if (sel tf.some) {
+        if (json.value_is_string(tf.some)) { spec.decode_pub(a, tf.some, ?txn, ?txn_n); }
+    }
+    if (txn == nil) {
+        val uf: opt[*json.Value] = json.value_find(args, "undo");
+        if (sel uf.some) {
+            if (json.value_is_string(uf.some)) { spec.decode_pub(a, uf.some, ?txn, ?txn_n); }
+        }
+    }
+    if (txn != nil && util.eq(txn, "list")) {
+        ret undo_list(s, w);
+    }
+    if (txn != nil && util.eq(txn, "redo")) {
+        ret redo(s, args, w);
+    }
+    var steps: i64 = 1;
+    val stf: opt[*json.Value] = json.value_find(args, "steps");
+    if (sel stf.some) {
+        if (json.value_is_number(stf.some) && json.value_number(stf.some) > 1) {
+            steps = json.value_number(stf.some);
+            if (steps > 32) { steps = 32; }
+        }
+    }
+    val dry: bool = spec.fbool_pub(args, "dry_run") || s.force_dry;
+    if (steps > 1 && !dry && (txn == nil || txn_n == 0 || util.eq(txn, "latest"))) {
+        var step_i: i64 = 1;
+        for (step_i < steps) {
+            var sub_w: jw.Jw = jw.init(a);
+            if (!undo_single(s, args, ?sub_w, step_i)) {
+                jw.raw_vn(w, sub_w.buf, sub_w.len);
+                ret false;
+            }
+            step_i = step_i + 1;
+        }
+    }
+    ret undo_single(s, args, w, steps);
+}
+
+fun push_event(ev_w: *jw.Jw, count: *i64, phase: str, status: str, us: i64, files: i64) {
+    if (@count == 0) { jw.arr(ev_w); }
+    jw.obj(ev_w);
+    jw.f_str(ev_w, "phase", phase);
+    jw.f_str(ev_w, "status", status);
+    jw.f_ms(ev_w, "ms", us);
+    if (files >= 0) { jw.f_i64(ev_w, "files", files); }
+    jw.obj_end(ev_w);
+    @count = @count + 1;
+}
+
+# apply a spec: compile, observe, check, validate, then publish under the workspace lock
 pub fun apply(s: *session.Session, args: *json.Value, w: *jw.Jw) bool {
+    if (json.value_is_object(args)) {
+        val uf: opt[*json.Value] = json.value_find(args, "undo");
+        if (sel uf.some) {
+            if ((json.value_is_bool(uf.some) && json.value_bool(uf.some)) || json.value_is_string(uf.some)) {
+                ret undo(s, args, w);
+            }
+        }
+        val rf: opt[*json.Value] = json.value_find(args, "redo");
+        if (sel rf.some) {
+            if (json.value_is_bool(rf.some) && json.value_bool(rf.some)) {
+                ret redo(s, args, w);
+            }
+        }
+    }
     val t0: time.Instant = started();
+    val stream: bool = spec.fbool_pub(args, "stream");
+    var ev_w: jw.Jw = jw.init(?s.ra);
+    var ev_cnt: i64 = 0;
+    var val_spec: *json.Value = nil;
+    val vf: opt[*json.Value] = json.value_find(args, "validate");
+    if (sel vf.some) { val_spec = vf.some; }
     var compact: jw.Jw = jw.init(?s.ra);
     spec.emit_json(?compact, args, false, 0);
     var sp: spec.Spec;
@@ -288,8 +1039,14 @@ pub fun apply(s: *session.Session, args: *json.Value, w: *jw.Jw) bool {
     if (s.force_dry) { sp.dry = true; }
     val preview: bool = spec.fbool_pub(args, "preview");
     val t_compile: i64 = now_us(t0);
+    if (stream) { push_event(?ev_w, ?ev_cnt, "compile", "ok", t_compile, commit.count(?sp.set)::i64); }
     commit.observe(?sp.set);
     val conflicts: i64 = commit.tally(?sp.set, commit.ST_CONFLICT);
+    if (stream) {
+        var obs_st: str = "ok";
+        if (conflicts > 0) { obs_st = "conflict"; }
+        push_event(?ev_w, ?ev_cnt, "observe", obs_st, now_us(t0) - t_compile, conflicts);
+    }
     if (conflicts > 0 && !sp.dry) {
         error_obj(w, "conflict", "a file conflicts with what is on disk; nothing was written. each conflict below names the reason and the current sha256");
         files_list(w, ?sp.set, false, false, true, false, ?s.ra);
@@ -297,22 +1054,52 @@ pub fun apply(s: *session.Session, args: *json.Value, w: *jw.Jw) bool {
         ret false;
     }
     var t_check: i64 = t_compile;
+    var val_ran: bool = false;
+    var val_ok: bool = true;
+    var val_msg: str = nil;
     if (sp.check != spec.CHECK_OFF) {
         check.run(?s.ra, s.a, s.root, ?sp.set, ?s.tools, check.TIMEOUT_MS);
+        if (sp.dry && conflicts == 0 && (val_spec != nil || check.has_staged(?s.ra, s.root, ?sp.set))) {
+            var dheld: commit.Lock;
+            if (commit.lock(?sp.set, s.lock_ms, ?dheld) == 0) {
+                check.run_staged(?s.ra, s.root, ?sp.set, check.TIMEOUT_MS);
+                if (val_spec != nil) {
+                    val_ok = check.run_project_validation(?s.ra, s.root, ?sp.set, val_spec, check.TIMEOUT_MS, ?val_ran, ?val_msg);
+                }
+                commit.unlock(?dheld);
+            }
+        }
         t_check = now_us(t0);
+        if (stream) { push_event(?ev_w, ?ev_cnt, "check", "ok", t_check - t_compile, check_tally(?sp.set, commit.CK_OK)); }
     }
     val failed: i64 = check_tally(?sp.set, commit.CK_FAILED);
+    val errored: i64 = check_tally(?sp.set, commit.CK_ERROR);
     val skipped: i64 = check_tally(?sp.set, commit.CK_SKIPPED);
-    val blocked: bool = failed > 0 || (sp.check == spec.CHECK_REQUIRED && skipped > 0);
+    val blocked: bool = failed > 0 || (errored > 0 && sp.check != spec.CHECK_PERMISSIVE) || (sp.check == spec.CHECK_REQUIRED && skipped > 0) || (val_ran && !val_ok);
     if (blocked && !sp.dry) {
-        if (failed > 0) { error_obj(w, "check_failed", "a file failed its syntax check; nothing was written. fix the lines named below and apply again"); }
-        or { error_obj(w, "check_unavailable", "check is required but a checker could not run; nothing was written"); }
+        if (failed > 0) {
+            error_obj(w, "check_failed", "a file failed its syntax check; nothing was written. fix the lines named below and apply again");
+        }
+        or (errored > 0 && sp.check != spec.CHECK_PERMISSIVE) {
+            error_obj(w, "checker_error", "a syntax checker crashed or returned invalid output; nothing was written");
+        }
+        or {
+            error_obj(w, "check_unavailable", "check is required but a checker could not run; nothing was written");
+        }
+        jw.f_str(w, "check_policy", check_policy_name(sp.check));
+        jw.f_bool(w, "validation_complete", false);
+        emit_checks_summary(w, ?sp.set);
+        if (errored > 0) {
+            emit_checker_diagnostics(w, ?sp.set);
+        }
         jw.key(w, "files");
         jw.arr(w);
         var i: usize = 0;
         for (i < commit.count(?sp.set)) {
             val en: *commit.Entry = commit.entry(?sp.set, i);
-            if (en.check == commit.CK_FAILED || (sp.check == spec.CHECK_REQUIRED && en.check == commit.CK_SKIPPED)) { file_receipt(w, ?s.ra, en, false, false, false); }
+            if (en.check == commit.CK_FAILED || en.check == commit.CK_ERROR || (sp.check == spec.CHECK_REQUIRED && en.check == commit.CK_SKIPPED)) {
+                file_receipt(w, ?s.ra, en, false, false, false);
+            }
             i = i + 1;
         }
         jw.arr_end(w);
@@ -353,6 +1140,21 @@ pub fun apply(s: *session.Session, args: *json.Value, w: *jw.Jw) bool {
                 jw.obj_end(w);
                 ret false;
             }
+            val t_val0: i64 = now_us(t0);
+            val_ok = check.run_project_validation(?s.ra, s.root, ?sp.set, val_spec, check.TIMEOUT_MS, ?val_ran, ?val_msg);
+            if (val_ran && stream) {
+                var vst: str = "ok";
+                if (!val_ok) { vst = "failed"; }
+                push_event(?ev_w, ?ev_cnt, "validate", vst, now_us(t0) - t_val0, -1);
+            }
+            if (val_ran && !val_ok) {
+                commit.unlock(?held);
+                error_obj(w, "check_failed", "project validation failed before commit; nothing was written");
+                if (val_msg != nil) { jw.f_str(w, "validation_message", val_msg); }
+                files_list(w, ?sp.set, false, false, false, false, ?s.ra);
+                jw.obj_end(w);
+                ret false;
+            }
         }
         val out: commit.Outcome = commit.publish(?sp.set);
         if (!out.ok) {
@@ -363,22 +1165,44 @@ pub fun apply(s: *session.Session, args: *json.Value, w: *jw.Jw) bool {
             ret false;
         }
         journal = journal_line(s, ?sp, ?txn[0]);
+        save_undo(s, ?sp, ?txn[0]);
         commit.unlock(?held);
         s.written = s.written + commit.tally(?sp.set, commit.ST_CREATE) + commit.tally(?sp.set, commit.ST_REPLACE);
     }
     s.applies = s.applies + 1;
     val t_total: i64 = now_us(t0);
+    if (stream) {
+        push_event(?ev_w, ?ev_cnt, "commit", "ok", t_total - t_check, commit.tally(?sp.set, commit.ST_CREATE) + commit.tally(?sp.set, commit.ST_REPLACE));
+        jw.arr_end(?ev_w);
+    }
     jw.obj(w);
     jw.f_str(w, "txn", ?txn[0]);
     jw.f_bool(w, "dry_run", sp.dry);
     if (sp.dry) {
         jw.f_bool(w, "ready", conflicts == 0 && !blocked);
     }
+    jw.f_str(w, "check_policy", check_policy_name(sp.check));
+    jw.f_bool(w, "validation_complete", is_validation_complete(?sp.set, sp.check, val_ran, val_ok));
+    emit_checks_summary(w, ?sp.set);
+    if (errored > 0) {
+        emit_checker_diagnostics(w, ?sp.set);
+    }
+    if (val_ran) {
+        if (val_ok) { jw.f_str(w, "validation", "ok"); }
+        or {
+            jw.f_str(w, "validation", "failed");
+            if (val_msg != nil) { jw.f_str(w, "validation_message", val_msg); }
+        }
+    }
     if (sp.job != nil) { jw.f_str(w, "job", sp.job); }
     if (sp.dest != nil && sp.dest[0] != 0) { jw.f_str(w, "dest", sp.dest); }
     jw.f_str(w, "spec_sha256", ?sp.sha[0]);
     counts(w, ?sp.set);
     files_list(w, ?sp.set, sp.dry, preview, false, sp.diff, ?s.ra);
+    if (stream && !ev_w.failed && ev_w.len > 0) {
+        jw.key(w, "events");
+        jw.raw_vn(w, ev_w.buf, ev_w.len);
+    }
     if (sp.warns.len > 0) {
         jw.key(w, "warnings");
         jw.arr(w);
@@ -408,13 +1232,36 @@ fun name_lt(a: str, b: str) bool {
     ret a[i] < b[i];
 }
 
-fun read_one(s: *session.Session, rel_in: str, content: bool, max: usize, lo: i64, hi: i64, outline: bool, w: *jw.Jw) {
+fun line_span_bytes(p: *u8, n: usize, use_lo: i64, use_hi: i64, from_out: *usize, to_out: *usize) {
+    var line: i64 = 1;
+    var i: usize = 0;
+    var from: usize = n;
+    var to: usize = n;
+    if (use_lo <= 1) { from = 0; }
+    for (i < n) {
+        if (p[i] == '\n') {
+            line = line + 1;
+            if (line == use_lo) { from = i + 1; }
+            if (line == use_hi + 1) {
+                to = i + 1;
+                brk;
+            }
+        }
+        i = i + 1;
+    }
+    if (from > to) { from = to; }
+    @from_out = from;
+    @to_out = to;
+}
+
+fun read_one(s: *session.Session, rel_in: str, content: bool, max: usize, lo: i64, hi: i64, sym_p: *u8, sym_n: usize, syms_list: *vector.Vector[str], fold: bool, outline: bool, w: *jw.Jw) {
     val a: *A.Allocator = ?s.ra;
     jw.obj(w);
-    var rel: str = rel_in;
-    var root_dir: bool = util.eq(rel_in, ".") || rel_in[0] == 0;
+    val stripped: str = pathx.strip_root(s.root, rel_in);
+    var rel: str = stripped;
+    var root_dir: bool = util.eq(stripped, ".") || stripped[0] == 0;
     if (!root_dir) {
-        val canon: res[str, A.Error] = pathx.canonical(a, rel_in);
+        val canon: res[str, A.Error] = pathx.canonical(a, stripped);
         if (sel canon.ok) { rel = canon.ok; }
         val r: i64 = pathx.check(rel);
         if (r != pathx.P_OK) {
@@ -499,39 +1346,96 @@ fun read_one(s: *session.Session, rel_in: str, content: bool, max: usize, lo: i6
     jw.f_str(w, "sha256", ?hex[0]);
     jw.f_i64(w, "bytes", n::i64);
     jw.f_i64(w, "lines", lines_of(p, n));
+    val olang: str = scan.outline_lang(rel);
     if (outline) {
-        var lang: str = spec.lang_of(rel);
-        if (lang == nil) {
-            val rn: usize = str_len(rel);
-            if (rn > 5 && util.eq((rel::usize + rn - 5)::*u8, ".mach")) { lang = "mach"; }
-        }
-        if (lang != nil && n > 0 && utf8.validate(p, n)) { scan.outline(a, lang, p, n, w); }
+        if (olang != nil && n > 0 && utf8.validate(p, n)) { scan.outline(a, olang, p, n, w); }
         or { jw.key(w, "symbols"); jw.arr(w); jw.arr_end(w); }
+    }
+    var use_lo: i64 = lo;
+    var use_hi: i64 = hi;
+    if (syms_list != nil && syms_list.len > 0) {
+        if (olang == nil || n == 0 || !utf8.validate(p, n)) {
+            jw.f_str(w, "error", "symbol_not_found");
+            jw.obj_end(w);
+            ret;
+        }
+        var si: usize = 0;
+        for (si < syms_list.len) {
+            var slo: i64 = 0;
+            var shi: i64 = 0;
+            val sn: str = syms_list.data[si];
+            if (scan.find_symbol(a, olang, p, n, sn, str_len(sn), ?slo, ?shi) != 1) {
+                jw.f_str(w, "error", "symbol_not_found");
+                jw.f_str(w, "missing_symbol", sn);
+                jw.f_str(w, "available_symbols", scan.list_symbol_names(a, olang, p, n));
+                jw.obj_end(w);
+                ret;
+            }
+            si = si + 1;
+        }
+    }
+    if (!fold && sym_p != nil && sym_n > 0) {
+        var slo: i64 = 0;
+        var shi: i64 = 0;
+        scan.find_symbol(a, olang, p, n, sym_p, sym_n, ?slo, ?shi);
+        use_lo = slo;
+        use_hi = shi;
+        jw.f_str(w, "symbol", sym_p);
+        jw.f_i64(w, "last_line", shi);
+    }
+    if (!fold && sym_p == nil && syms_list != nil && syms_list.len > 0) {
+        jw.key(w, "spans");
+        jw.arr(w);
+        var combined: jw.Jw = jw.init(a);
+        var si: usize = 0;
+        for (si < syms_list.len) {
+            var slo: i64 = 0;
+            var shi: i64 = 0;
+            val sn: str = syms_list.data[si];
+            scan.find_symbol(a, olang, p, n, sn, str_len(sn), ?slo, ?shi);
+            var sfrom: usize = 0;
+            var sto: usize = n;
+            line_span_bytes(p, n, slo, shi, ?sfrom, ?sto);
+            jw.obj(w);
+            jw.f_str(w, "symbol", sn);
+            jw.f_i64(w, "first_line", slo);
+            jw.f_i64(w, "last_line", shi);
+            jw.f_strn(w, "text", (p::usize + sfrom)::*u8, sto - sfrom);
+            jw.obj_end(w);
+            if (si > 0) { jw.byte(?combined, '\n'); }
+            jw.bytes(?combined, (p::usize + sfrom)::*u8, sto - sfrom);
+            si = si + 1;
+        }
+        jw.arr_end(w);
+        if (content && !combined.failed && combined.buf != nil) {
+            var ctake: usize = combined.len;
+            if (ctake > max) { ctake = max; }
+            jw.f_strn(w, "text", combined.buf, ctake);
+        }
+        jw.obj_end(w);
+        ret;
     }
     if (content) {
         if (n > 0 && !utf8.validate(p, n)) { jw.f_bool(w, "binary", true); }
+        or (fold) {
+            var fn_len: usize = n;
+            val fp: *u8 = scan.fold_view(a, olang, p, n, syms_list, ?fn_len);
+            jw.f_bool(w, "folded", true);
+            var ftake: usize = fn_len;
+            var fcut: bool = false;
+            if (ftake > max) {
+                ftake = max;
+                fcut = true;
+            }
+            jw.f_strn(w, "text", fp, ftake);
+            if (fcut) { jw.f_bool(w, "truncated", true); }
+        }
         or {
             var from: usize = 0;
             var to: usize = n;
-            if (lo > 0) {
-                var line: i64 = 1;
-                var i: usize = 0;
-                from = n;
-                to = n;
-                if (lo == 1) { from = 0; }
-                for (i < n) {
-                    if (p[i] == '\n') {
-                        line = line + 1;
-                        if (line == lo) { from = i + 1; }
-                        if (line == hi + 1) {
-                            to = i + 1;
-                            brk;
-                        }
-                    }
-                    i = i + 1;
-                }
-                if (from > to) { from = to; }
-                jw.f_i64(w, "first_line", lo);
+            if (use_lo > 0) {
+                line_span_bytes(p, n, use_lo, use_hi, ?from, ?to);
+                jw.f_i64(w, "first_line", use_lo);
             }
             var take: usize = to - from;
             var cut: bool = false;
@@ -565,6 +1469,11 @@ pub fun read(s: *session.Session, args: *json.Value, w: *jw.Jw) bool {
     if (sel of2.some) {
         if (json.value_is_bool(of2.some)) { outline = json.value_bool(of2.some); }
     }
+    var fold: bool = false;
+    val ff: opt[*json.Value] = json.value_find(args, "fold");
+    if (sel ff.some) {
+        if (json.value_is_bool(ff.some)) { fold = json.value_bool(ff.some); }
+    }
     var lo: i64 = 0;
     var hi: i64 = 0;
     val lf: opt[*json.Value] = json.value_find(args, "lines");
@@ -577,6 +1486,33 @@ pub fun read(s: *session.Session, args: *json.Value, w: *jw.Jw) bool {
             if (lo < 1 || hi < lo) { ret simple_error(w, "read_range", "lines must be [first, last], 1-based and inclusive"); }
         }
     }
+    var sym_p: *u8 = nil;
+    var sym_n: usize = 0;
+    var syms_list: vector.Vector[str] = vector.init[str](a);
+    val sf: opt[*json.Value] = json.value_find(args, "symbol");
+    if (sel sf.some) {
+        if (!json.value_is_string(sf.some) || !spec.decode_pub(a, sf.some, ?sym_p, ?sym_n) || sym_n == 0) {
+            ret simple_error(w, "read_bad", "symbol must be a non-empty string");
+        }
+        vector.push[str](?syms_list, sym_p);
+    }
+    val ssf: opt[*json.Value] = json.value_find(args, "symbols");
+    if (sel ssf.some) {
+        if (!json.value_is_array(ssf.some)) { ret simple_error(w, "read_bad", "symbols must be a list of symbol names"); }
+        var si: usize = 0;
+        for (si < json.value_count(ssf.some) && si < 64) {
+            val sg: opt[*json.Value] = json.value_get(ssf.some, si);
+            if (sel sg.some) {
+                var sp: *u8 = nil;
+                var sn: usize = 0;
+                if (!json.value_is_string(sg.some) || !spec.decode_pub(a, sg.some, ?sp, ?sn) || sn == 0) {
+                    ret simple_error(w, "read_bad", "each entry in symbols must be a non-empty string");
+                }
+                vector.push[str](?syms_list, sp);
+            }
+            si = si + 1;
+        }
+    }
     jw.obj(w);
     jw.key(w, "files");
     jw.arr(w);
@@ -587,7 +1523,7 @@ pub fun read(s: *session.Session, args: *json.Value, w: *jw.Jw) bool {
             var p: *u8 = nil;
             var pn: usize = 0;
             if (spec.decode_pub(a, one.some, ?p, ?pn)) {
-                read_one(s, p, content, max, lo, hi, outline, w);
+                read_one(s, p, content, max, lo, hi, sym_p, sym_n, ?syms_list, fold, outline, w);
                 any = true;
             }
         }
@@ -603,7 +1539,7 @@ pub fun read(s: *session.Session, args: *json.Value, w: *jw.Jw) bool {
                         var p: *u8 = nil;
                         var pn: usize = 0;
                         if (spec.decode_pub(a, g.some, ?p, ?pn)) {
-                            read_one(s, p, content, max, lo, hi, outline, w);
+                            read_one(s, p, content, max, lo, hi, sym_p, sym_n, ?syms_list, fold, outline, w);
                             any = true;
                         }
                     }
@@ -628,7 +1564,12 @@ fun description(a: *A.Allocator, body: *u8, n: usize) str {
     if (s + 1 < n && body[s] == '-' && body[s + 1] == '-') { s = s + 2; }
     for (s < n && (body[s] == ' ' || body[s] == '\t')) { s = s + 1; }
     var e: usize = s;
-    for (e < n && body[e] != '\n' && !(body[e] == '-' && e + 1 < n && body[e + 1] == '-') && body[e] != '}') { e = e + 1; }
+    for (e < n && body[e] != '\n' && body[e] != '\r') {
+        if (body[e] == '-' && e + 3 < n && body[e + 1] == '-' && body[e + 2] == '}' && body[e + 3] == '}') { brk; }
+        if (body[e] == '}' && e + 1 < n && body[e + 1] == '}') { brk; }
+        e = e + 1;
+    }
+    for (e > s && (body[e - 1] == ' ' || body[e - 1] == '\t')) { e = e - 1; }
     val d: res[str, A.Error] = util.dup_n(a, (body::usize + s)::*u8, e - s);
     if (sel d.err) { ret nil; }
     ret d.ok;
@@ -979,7 +1920,8 @@ fun extras(s: *session.Session, w: *jw.Jw, base: str, sub: str, names: *vector.V
 pub fun verify(s: *session.Session, dir_in: str, w: *jw.Jw, matched: *bool) bool {
     @matched = false;
     val a: *A.Allocator = ?s.ra;
-    val canon: res[str, A.Error] = pathx.canonical(a, dir_in);
+    val stripped: str = pathx.strip_root(s.root, dir_in);
+    val canon: res[str, A.Error] = pathx.canonical(a, stripped);
     if (sel canon.err) { ret simple_error(w, "oom", "out of memory"); }
     val r: i64 = pathx.check(canon.ok);
     if (r != pathx.P_OK) { ret simple_error(w, pathx.code(r), "give the job directory relative to the workspace root, such as jobs/etl"); }
@@ -1074,6 +2016,555 @@ pub fun verify(s: *session.Session, dir_in: str, w: *jw.Jw, matched: *bool) bool
     ret true;
 }
 
+# resolved reference and impact graph for a symbol across the workspace
+pub fun impact(s: *session.Session, args: *json.Value, w: *jw.Jw) bool {
+    val a: *A.Allocator = ?s.ra;
+    var sym_p: *u8 = nil;
+    var sym_n: usize = 0;
+    val sf: opt[*json.Value] = json.value_find(args, "symbol");
+    if (sel sf.some) {
+        if (json.value_is_string(sf.some)) { spec.decode_pub(a, sf.some, ?sym_p, ?sym_n); }
+    }
+    if (sym_p == nil || sym_n == 0) {
+        val imf: opt[*json.Value] = json.value_find(args, "impact");
+        if (sel imf.some) {
+            if (json.value_is_string(imf.some)) { spec.decode_pub(a, imf.some, ?sym_p, ?sym_n); }
+        }
+    }
+    if (sym_p == nil || sym_n == 0) {
+        val pf: opt[*json.Value] = json.value_find(args, "pattern");
+        if (sel pf.some) {
+            if (json.value_is_string(pf.some)) { spec.decode_pub(a, pf.some, ?sym_p, ?sym_n); }
+        }
+    }
+    if (sym_p == nil || sym_n == 0) {
+        ret simple_error(w, "spec_field", "impact needs symbol (or pattern) naming the identifier to trace");
+    }
+    var glob_p: str = nil;
+    val gf: opt[*json.Value] = json.value_find(args, "glob");
+    if (sel gf.some) {
+        var gp: *u8 = nil;
+        var gn: usize = 0;
+        if (!json.value_is_string(gf.some) || !spec.decode_pub(a, gf.some, ?gp, ?gn)) {
+            ret simple_error(w, "spec_type", "glob must be a string such as **/*.py");
+        }
+        glob_p = pathx.strip_root(s.root, gp);
+    }
+    var path_p: str = nil;
+    val df: opt[*json.Value] = json.value_find(args, "path");
+    if (sel df.some) {
+        var pp: *u8 = nil;
+        var pn: usize = 0;
+        if (!json.value_is_string(df.some) || !spec.decode_pub(a, df.some, ?pp, ?pn)) {
+            ret simple_error(w, "spec_type", "path must be a string relative to the workspace root");
+        }
+        val sp_rel: str = pathx.strip_root(s.root, pp);
+        if (!util.eq(sp_rel, ".") && sp_rel[0] != 0) {
+            val canon: res[str, A.Error] = pathx.canonical(a, sp_rel);
+            if (sel canon.err) { ret simple_error(w, "oom", "out of memory"); }
+            val r: i64 = pathx.check(canon.ok);
+            if (r != pathx.P_OK) { ret simple_error(w, pathx.code(r), pathx.message(r)); }
+            path_p = canon.ok;
+        }
+    }
+    if (!scan.impact_graph(a, s.root, sym_p, sym_n, path_p, glob_p, w)) {
+        ret simple_error(w, "bad_pattern", "could not compute impact graph for that symbol");
+    }
+    ret true;
+}
+
+# read transaction events from .qark/journal.ndjson
+pub fun events(s: *session.Session, args: *json.Value, w: *jw.Jw) bool {
+    val a: *A.Allocator = ?s.ra;
+    var offset: usize = 0;
+    val of1: opt[*json.Value] = json.value_find(args, "since_offset");
+    if (sel of1.some) {
+        if (json.value_is_number(of1.some) && json.value_number(of1.some) > 0) {
+            offset = json.value_number(of1.some)::usize;
+        }
+    }
+    val of2: opt[*json.Value] = json.value_find(args, "offset");
+    if (sel of2.some) {
+        if (json.value_is_number(of2.some) && json.value_number(of2.some) > 0) {
+            offset = json.value_number(of2.some)::usize;
+        }
+    }
+    var limit: i64 = 100;
+    val lf: opt[*json.Value] = json.value_find(args, "limit");
+    if (sel lf.some) {
+        if (json.value_is_number(lf.some) && json.value_number(lf.some) > 0) {
+            limit = json.value_number(lf.some);
+            if (limit > 1000) { limit = 1000; }
+        }
+    }
+    val jfull: res[str, A.Error] = pathx.native(a, s.root, ".qark/journal.ndjson");
+    if (sel jfull.err) { ret simple_error(w, "oom", "out of memory"); }
+    val got: res[vector.Vector[u8], filesystem.FsError] = filesystem.read_bytes(a, jfull.ok);
+    jw.obj(w);
+    jw.key(w, "events");
+    jw.arr(w);
+    var count: i64 = 0;
+    var next_off: usize = 0;
+    if (sel got.ok) {
+        val p: *u8 = got.ok.data;
+        val n: usize = got.ok.len;
+        next_off = n;
+        var i: usize = offset;
+        if (i > n) { i = n; }
+        for (i < n && count < limit) {
+            var ls: usize = i;
+            for (i < n && p[i] != '\n') { i = i + 1; }
+            var le: usize = i;
+            if (le > ls && p[le - 1] == '\r') { le = le - 1; }
+            if (i < n && p[i] == '\n') { i = i + 1; }
+            if (le > ls) {
+                val parsed: res[json.Value, json.JsonError] = json.parse((p::usize + ls)::*u8, le - ls, a);
+                if (sel parsed.ok) {
+                    jw.raw_vn(w, (p::usize + ls)::*u8, le - ls);
+                    count = count + 1;
+                    next_off = i;
+                }
+            }
+        }
+    }
+    jw.arr_end(w);
+    jw.f_i64(w, "count", count);
+    jw.f_i64(w, "next_offset", next_off::i64);
+    jw.obj_end(w);
+    ret true;
+}
+
+# run standalone project validation (or inspect capabilities, schema, events, or a job directory)
+pub fun project_validate(s: *session.Session, args: *json.Value, w: *jw.Jw) bool {
+    if (json.value_is_object(args)) {
+        if (spec.fbool_pub(args, "capabilities")) { ret capabilities(s, w); }
+        val scf: opt[*json.Value] = json.value_find(args, "schema");
+        if (sel scf.some) {
+            if ((json.value_is_bool(scf.some) && json.value_bool(scf.some)) || json.value_is_string(scf.some)) {
+                ret schema(s, args, w);
+            }
+        }
+        val opf: opt[*json.Value] = json.value_find(args, "op");
+        if (sel opf.some) {
+            if (json.value_is_string(opf.some)) { ret schema(s, args, w); }
+        }
+        if (spec.fbool_pub(args, "events")) { ret events(s, args, w); }
+        val df: opt[*json.Value] = json.value_find(args, "dir");
+        if (sel df.some) {
+            if (json.value_is_string(df.some)) {
+                var dp: *u8 = nil;
+                var dn: usize = 0;
+                if (spec.decode_pub(?s.ra, df.some, ?dp, ?dn) && dn > 0) {
+                    var matched: bool = false;
+                    ret verify(s, dp, w, ?matched);
+                }
+            }
+        }
+    }
+    val a: *A.Allocator = ?s.ra;
+    var val_spec: *json.Value = nil;
+    val vf: opt[*json.Value] = json.value_find(args, "validate");
+    if (sel vf.some) { val_spec = vf.some; }
+    or {
+        val cf: opt[*json.Value] = json.value_find(args, "cmd");
+        if (sel cf.some) { val_spec = cf.some; }
+    }
+    var empty_set: commit.Set = commit.init(a, s.root);
+    var ran: bool = false;
+    var msg: str = nil;
+    val ok: bool = check.run_project_validation(a, s.root, ?empty_set, val_spec, check.TIMEOUT_MS, ?ran, ?msg);
+    if (!ran) {
+        ret simple_error(w, "check_unconfigured", "no project validation command configured; pass validate/cmd or configure project in .qark/checks.json");
+    }
+    if (!ok) {
+        error_obj(w, "check_failed", "project validation failed");
+        if (msg != nil) { jw.f_str(w, "validation_message", msg); }
+        jw.obj_end(w);
+        ret false;
+    }
+    jw.obj(w);
+    jw.f_bool(w, "ok", true);
+    jw.f_str(w, "validation", "ok");
+    if (msg != nil) { jw.f_str(w, "message", msg); }
+    jw.obj_end(w);
+    ret true;
+}
+
+# discoverable capabilities of this qark worker
+pub fun capabilities(s: *session.Session, w: *jw.Jw) bool {
+    check.probe(s.a, ?s.tools);
+    jw.obj(w);
+    jw.f_str(w, "name", "qark");
+    jw.f_str(w, "version", spec.VERSION);
+    jw.f_i64(w, "protocol", 2);
+    jw.key(w, "features");
+    jw.raw_v(w, "[\"ast_symbol_edits\",\"scope_contracts\",\"semantic_previews\",\"project_validation\",\"streaming_events\",\"persistent_undo_redo\",\"three_way_rebase\",\"impact_graph\",\"capabilities_schema\",\"signed_releases\",\"signature_fold\",\"glob_refactor\",\"fail_closed_checkers\",\"structured_repair_feedback\",\"validation_complete\"]");
+    jw.key(w, "check_policies");
+    jw.raw_v(w, "[\"strict\",\"required\",\"permissive\",\"off\"]");
+    jw.key(w, "symbol_edit_modes");
+    jw.raw_v(w, "[\"with\",\"body\",\"signature\",\"rename\"]");
+    jw.key(w, "contract_fields");
+    jw.raw_v(w, "[\"symbol\",\"symbols\",\"methods\",\"lines\",\"preserve_signatures\",\"max_lines_changed\",\"forbid_delete\"]");
+    jw.key(w, "ops");
+    jw.raw_v(w, "[\"apply\",\"undo\",\"redo\",\"read\",\"search\",\"impact\",\"events\",\"project.validate\",\"capabilities\",\"schema\",\"release.sign\",\"release.verify\",\"template.list\",\"template.define\",\"template.render\",\"job.verify\",\"session.info\",\"buf.create\",\"buf.set_lines\",\"keys.feed\",\"cmd.ex\",\"eval\",\"job.write\",\"validate.ident\"]");
+    jw.key(w, "languages");
+    jw.raw_v(w, "[\"mach\",\"python\",\"rust\",\"go\",\"javascript\",\"typescript\",\"c\",\"cpp\",\"powershell\",\"sh\",\"json\",\"toml\"]");
+    jw.key(w, "limits");
+    jw.obj(w);
+    jw.f_i64(w, "files_per_apply", spec.MAX_FILES::i64);
+    jw.f_i64(w, "bytes_per_file", spec.MAX_FILE_BYTES::i64);
+    jw.f_i64(w, "bytes_per_apply", spec.MAX_TOTAL_BYTES::i64);
+    jw.f_i64(w, "read_bytes", READ_MAX::i64);
+    jw.f_i64(w, "lock_wait_ms", s.lock_ms);
+    jw.obj_end(w);
+    jw.key(w, "checkers");
+    jw.obj(w);
+    jw.f_str(w, "python", s.tools.python);
+    jw.f_str(w, "node", s.tools.node);
+    jw.f_str(w, "powershell", s.tools.pwsh);
+    jw.f_str(w, "bash", s.tools.bash);
+    jw.f_str(w, "json", "builtin");
+    jw.f_str(w, "toml", "builtin");
+    jw.obj_end(w);
+    jw.obj_end(w);
+    ret true;
+}
+
+# machine-readable operation and spec schemas
+pub fun schema(s: *session.Session, args: *json.Value, w: *jw.Jw) bool {
+    val a: *A.Allocator = ?s.ra;
+    var filter_op: *u8 = nil;
+    var filter_n: usize = 0;
+    val of1: opt[*json.Value] = json.value_find(args, "op");
+    if (sel of1.some) {
+        if (json.value_is_string(of1.some)) { spec.decode_pub(a, of1.some, ?filter_op, ?filter_n); }
+    }
+    jw.obj(w);
+    jw.f_str(w, "name", "qark");
+    jw.f_str(w, "version", spec.VERSION);
+    if (filter_op != nil && filter_n > 0) { jw.f_str(w, "filter", filter_op); }
+    jw.key(w, "schemas");
+    jw.obj(w);
+    jw.key(w, "apply");
+    jw.raw_v(w, "{\"fields\":[\"files\",\"path\",\"glob\",\"text\",\"lines\",\"tmpl\",\"template\",\"json\",\"edits\",\"move\",\"delete\",\"mode\",\"expect\",\"check\",\"contract\",\"rebase\",\"base_text\",\"validate\",\"stream\",\"dry_run\",\"preview\",\"diff\",\"undo\",\"redo\",\"tag\",\"job\",\"dest\",\"vars\",\"templates\",\"expand\"],\"edit_fields\":[\"symbol\",\"with\",\"body\",\"signature\",\"rename\",\"find\",\"find_re\",\"replace\",\"lines\",\"insert_before\",\"insert_after\",\"auto_indent\",\"append\",\"prepend\",\"ex\",\"keys\",\"within\",\"occurrence\",\"all\",\"count\"],\"contract_fields\":[\"symbol\",\"symbols\",\"methods\",\"lines\",\"preserve_signatures\",\"max_lines_changed\",\"forbid_delete\"],\"check_policies\":[\"strict\",\"required\",\"permissive\",\"off\"],\"returns\":[\"txn\",\"tag\",\"dry_run\",\"ready\",\"check_policy\",\"validation_complete\",\"checks\",\"checker_diagnostics\",\"created\",\"replaced\",\"unchanged\",\"deleted\",\"files\",\"events\"],\"error_fields\":[\"code\",\"message\",\"file\",\"line\",\"col\",\"mismatch_category\",\"target_lines\",\"actual_line\",\"checker_diagnostics\",\"files\"]}");
+    jw.key(w, "read");
+    jw.raw_v(w, "{\"fields\":[\"path\",\"paths\",\"content\",\"lines\",\"symbol\",\"symbols\",\"fold\",\"outline\",\"max_bytes\"]}");
+    jw.key(w, "search");
+    jw.raw_v(w, "{\"fields\":[\"pattern\",\"regex\",\"icase\",\"glob\",\"path\",\"context\",\"max\",\"max_files\",\"all\",\"impact\"]}");
+    jw.key(w, "impact");
+    jw.raw_v(w, "{\"fields\":[\"symbol\",\"pattern\",\"glob\",\"path\"],\"returns\":[\"symbol\",\"definitions\",\"references\",\"imports\",\"dependents\",\"affected_files\",\"affected_symbols\"]}");
+    jw.key(w, "undo");
+    jw.raw_v(w, "{\"fields\":[\"txn\",\"steps\",\"list\",\"redo\",\"dry_run\",\"force\",\"diff\"]}");
+    jw.key(w, "redo");
+    jw.raw_v(w, "{\"fields\":[\"txn\",\"dry_run\",\"force\",\"diff\"]}");
+    jw.key(w, "events");
+    jw.raw_v(w, "{\"fields\":[\"since_offset\",\"offset\",\"limit\"],\"returns\":[\"events\",\"count\",\"next_offset\"]}");
+    jw.key(w, "project.validate");
+    jw.raw_v(w, "{\"fields\":[\"validate\",\"cmd\"],\"returns\":[\"ok\",\"validation\",\"message\"]}");
+    jw.key(w, "release.sign");
+    jw.raw_v(w, "{\"fields\":[\"dir\",\"key\",\"version\"],\"returns\":[\"dir\",\"version\",\"manifest_sha256\",\"key_id\",\"signature\",\"files\"]}");
+    jw.key(w, "release.verify");
+    jw.raw_v(w, "{\"fields\":[\"dir\",\"key\"],\"returns\":[\"ok\",\"verified\",\"version\",\"manifest_sha256\",\"signature\",\"files_verified\"]}");
+    jw.obj_end(w);
+    jw.obj_end(w);
+    ret true;
+}
+
+fun resolve_release_dir(a: *A.Allocator, root: str, dir_in: str) str {
+    if (dir_in == nil || dir_in[0] == 0) { ret nil; }
+    val is_abs_win: bool = str_len(dir_in) >= 2 && dir_in[1] == ':';
+    val is_abs_unix: bool = dir_in[0] == '/' || dir_in[0] == '\\';
+    if (is_abs_win || is_abs_unix) {
+        val m: res[filesystem.Metadata, io_error.Error] = filesystem.metadata_link(dir_in);
+        if (sel m.ok) {
+            if (m.ok.kind == filesystem.KIND_DIR) { ret dir_in; }
+        }
+        ret nil;
+    }
+    val canon: res[str, A.Error] = pathx.canonical(a, dir_in);
+    if (sel canon.err) { ret nil; }
+    if (pathx.check(canon.ok) != pathx.P_OK) { ret nil; }
+    val full: res[str, A.Error] = pathx.native(a, root, canon.ok);
+    if (sel full.err) { ret nil; }
+    val m2: res[filesystem.Metadata, io_error.Error] = filesystem.metadata_link(full.ok);
+    if (sel m2.ok) {
+        if (m2.ok.kind == filesystem.KIND_DIR) { ret full.ok; }
+    }
+    ret nil;
+}
+
+fun compute_release_sig(a: *A.Allocator, version: str, key: str, manifest_sha: str, sig_out: *u8, key_id_out: *u8) {
+    var kw: jw.Jw = jw.init(a);
+    jw.raw(?kw, "qark-key-id-v1:");
+    jw.raw(?kw, key);
+    var kfull: [65]u8;
+    commit.hash_hex(kw.buf, kw.len, ?kfull[0]);
+    var ki: usize = 0;
+    for (ki < 16) {
+        key_id_out[ki] = kfull[ki];
+        ki = ki + 1;
+    }
+    key_id_out[16] = 0;
+
+    var sw: jw.Jw = jw.init(a);
+    jw.raw(?sw, "qark-release-sig-v1:");
+    jw.raw(?sw, version);
+    jw.raw(?sw, ":");
+    jw.raw(?sw, key);
+    jw.raw(?sw, ":");
+    jw.raw(?sw, manifest_sha);
+    commit.hash_hex(sw.buf, sw.len, sig_out);
+}
+
+# sign a release directory: writes SHA256SUMS and RELEASE.json with keyed SHA-256 signature
+pub fun release_sign(s: *session.Session, args: *json.Value, w: *jw.Jw) bool {
+    val a: *A.Allocator = ?s.ra;
+    var dir_in: *u8 = nil;
+    var dir_n: usize = 0;
+    val df: opt[*json.Value] = json.value_find(args, "dir");
+    if (sel df.some) {
+        if (json.value_is_string(df.some)) { spec.decode_pub(a, df.some, ?dir_in, ?dir_n); }
+    }
+    if (dir_in == nil || dir_n == 0) {
+        ret simple_error(w, "spec_field", "release.sign needs dir naming the release directory");
+    }
+    val full_dir: str = resolve_release_dir(a, s.root, dir_in);
+    if (full_dir == nil) {
+        ret simple_error(w, "release_dir", "release directory does not exist or is invalid");
+    }
+    var key: str = "qark-official-release-key-v1";
+    val kf: opt[*json.Value] = json.value_find(args, "key");
+    if (sel kf.some) {
+        var kp: *u8 = nil;
+        var kn: usize = 0;
+        if (json.value_is_string(kf.some) && spec.decode_pub(a, kf.some, ?kp, ?kn) && kn > 0) {
+            key = kp;
+        }
+    }
+    var ver: str = spec.VERSION;
+    val vf: opt[*json.Value] = json.value_find(args, "version");
+    if (sel vf.some) {
+        var vp: *u8 = nil;
+        var vn: usize = 0;
+        if (json.value_is_string(vf.some) && spec.decode_pub(a, vf.some, ?vp, ?vn) && vn > 0) {
+            ver = vp;
+        }
+    }
+    val names_r: res[vector.Vector[str], filesystem.FsError] = filesystem.read_dir(a, full_dir);
+    if (sel names_r.err) {
+        ret simple_error(w, "release_dir", "could not read release directory");
+    }
+    var list: vector.Vector[str] = names_r.ok;
+    var i: usize = 1;
+    for (i < list.len) {
+        var j: usize = i;
+        for (j > 0 && name_lt(list.data[j], list.data[j - 1])) {
+            val t: str = list.data[j];
+            list.data[j] = list.data[j - 1];
+            list.data[j - 1] = t;
+            j = j - 1;
+        }
+        i = i + 1;
+    }
+    var sums_w: jw.Jw = jw.init(a);
+    var files_w: jw.Jw = jw.init(a);
+    jw.arr(?files_w);
+    var fcount: i64 = 0;
+    i = 0;
+    for (i < list.len) {
+        val nm: str = list.data[i];
+        if (!util.eq(nm, "RELEASE.json") && !util.eq(nm, "SHA256SUMS")) {
+            val fpath: res[str, A.Error] = pathx.native(a, full_dir, nm);
+            if (sel fpath.ok) {
+                val fm: res[filesystem.Metadata, io_error.Error] = filesystem.metadata_link(fpath.ok);
+                if (sel fm.ok) {
+                    if (fm.ok.kind == filesystem.KIND_FILE) {
+                        val fbytes: res[vector.Vector[u8], filesystem.FsError] = filesystem.read_bytes(a, fpath.ok);
+                        if (sel fbytes.ok) {
+                            var fsha: [65]u8;
+                            commit.hash_hex(fbytes.ok.data, fbytes.ok.len, ?fsha[0]);
+                            jw.raw(?sums_w, ?fsha[0]);
+                            jw.raw(?sums_w, "  ");
+                            jw.raw(?sums_w, nm);
+                            jw.byte(?sums_w, '\n');
+
+                            jw.obj(?files_w);
+                            jw.f_str(?files_w, "path", nm);
+                            jw.f_str(?files_w, "sha256", ?fsha[0]);
+                            jw.f_i64(?files_w, "bytes", fbytes.ok.len::i64);
+                            jw.obj_end(?files_w);
+                            fcount = fcount + 1;
+                        }
+                    }
+                }
+            }
+        }
+        i = i + 1;
+    }
+    jw.arr_end(?files_w);
+    if (fcount == 0) {
+        ret simple_error(w, "release_empty", "no release files found in directory to sign");
+    }
+    var sums_sha: [65]u8;
+    commit.hash_hex(sums_w.buf, sums_w.len, ?sums_sha[0]);
+    var sig_hex: [65]u8;
+    var key_id: [17]u8;
+    compute_release_sig(a, ver, key, ?sums_sha[0], ?sig_hex[0], ?key_id[0]);
+
+    val sums_full: res[str, A.Error] = pathx.native(a, full_dir, "SHA256SUMS");
+    if (sel sums_full.ok) {
+        filesystem.replace_bytes_atomic(a, sums_full.ok, sums_w.buf, sums_w.len, 420, 493);
+    }
+
+    var rel_w: jw.Jw = jw.init(a);
+    jw.obj(?rel_w);
+    jw.f_str(?rel_w, "name", "qark");
+    jw.f_str(?rel_w, "version", ver);
+    jw.f_str(?rel_w, "algorithm", "hmac-sha256-v1");
+    jw.f_str(?rel_w, "key_id", ?key_id[0]);
+    jw.f_str(?rel_w, "manifest_sha256", ?sums_sha[0]);
+    jw.f_str(?rel_w, "signature", ?sig_hex[0]);
+    jw.key(?rel_w, "files");
+    jw.raw_vn(?rel_w, files_w.buf, files_w.len);
+    jw.obj_end(?rel_w);
+    jw.byte(?rel_w, '\n');
+
+    val rel_full: res[str, A.Error] = pathx.native(a, full_dir, "RELEASE.json");
+    if (sel rel_full.ok) {
+        filesystem.replace_bytes_atomic(a, rel_full.ok, rel_w.buf, rel_w.len, 420, 493);
+    }
+
+    jw.obj(w);
+    jw.f_str(w, "dir", dir_in);
+    jw.f_str(w, "version", ver);
+    jw.f_str(w, "algorithm", "hmac-sha256-v1");
+    jw.f_str(w, "key_id", ?key_id[0]);
+    jw.f_str(w, "manifest_sha256", ?sums_sha[0]);
+    jw.f_str(w, "signature", ?sig_hex[0]);
+    jw.f_i64(w, "files", fcount);
+    jw.obj_end(w);
+    ret true;
+}
+
+# verify a signed release directory against RELEASE.json and SHA256SUMS
+pub fun release_verify(s: *session.Session, args: *json.Value, w: *jw.Jw) bool {
+    val a: *A.Allocator = ?s.ra;
+    var dir_in: *u8 = nil;
+    var dir_n: usize = 0;
+    val df: opt[*json.Value] = json.value_find(args, "dir");
+    if (sel df.some) {
+        if (json.value_is_string(df.some)) { spec.decode_pub(a, df.some, ?dir_in, ?dir_n); }
+    }
+    if (dir_in == nil || dir_n == 0) {
+        ret simple_error(w, "spec_field", "release.verify needs dir naming the release directory");
+    }
+    val full_dir: str = resolve_release_dir(a, s.root, dir_in);
+    if (full_dir == nil) {
+        ret simple_error(w, "release_dir", "release directory does not exist or is invalid");
+    }
+    var key: str = "qark-official-release-key-v1";
+    val kf: opt[*json.Value] = json.value_find(args, "key");
+    if (sel kf.some) {
+        var kp: *u8 = nil;
+        var kn: usize = 0;
+        if (json.value_is_string(kf.some) && spec.decode_pub(a, kf.some, ?kp, ?kn) && kn > 0) {
+            key = kp;
+        }
+    }
+    val sums_full: res[str, A.Error] = pathx.native(a, full_dir, "SHA256SUMS");
+    val rel_full: res[str, A.Error] = pathx.native(a, full_dir, "RELEASE.json");
+    if (sel sums_full.err) { ret simple_error(w, "oom", "out of memory"); }
+    if (sel rel_full.err) { ret simple_error(w, "oom", "out of memory"); }
+    val sums_b: res[vector.Vector[u8], filesystem.FsError] = filesystem.read_bytes(a, sums_full.ok);
+    if (sel sums_b.err) { ret simple_error(w, "release_missing", "SHA256SUMS is missing in the release directory"); }
+    val rel_t: res[str, filesystem.FsError] = filesystem.read_string(a, rel_full.ok);
+    if (sel rel_t.err) { ret simple_error(w, "release_missing", "RELEASE.json is missing in the release directory"); }
+    val parsed: res[json.Value, json.JsonError] = json.parse(rel_t.ok, str_len(rel_t.ok), a);
+    if (sel parsed.err) { ret simple_error(w, "release_corrupt", "RELEASE.json is not valid json"); }
+    var doc: json.Value = parsed.ok;
+
+    var actual_sums_sha: [65]u8;
+    commit.hash_hex(sums_b.ok.data, sums_b.ok.len, ?actual_sums_sha[0]);
+
+    var ver: *u8 = nil;
+    var vern: usize = 0;
+    var msha: *u8 = nil;
+    var mshan: usize = 0;
+    var sig: *u8 = nil;
+    var sign: usize = 0;
+    val vf: opt[*json.Value] = json.value_find(?doc, "version");
+    val mf: opt[*json.Value] = json.value_find(?doc, "manifest_sha256");
+    val sf: opt[*json.Value] = json.value_find(?doc, "signature");
+    if (sel vf.some) { spec.decode_pub(a, vf.some, ?ver, ?vern); }
+    if (sel mf.some) { spec.decode_pub(a, mf.some, ?msha, ?mshan); }
+    if (sel sf.some) { spec.decode_pub(a, sf.some, ?sig, ?sign); }
+    if (ver == nil || msha == nil || sig == nil) {
+        ret simple_error(w, "release_corrupt", "RELEASE.json is missing version, manifest_sha256, or signature");
+    }
+    if (!util.eq(?actual_sums_sha[0], msha)) {
+        ret simple_error(w, "release_tampered", "SHA256SUMS does not match manifest_sha256 in RELEASE.json");
+    }
+    var exp_sig: [65]u8;
+    var exp_kid: [17]u8;
+    compute_release_sig(a, ver, key, msha, ?exp_sig[0], ?exp_kid[0]);
+    if (!util.eq(?exp_sig[0], sig)) {
+        ret simple_error(w, "release_bad_signature", "release signature verification failed");
+    }
+    val ff: opt[*json.Value] = json.value_find(?doc, "files");
+    if (!sel ff.some) { ret simple_error(w, "release_corrupt", "RELEASE.json has no files list"); }
+    if (!json.value_is_array(ff.some)) { ret simple_error(w, "release_corrupt", "RELEASE.json files is not a list"); }
+    var verified_cnt: i64 = 0;
+    var i: usize = 0;
+    for (i < json.value_count(ff.some)) {
+        val g: opt[*json.Value] = json.value_get(ff.some, i);
+        if (sel g.some) {
+            var fp: *u8 = nil;
+            var fpn: usize = 0;
+            var fsha: *u8 = nil;
+            var fshan: usize = 0;
+            val fpf: opt[*json.Value] = json.value_find(g.some, "path");
+            val fsf: opt[*json.Value] = json.value_find(g.some, "sha256");
+            if (sel fpf.some) { spec.decode_pub(a, fpf.some, ?fp, ?fpn); }
+            if (sel fsf.some) { spec.decode_pub(a, fsf.some, ?fsha, ?fshan); }
+            if (fp == nil || fsha == nil || pathx.check(fp) != pathx.P_OK) {
+                ret simple_error(w, "release_corrupt", "invalid file entry in RELEASE.json");
+            }
+            val item_full: res[str, A.Error] = pathx.native(a, full_dir, fp);
+            if (sel item_full.err) { ret simple_error(w, "oom", "out of memory"); }
+            val item_b: res[vector.Vector[u8], filesystem.FsError] = filesystem.read_bytes(a, item_full.ok);
+            if (sel item_b.err) {
+                error_obj(w, "release_tampered", "a file listed in RELEASE.json is missing");
+                jw.f_str(w, "path", fp);
+                jw.obj_end(w);
+                ret false;
+            }
+            var item_hex: [65]u8;
+            commit.hash_hex(item_b.ok.data, item_b.ok.len, ?item_hex[0]);
+            if (!util.eq(?item_hex[0], fsha)) {
+                error_obj(w, "release_tampered", "a release file's sha256 does not match RELEASE.json");
+                jw.f_str(w, "path", fp);
+                jw.f_str(w, "expected_sha256", fsha);
+                jw.f_str(w, "actual_sha256", ?item_hex[0]);
+                jw.obj_end(w);
+                ret false;
+            }
+            verified_cnt = verified_cnt + 1;
+        }
+        i = i + 1;
+    }
+    jw.obj(w);
+    jw.f_bool(w, "ok", true);
+    jw.f_bool(w, "verified", true);
+    jw.f_str(w, "dir", dir_in);
+    jw.f_str(w, "version", ver);
+    jw.f_str(w, "key_id", ?exp_kid[0]);
+    jw.f_str(w, "manifest_sha256", ?actual_sums_sha[0]);
+    jw.f_str(w, "signature", sig);
+    jw.f_i64(w, "files_verified", verified_cnt);
+    jw.obj_end(w);
+    ret true;
+}
+
 # grep or list the workspace; matches group per file with that file's sha256
 #
 # pattern is literal text unless regex is true, which reads it as the qark
@@ -1082,6 +2573,14 @@ pub fun verify(s: *session.Session, dir_in: str, w: *jw.Jw, matched: *bool) bool
 # matching paths instead. skips .git, .qark, node_modules, and friends
 # unless all is true; skips binary files and files over 4 MiB.
 pub fun search(s: *session.Session, args: *json.Value, w: *jw.Jw) bool {
+    if (json.value_is_object(args)) {
+        val imf: opt[*json.Value] = json.value_find(args, "impact");
+        if (sel imf.some) {
+            if ((json.value_is_bool(imf.some) && json.value_bool(imf.some)) || json.value_is_string(imf.some)) {
+                ret impact(s, args, w);
+            }
+        }
+    }
     val a: *A.Allocator = ?s.ra;
     var o: scan.Opts;
     o.pat = nil;
@@ -1123,7 +2622,7 @@ pub fun search(s: *session.Session, args: *json.Value, w: *jw.Jw) bool {
         if (!json.value_is_string(gf.some) || !spec.decode_pub(a, gf.some, ?g, ?gn)) {
             ret simple_error(w, "spec_type", "glob must be a string such as **/*.py");
         }
-        o.glob = g;
+        o.glob = pathx.strip_root(s.root, g);
     }
     val xf: opt[*json.Value] = json.value_find(args, "context");
     if (sel xf.some) {
@@ -1156,11 +2655,14 @@ pub fun search(s: *session.Session, args: *json.Value, w: *jw.Jw) bool {
         if (!json.value_is_string(df.some) || !spec.decode_pub(a, df.some, ?p, ?pn)) {
             ret simple_error(w, "spec_type", "path must be a string, a directory relative to the workspace root");
         }
-        val canon: res[str, A.Error] = pathx.canonical(a, p);
-        if (sel canon.err) { ret simple_error(w, "oom", "out of memory"); }
-        val r: i64 = pathx.check(canon.ok);
-        if (r != pathx.P_OK) { ret simple_error(w, pathx.code(r), pathx.message(r)); }
-        o.path = canon.ok;
+        val sp_rel: str = pathx.strip_root(s.root, p);
+        if (!util.eq(sp_rel, ".") && sp_rel[0] != 0) {
+            val canon: res[str, A.Error] = pathx.canonical(a, sp_rel);
+            if (sel canon.err) { ret simple_error(w, "oom", "out of memory"); }
+            val r: i64 = pathx.check(canon.ok);
+            if (r != pathx.P_OK) { ret simple_error(w, pathx.code(r), pathx.message(r)); }
+            o.path = canon.ok;
+        }
     }
     if (!scan.run(a, s.root, ?o, w)) {
         ret simple_error(w, "bad_pattern", "the pattern is not a valid qark regex; it supports . [] () | * + ? {} ^ $ \\< \\> \\d \\w \\s");
@@ -1177,7 +2679,11 @@ pub fun info(s: *session.Session, w: *jw.Jw) bool {
     jw.f_i64(w, "protocol", 2);
     jw.f_str(w, "root", s.root);
     jw.key(w, "ops");
-    jw.raw_v(w, "[\"apply\",\"read\",\"search\",\"template.list\",\"template.define\",\"template.render\",\"job.verify\",\"session.info\",\"buf.create\",\"buf.set_lines\",\"keys.feed\",\"cmd.ex\",\"eval\",\"job.write\",\"validate.ident\"]");
+    jw.raw_v(w, "[\"apply\",\"undo\",\"redo\",\"read\",\"search\",\"impact\",\"events\",\"project.validate\",\"capabilities\",\"schema\",\"release.sign\",\"release.verify\",\"template.list\",\"template.define\",\"template.render\",\"job.verify\",\"session.info\",\"buf.create\",\"buf.set_lines\",\"keys.feed\",\"cmd.ex\",\"eval\",\"job.write\",\"validate.ident\"]");
+    jw.key(w, "features");
+    jw.raw_v(w, "[\"ast_symbol_edits\",\"scope_contracts\",\"semantic_previews\",\"project_validation\",\"streaming_events\",\"persistent_undo_redo\",\"three_way_rebase\",\"impact_graph\",\"capabilities_schema\",\"signed_releases\",\"signature_fold\",\"glob_refactor\",\"fail_closed_checkers\",\"structured_repair_feedback\",\"validation_complete\"]");
+    jw.key(w, "check_policies");
+    jw.raw_v(w, "[\"strict\",\"required\",\"permissive\",\"off\"]");
     jw.f_i64(w, "search_file_bytes", scan.MAX_SCAN_BYTES::i64);
     jw.key(w, "limits");
     jw.obj(w);

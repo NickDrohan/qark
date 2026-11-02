@@ -25,6 +25,7 @@ use A: std.allocator;
 use eng: qark.core.engine;
 use jw: qark.rpc.jw;
 use re: qark.core.regex;
+use scan: qark.gen.scan;
 use util: qark.util;
 
 # matches a single edit may gather before it is refused as too broad
@@ -37,13 +38,19 @@ val MAX_HITS: usize = 32768;
 # index: which edit in the list, 0-based
 # line:  1-based line the message is about, 0 when none
 pub rec Err {
-    code:  str;
-    msg:   str;
-    index: i64;
-    line:  i64;
+    code:     str;
+    msg:      str;
+    index:    i64;
+    line:     i64;
+    col:      i64;
+    cat:      str;
+    scope_lo: i64;
+    scope_hi: i64;
+    actual:   str;
 }
 
 rec Text {
+    name:   str;
     p:      *u8;
     n:      usize;
     crlf:   bool;
@@ -58,16 +65,47 @@ fun fail(e: *Err, code: str, msg: str, line: i64) bool {
     ret false;
 }
 
+fun decode_lenient(raw: *u8, raw_n: usize, out: *u8) usize {
+    var i: usize = 0;
+    var o: usize = 0;
+    for (i < raw_n) {
+        if (raw[i] == '\\' && i + 1 < raw_n) {
+            val nx: u8 = raw[i + 1];
+            if (nx == '"') { out[o] = '"'; o = o + 1; i = i + 2; cnt; }
+            if (nx == '\\') { out[o] = '\\'; o = o + 1; i = i + 2; cnt; }
+            if (nx == '/') { out[o] = '/'; o = o + 1; i = i + 2; cnt; }
+            if (nx == 'n') { out[o] = '\n'; o = o + 1; i = i + 2; cnt; }
+            if (nx == 'r') { out[o] = '\r'; o = o + 1; i = i + 2; cnt; }
+            if (nx == 't') { out[o] = '\t'; o = o + 1; i = i + 2; cnt; }
+            out[o] = '\\';
+            out[o + 1] = nx;
+            o = o + 2;
+            i = i + 2;
+            cnt;
+        }
+        out[o] = raw[i];
+        o = o + 1;
+        i = i + 1;
+    }
+    out[o] = 0;
+    ret o;
+}
+
 fun get_str(a: *A.Allocator, obj: *json.Value, key: str, out: **u8, n: *usize) i64 {
     val f: opt[*json.Value] = json.value_find(obj, key);
     if (!sel f.some) { ret 0; }
     if (!json.value_is_string(f.some)) { ret -1; }
     var raw_n: usize = 0;
-    json.value_string(f.some, ?raw_n);
+    val raw: *u8 = json.value_string(f.some, ?raw_n);
     val got: res[*u8, A.Error] = A.allocate[u8](a, raw_n + 1);
     if (sel got.err) { ret -2; }
     val dec: res[usize, json.JsonError] = json.value_string_decode(f.some, got.ok, raw_n + 1);
-    if (sel dec.err) { ret -1; }
+    if (sel dec.err) {
+        val len: usize = decode_lenient(raw, raw_n, got.ok);
+        @out = got.ok;
+        @n = len;
+        ret 1;
+    }
     if (dec.ok > raw_n) { ret -1; }
     got.ok[dec.ok] = 0;
     @out = got.ok;
@@ -200,10 +238,9 @@ fun splice(a: *A.Allocator, t: *Text, from: usize, to: usize, ins: *u8, insn: us
     ret true;
 }
 
-# the replacement lines for a range edit, each ending in the file's line ending
-fun with_lines(a: *A.Allocator, t: *Text, obj: *json.Value, out: **u8, n: *usize) bool {
+fun with_lines_key(a: *A.Allocator, t: *Text, obj: *json.Value, key: str, out: **u8, n: *usize) bool {
     var w: jw.Jw = jw.init(a);
-    val f: opt[*json.Value] = json.value_find(obj, "with");
+    val f: opt[*json.Value] = json.value_find(obj, key);
     if (!sel f.some) { ret false; }
     if (sel f.some) {
         if (json.value_is_array(f.some)) {
@@ -227,7 +264,7 @@ fun with_lines(a: *A.Allocator, t: *Text, obj: *json.Value, out: **u8, n: *usize
         or (json.value_is_string(f.some)) {
             var p: *u8 = nil;
             var pn: usize = 0;
-            if (get_str(a, obj, "with", ?p, ?pn) != 1) { ret false; }
+            if (get_str(a, obj, key, ?p, ?pn) != 1) { ret false; }
             var p2: *u8 = nil;
             var p2n: usize = 0;
             var ch: bool = false;
@@ -242,6 +279,12 @@ fun with_lines(a: *A.Allocator, t: *Text, obj: *json.Value, out: **u8, n: *usize
     @out = w.buf;
     @n = w.len;
     ret true;
+}
+
+# the replacement lines for a range edit, each ending in the file's line ending
+fun with_lines(a: *A.Allocator, t: *Text, obj: *json.Value, out: **u8, n: *usize) bool {
+    if (with_lines_key(a, t, obj, "with", out, n)) { ret true; }
+    ret with_lines_key(a, t, obj, "replace", out, n);
 }
 
 fun is_hspace(c: u8) bool {
@@ -384,17 +427,21 @@ fun hit_err(a: *A.Allocator, t: *Text, hits: *vector.Vector[usize], what: str, q
         var w: jw.Jw = jw.init(a);
         jw.raw(?w, what);
         if (q != nil && near_miss(t, q, qn, ?ml, ?mc)) {
+            e.cat = "near_miss";
+            e.col = mc;
             jw.raw(?w, " text not found; the closest line is the reported line, and they differ at column ");
             var num: [24]u8;
             val k: usize = util.fmt_i64(?num[0], 24, mc);
             jw.bytes(?w, ?num[0], k);
         }
         or {
+            if (e.cat == nil) { e.cat = "not_found"; }
             jw.raw(?w, " text not found; read the file again and copy the text exactly");
         }
         if (w.failed || w.buf == nil) { ret fail(e, "edit_not_found", "text not found", 0); }
         ret fail(e, "edit_not_found", w.buf, ml);
     }
+    e.cat = "ambiguous_match";
     var w: jw.Jw = jw.init(a);
     jw.raw(?w, what);
     jw.raw(?w, " text matches ");
@@ -414,13 +461,59 @@ fun hit_err(a: *A.Allocator, t: *Text, hits: *vector.Vector[usize], what: str, q
     ret fail(e, "edit_ambiguous", w.buf, line_of(t.p, hits.data[0]));
 }
 
-# the byte span an edit's "within" limits it to; the whole file when absent.
-# a within is [first, last] lines, a string, or {find|find_re, occurrence}
+fun resolve_symbol(a: *A.Allocator, t: *Text, sym_p: *u8, sym_n: usize, lo: *i64, hi: *i64, e: *Err) bool {
+    val lang: str = scan.outline_lang(t.name);
+    if (lang == nil) {
+        ret fail(e, "edit_bad", "symbol edits require a supported language file (.py, .mach, .js, .ts, .ps1, .sh, .toml, .rs, .go)", 0);
+    }
+    val sr: i64 = scan.find_symbol(a, lang, t.p, t.n, sym_p, sym_n, lo, hi);
+    if (sr == 1) {
+        e.scope_lo = @lo;
+        e.scope_hi = @hi;
+        ret true;
+    }
+    if (sr == 2) {
+        e.cat = "symbol_ambiguous";
+        var w: jw.Jw = jw.init(a);
+        jw.raw(?w, "symbol '");
+        jw.bytes(?w, sym_p, sym_n);
+        jw.raw(?w, "' appears more than once; qualify it as Parent.name or use a line range");
+        if (w.failed || w.buf == nil) { ret fail(e, "edit_ambiguous", "symbol appears more than once", 0); }
+        ret fail(e, "edit_ambiguous", w.buf, 0);
+    }
+    e.cat = "symbol_not_found";
+    var w: jw.Jw = jw.init(a);
+    jw.raw(?w, "symbol '");
+    jw.bytes(?w, sym_p, sym_n);
+    jw.raw(?w, "' not found; symbols in this file: ");
+    jw.raw(?w, scan.list_symbol_names(a, lang, t.p, t.n));
+    if (w.failed || w.buf == nil) { ret fail(e, "edit_not_found", "symbol not found", 0); }
+    ret fail(e, "edit_not_found", w.buf, 0);
+}
+
+# the byte span an edit's "within" (or top-level "symbol") limits it to; the whole file when absent.
+# a within is [first, last] lines, a string, {symbol:"..."}, or {find|find_re, occurrence}
 fun scope(a: *A.Allocator, t: *Text, obj: *json.Value, sa: *usize, sb: *usize, e: *Err) bool {
     @sa = 0;
     @sb = t.n;
     val f: opt[*json.Value] = json.value_find(obj, "within");
-    if (!sel f.some) { ret true; }
+    if (!sel f.some) {
+        val top_sym: opt[*json.Value] = json.value_find(obj, "symbol");
+        if (!sel top_sym.some) { ret true; }
+        var sp: *u8 = nil;
+        var spn: usize = 0;
+        if (get_str(a, obj, "symbol", ?sp, ?spn) != 1 || spn == 0) {
+            ret fail(e, "edit_bad", "symbol must be a non-empty string", 0);
+        }
+        var slo: i64 = 0;
+        var shi: i64 = 0;
+        if (!resolve_symbol(a, t, sp, spn, ?slo, ?shi, e)) { ret false; }
+        @sa = line_start(t, slo::usize);
+        @sb = line_start(t, (shi + 1)::usize);
+        e.scope_lo = slo;
+        e.scope_hi = shi;
+        ret true;
+    }
     if (json.value_is_array(f.some)) {
         if (json.value_count(f.some) != 2) {
             ret fail(e, "edit_bad", "within as a list must be [first, last], both 1-based and inclusive", 0);
@@ -437,10 +530,15 @@ fun scope(a: *A.Allocator, t: *Text, obj: *json.Value, sa: *usize, sb: *usize, e
         }
         val total: i64 = count_lines(t)::i64;
         if (lo < 1 || hi < lo || hi > total) {
+            e.cat = "range_out_of_bounds";
+            e.scope_lo = 1;
+            e.scope_hi = total;
             ret fail(e, "edit_range", "within lines are outside the file", 0);
         }
         @sa = line_start(t, lo::usize);
         @sb = line_start(t, (hi + 1)::usize);
+        e.scope_lo = lo;
+        e.scope_hi = hi;
         ret true;
     }
     var wp: *u8 = nil;
@@ -449,10 +547,24 @@ fun scope(a: *A.Allocator, t: *Text, obj: *json.Value, sa: *usize, sb: *usize, e
     var wocc: i64 = 0;
     if (json.value_is_string(f.some)) {
         if (get_str(a, obj, "within", ?wp, ?wpn) != 1 || wpn == 0) {
-            ret fail(e, "edit_bad", "within must be a non-empty string, {find|find_re:...}, or [first, last]", 0);
+            ret fail(e, "edit_bad", "within must be a non-empty string, {find|find_re|symbol:...}, or [first, last]", 0);
         }
     }
     or (json.value_is_object(f.some)) {
+        val wsym: opt[*json.Value] = json.value_find(f.some, "symbol");
+        if (sel wsym.some) {
+            if (get_str(a, f.some, "symbol", ?wp, ?wpn) != 1 || wpn == 0) {
+                ret fail(e, "edit_bad", "within symbol must be a non-empty string", 0);
+            }
+            var slo: i64 = 0;
+            var shi: i64 = 0;
+            if (!resolve_symbol(a, t, wp, wpn, ?slo, ?shi, e)) { ret false; }
+            @sa = line_start(t, slo::usize);
+            @sb = line_start(t, (shi + 1)::usize);
+            e.scope_lo = slo;
+            e.scope_hi = shi;
+            ret true;
+        }
         val wf: opt[*json.Value] = json.value_find(f.some, "find");
         val wr: opt[*json.Value] = json.value_find(f.some, "find_re");
         if (sel wf.some) {
@@ -466,12 +578,12 @@ fun scope(a: *A.Allocator, t: *Text, obj: *json.Value, sa: *usize, sb: *usize, e
             }
             wre = true;
         }
-        or { ret fail(e, "edit_bad", "within needs find or find_re", 0); }
+        or { ret fail(e, "edit_bad", "within needs find, find_re, or symbol", 0); }
         if (get_int(f.some, "occurrence", ?wocc) == -1) {
             ret fail(e, "edit_bad", "occurrence must be an integer", 0);
         }
     }
-    or { ret fail(e, "edit_bad", "within must be a string, {find|find_re:...}, or [first, last]", 0); }
+    or { ret fail(e, "edit_bad", "within must be a string, {find|find_re|symbol:...}, or [first, last]", 0); }
     if (!wre) {
         var w2: *u8 = nil;
         var w2n: usize = 0;
@@ -502,6 +614,10 @@ fun scope(a: *A.Allocator, t: *Text, obj: *json.Value, sa: *usize, sb: *usize, e
     }
     @sa = ms;
     @sb = me;
+    e.scope_lo = line_of(t.p, ms);
+    var end_off: usize = me;
+    if (end_off > ms && end_off > 0 && t.p[end_off - 1] == '\n') { end_off = end_off - 1; }
+    e.scope_hi = line_of(t.p, end_off);
     ret true;
 }
 
@@ -519,7 +635,8 @@ fun find_edit(a: *A.Allocator, t: *Text, obj: *json.Value, e: *Err) bool {
     if (nrm) { q = q2; qn = q2n; t.normed = true; }
     var rp: *u8 = nil;
     var rn: usize = 0;
-    val rs: i64 = get_str(a, obj, "replace", ?rp, ?rn);
+    var rs: i64 = get_str(a, obj, "replace", ?rp, ?rn);
+    if (rs == 0) { rs = get_str(a, obj, "with", ?rp, ?rn); }
     if (rs == -1) { ret fail(e, "edit_bad", "replace must be a string", 0); }
     if (rs == 0) { rp = ""; }
     var rp2: *u8 = nil;
@@ -537,6 +654,13 @@ fun find_edit(a: *A.Allocator, t: *Text, obj: *json.Value, e: *Err) bool {
     if (rc == -2) { ret fail(e, "edit_too_many", "find text matches too many times; scope it with within", 0); }
     val n: usize = hits.len / 2;
     if (n == 0) {
+        if (sa > 0 || sb < t.n) {
+            var full_hits: vector.Vector[usize] = vector.init[usize](a);
+            if (collect(a, t, 0, t.n, q, qn, false, ?full_hits) == 1 && full_hits.len >= 2) {
+                e.cat = "not_in_scope";
+                ret fail(e, "edit_not_found", "find text not found inside the active scope, though it appears outside the scope at the reported line", line_of(t.p, full_hits.data[0]));
+            }
+        }
         var first: usize = 0;
         for (first < qn && q[first] != '\n') { first = first + 1; }
         var s: usize = 0;
@@ -550,15 +674,19 @@ fun find_edit(a: *A.Allocator, t: *Text, obj: *json.Value, e: *Err) bool {
             }
         }
         if (near > 0) {
+            e.cat = "near_miss";
             ret fail(e, "edit_not_found", "find text not found; its first line appears at the reported line, so check indentation, whitespace, and the lines after it", near);
         }
         val spaced: i64 = near_space(t.p, t.n, q, first);
         if (spaced > 0) {
+            e.cat = "whitespace_mismatch";
             ret fail(e, "edit_not_found", "find text not found; the reported line matches once extra spaces are removed", spaced);
         }
         var ml: i64 = 0;
         var mc: i64 = 0;
         if (near_miss(t, q, qn, ?ml, ?mc)) {
+            e.cat = "near_miss";
+            e.col = mc;
             var w3: jw.Jw = jw.init(a);
             jw.raw(?w3, "find text not found; the closest line is the reported line, and they differ at column ");
             var num: [24]u8;
@@ -567,12 +695,14 @@ fun find_edit(a: *A.Allocator, t: *Text, obj: *json.Value, e: *Err) bool {
             if (w3.failed || w3.buf == nil) { ret fail(e, "edit_not_found", "text not found", 0); }
             ret fail(e, "edit_not_found", w3.buf, ml);
         }
+        e.cat = "not_found";
         ret fail(e, "edit_not_found", "find text not found in the file; read the file again and copy the text exactly", 0);
     }
     if (occ != 0) {
         var at: i64 = occ - 1;
         if (occ < 0) { at = n::i64 + occ; }
         if (at < 0 || at >= n::i64) {
+            e.cat = "range_out_of_bounds";
             ret fail(e, "edit_not_found", "occurrence is outside the matches", line_of(t.p, hits.data[0]));
         }
         if (!splice(a, t, hits.data[at::usize * 2], hits.data[at::usize * 2 + 1], rp, rn)) {
@@ -646,7 +776,8 @@ fun re_edit(a: *A.Allocator, t: *Text, obj: *json.Value, e: *Err) bool {
     if (get_str(a, obj, "find_re", ?q, ?qn) != 1 || qn == 0) { ret fail(e, "edit_bad", "find_re must be a non-empty string", 0); }
     var rp: *u8 = nil;
     var rn: usize = 0;
-    val rs: i64 = get_str(a, obj, "replace", ?rp, ?rn);
+    var rs: i64 = get_str(a, obj, "replace", ?rp, ?rn);
+    if (rs == 0) { rs = get_str(a, obj, "with", ?rp, ?rn); }
     if (rs == -1) { ret fail(e, "edit_bad", "replace must be a string", 0); }
     if (rs == 0) { rp = ""; }
     var rp2: *u8 = nil;
@@ -682,8 +813,10 @@ fun re_edit(a: *A.Allocator, t: *Text, obj: *json.Value, e: *Err) bool {
     if (n == 0) {
         re.dnit(?progv);
         if (t.crlf) {
+            e.cat = "crlf_mismatch";
             ret fail(e, "edit_not_found", "find_re pattern matched nothing; the file uses CRLF line endings, so a newline in the pattern needs \\r\\n", 0);
         }
+        e.cat = "not_found";
         ret fail(e, "edit_not_found", "find_re pattern matched nothing; check the dialect or read the file again", 0);
     }
     var occ_at: i64 = -1;
@@ -692,6 +825,7 @@ fun re_edit(a: *A.Allocator, t: *Text, obj: *json.Value, e: *Err) bool {
         if (occ < 0) { occ_at = n::i64 + occ; }
         if (occ_at < 0 || occ_at >= n::i64) {
             re.dnit(?progv);
+            e.cat = "range_out_of_bounds";
             ret fail(e, "edit_not_found", "occurrence is outside the matches", line_of(t.p, spans.data[0]));
         }
     }
@@ -743,6 +877,9 @@ fun range_edit(a: *A.Allocator, t: *Text, obj: *json.Value, e: *Err) bool {
     }
     val total: i64 = count_lines(t)::i64;
     if (lo < 1 || hi < lo || hi > total) {
+        e.cat = "range_out_of_bounds";
+        e.scope_lo = 1;
+        e.scope_hi = total;
         var w: jw.Jw = jw.init(a);
         jw.raw(?w, "lines is outside the file, which has ");
         var num: [24]u8;
@@ -789,6 +926,18 @@ fun anchor_line(a: *A.Allocator, t: *Text, obj: *json.Value, key: str, after: bo
         }
     }
     or (json.value_is_object(f.some)) {
+        val asym: opt[*json.Value] = json.value_find(f.some, "symbol");
+        if (sel asym.some) {
+            if (get_str(a, f.some, "symbol", ?wp, ?wpn) != 1 || wpn == 0) {
+                fail(e, "edit_bad", "insert anchor symbol must be a non-empty string", 0);
+                ret -1;
+            }
+            var slo: i64 = 0;
+            var shi: i64 = 0;
+            if (!resolve_symbol(a, t, wp, wpn, ?slo, ?shi, e)) { ret -1; }
+            if (!after) { ret slo; }
+            ret shi + 1;
+        }
         val wf: opt[*json.Value] = json.value_find(f.some, "find");
         val wr: opt[*json.Value] = json.value_find(f.some, "find_re");
         if (sel wf.some) {
@@ -805,7 +954,7 @@ fun anchor_line(a: *A.Allocator, t: *Text, obj: *json.Value, key: str, after: bo
             wre = true;
         }
         or {
-            fail(e, "edit_bad", "insert anchor needs find or find_re", 0);
+            fail(e, "edit_bad", "insert anchor needs find, find_re, or symbol", 0);
             ret -1;
         }
         if (get_int(f.some, "occurrence", ?wocc) == -1) {
@@ -884,6 +1033,36 @@ fun insert_edit(a: *A.Allocator, t: *Text, obj: *json.Value, after: bool, e: *Er
     var ins: *u8 = nil;
     var insn: usize = 0;
     if (!with_lines(a, t, obj, ?ins, ?insn)) { ret fail(e, "edit_bad", "insert_before and insert_after need a with — a string or a list of strings", 0); }
+    if (get_bool(obj, "auto_indent") && total >= 1 && insn > 0) {
+        var ref_line: i64 = at_line;
+        if (after && at_line > 1) { ref_line = at_line - 1; }
+        if (ref_line > total) { ref_line = total; }
+        if (ref_line < 1) { ref_line = 1; }
+        val ref_off: usize = line_start(t, ref_line::usize);
+        var ind_len: usize = 0;
+        for (ref_off + ind_len < t.n && (t.p[ref_off + ind_len] == ' ' || t.p[ref_off + ind_len] == '\t')) {
+            ind_len = ind_len + 1;
+        }
+        if (ind_len > 0) {
+            var iw: jw.Jw = jw.init(a);
+            var ii: usize = 0;
+            var bol: bool = true;
+            for (ii < insn) {
+                val ch: u8 = ins[ii];
+                if (bol && ch != '\n' && ch != '\r') {
+                    jw.bytes(?iw, (t.p::usize + ref_off)::*u8, ind_len);
+                    bol = false;
+                }
+                jw.byte(?iw, ch);
+                if (ch == '\n') { bol = true; }
+                ii = ii + 1;
+            }
+            if (!iw.failed && iw.buf != nil) {
+                ins = iw.buf;
+                insn = iw.len;
+            }
+        }
+    }
     val at: usize = line_start(t, at_line::usize);
     if (at == t.n && t.n > 0 && t.p[t.n - 1] != '\n') {
         var w: jw.Jw = jw.init(a);
@@ -902,14 +1081,193 @@ fun insert_edit(a: *A.Allocator, t: *Text, obj: *json.Value, after: bool, e: *Er
     ret true;
 }
 
-# run an ex command or normal-mode keys over the text in a sandboxed editor
-fun vim_edit(a: *A.Allocator, name: str, t: *Text, src: *u8, is_ex: bool, e: *Err) bool {
+fun indent_block_if_unindented(a: *A.Allocator, ins: *u8, insn: usize, spaces: i64, out_p: **u8, out_n: *usize) {
+    @out_p = ins;
+    @out_n = insn;
+    if (spaces <= 0 || insn == 0) { ret; }
+    if (ins[0] == ' ' || ins[0] == '\t') { ret; }
+    var iw: jw.Jw = jw.init(a);
+    var ii: usize = 0;
+    var bol: bool = true;
+    for (ii < insn) {
+        val ch: u8 = ins[ii];
+        if (bol && ch != '\n' && ch != '\r') {
+            var s: i64 = 0;
+            for (s < spaces) {
+                jw.byte(?iw, ' ');
+                s = s + 1;
+            }
+            bol = false;
+        }
+        jw.byte(?iw, ch);
+        if (ch == '\n') { bol = true; }
+        ii = ii + 1;
+    }
+    if (!iw.failed && iw.buf != nil) {
+        @out_p = iw.buf;
+        @out_n = iw.len;
+    }
+}
+
+fun symbol_edit(a: *A.Allocator, t: *Text, obj: *json.Value, e: *Err) bool {
+    var sp: *u8 = nil;
+    var spn: usize = 0;
+    if (get_str(a, obj, "symbol", ?sp, ?spn) != 1 || spn == 0) {
+        ret fail(e, "edit_bad", "symbol must be a non-empty string", 0);
+    }
+    val lang: str = scan.outline_lang(t.name);
+    if (lang == nil) {
+        ret fail(e, "edit_bad", "symbol edits require a supported language file (.py, .mach, .js, .ts, .ps1, .sh, .toml, .rs, .go)", 0);
+    }
+    var sym: scan.Sym;
+    val sr: i64 = scan.find_symbol_ext(a, lang, t.p, t.n, sp, spn, ?sym);
+    if (sr != 1) {
+        var dlo: i64 = 0;
+        var dhi: i64 = 0;
+        resolve_symbol(a, t, sp, spn, ?dlo, ?dhi, e);
+        ret false;
+    }
+    # Mode 1: {"symbol": "name", "rename": "new_name"}
+    val ren_f: opt[*json.Value] = json.value_find(obj, "rename");
+    if (sel ren_f.some) {
+        var rnp: *u8 = nil;
+        var rnn: usize = 0;
+        if (get_str(a, obj, "rename", ?rnp, ?rnn) != 1 || rnn == 0) {
+            ret fail(e, "edit_bad", "symbol rename must be a non-empty identifier string", 0);
+        }
+        var pw: jw.Jw = jw.init(a);
+        jw.raw(?pw, "\\<");
+        jw.bytes(?pw, sym.name, sym.name_n);
+        jw.raw(?pw, "\\>");
+        val pat: str = jw.text(?pw);
+        val patn: usize = str_len(pat);
+        var sa: usize = 0;
+        var sb: usize = t.n;
+        val wf: opt[*json.Value] = json.value_find(obj, "within");
+        if (sel wf.some) {
+            if (!scope(a, t, obj, ?sa, ?sb, e)) { ret false; }
+        }
+        var hits: vector.Vector[usize] = vector.init[usize](a);
+        val rc: i64 = collect(a, t, sa, sb, pat, patn, true, ?hits);
+        if (rc <= 0 || hits.len == 0) {
+            ret fail(e, "edit_not_found", "symbol identifier not found in scope", sym.line);
+        }
+        var w: jw.Jw = jw.init(a);
+        var cur_off: usize = 0;
+        var hi_i: usize = 0;
+        val nhits: usize = hits.len / 2;
+        for (hi_i < nhits) {
+            val hs: usize = hits.data[hi_i * 2];
+            val he: usize = hits.data[hi_i * 2 + 1];
+            if (hs >= cur_off) {
+                jw.bytes(?w, (t.p::usize + cur_off)::*u8, hs - cur_off);
+                jw.bytes(?w, rnp, rnn);
+                cur_off = he;
+            }
+            hi_i = hi_i + 1;
+        }
+        jw.bytes(?w, (t.p::usize + cur_off)::*u8, t.n - cur_off);
+        if (w.failed || w.buf == nil) { ret fail(e, "oom", "out of memory", 0); }
+        t.p = w.buf;
+        t.n = w.len;
+        ret true;
+    }
+    # Mode 2: {"symbol": "name", "body": "..."}
+    val body_f: opt[*json.Value] = json.value_find(obj, "body");
+    if (sel body_f.some) {
+        var ins: *u8 = nil;
+        var insn: usize = 0;
+        if (!with_lines_key(a, t, obj, "body", ?ins, ?insn)) {
+            ret fail(e, "edit_bad", "symbol body must be a string or list of strings", sym.line);
+        }
+        var body_ind: i64 = sym.indent + 4;
+        if (sym.sig_end < sym.end) {
+            val b_off: usize = line_start(t, (sym.sig_end + 1)::usize);
+            var existing_ind: usize = 0;
+            for (b_off + existing_ind < t.n && (t.p[b_off + existing_ind] == ' ' || t.p[b_off + existing_ind] == '\t')) {
+                existing_ind = existing_ind + 1;
+            }
+            if (existing_ind::i64 > sym.indent) { body_ind = existing_ind::i64; }
+        }
+        indent_block_if_unindented(a, ins, insn, body_ind, ?ins, ?insn);
+        var from: usize = 0;
+        var to: usize = 0;
+        if (util.eq(lang, "python")) {
+            from = line_start(t, (sym.sig_end + 1)::usize);
+            to = line_start(t, (sym.end + 1)::usize);
+        }
+        or {
+            if (sym.end > sym.sig_end) {
+                from = line_start(t, (sym.sig_end + 1)::usize);
+                to = line_start(t, sym.end::usize);
+            }
+            or {
+                from = line_start(t, (sym.sig_end + 1)::usize);
+                to = line_start(t, (sym.end + 1)::usize);
+            }
+        }
+        if (to == t.n && t.n > 0 && t.p[t.n - 1] != '\n' && insn > 0) {
+            var trim: usize = insn;
+            if (trim > 0 && ins[trim - 1] == '\n') { trim = trim - 1; }
+            if (trim > 0 && ins[trim - 1] == '\r') { trim = trim - 1; }
+            insn = trim;
+        }
+        if (!splice(a, t, from, to, ins, insn)) { ret fail(e, "oom", "out of memory", 0); }
+        ret true;
+    }
+    # Mode 3: {"symbol": "name", "signature": "..."}
+    val sig_f: opt[*json.Value] = json.value_find(obj, "signature");
+    if (sel sig_f.some) {
+        var ins: *u8 = nil;
+        var insn: usize = 0;
+        if (!with_lines_key(a, t, obj, "signature", ?ins, ?insn)) {
+            ret fail(e, "edit_bad", "symbol signature must be a string or list of strings", sym.line);
+        }
+        indent_block_if_unindented(a, ins, insn, sym.indent, ?ins, ?insn);
+        val from: usize = line_start(t, sym.line::usize);
+        val to: usize = line_start(t, (sym.sig_end + 1)::usize);
+        if (!splice(a, t, from, to, ins, insn)) { ret fail(e, "oom", "out of memory", 0); }
+        ret true;
+    }
+    # Mode 4: {"symbol": "name", "with": "..."} (full symbol replacement)
+    var ins: *u8 = nil;
+    var insn: usize = 0;
+    if (!with_lines(a, t, obj, ?ins, ?insn)) { ret fail(e, "edit_bad", "a symbol edit needs with, body, signature, or rename", 0); }
+    indent_block_if_unindented(a, ins, insn, sym.indent, ?ins, ?insn);
+    var lo: i64 = sym.line;
+    val hi: i64 = sym.end;
+    if (sym.dec_start < sym.line && insn > 0) {
+        var k: usize = 0;
+        for (k < insn && (ins[k] == ' ' || ins[k] == '\t')) { k = k + 1; }
+        if (k < insn && (ins[k] == '@' || (k + 1 < insn && ins[k] == '#' && ins[k + 1] == '['))) {
+            lo = sym.dec_start;
+        }
+    }
+    val from: usize = line_start(t, lo::usize);
+    val to: usize = line_start(t, (hi + 1)::usize);
+    if (to == t.n && t.n > 0 && t.p[t.n - 1] != '\n' && insn > 0) {
+        var trim: usize = insn;
+        if (trim > 0 && ins[trim - 1] == '\n') { trim = trim - 1; }
+        if (trim > 0 && ins[trim - 1] == '\r') { trim = trim - 1; }
+        insn = trim;
+    }
+    if (!splice(a, t, from, to, ins, insn)) { ret fail(e, "oom", "out of memory", 0); }
+    ret true;
+}
+
+# run an ex command or normal-mode keys over the text (or within span) in a sandboxed editor
+fun vim_edit(a: *A.Allocator, name: str, t: *Text, obj: *json.Value, src: *u8, is_ex: bool, e: *Err) bool {
+    var sa: usize = 0;
+    var sb: usize = 0;
+    if (!scope(a, t, obj, ?sa, ?sb, e)) { ret false; }
+    val slice_p: *u8 = (t.p::usize + sa)::*u8;
+    val slice_n: usize = sb - sa;
     val made: res[eng.Engine, A.Error] = eng.init(a);
     if (sel made.err) { ret fail(e, "oom", "out of memory", 0); }
     var ed: eng.Engine = made.ok;
     ed.sandbox = true;
-    val had_final: bool = t.n == 0 || t.p[t.n - 1] == '\n';
-    val loaded: err[A.Error] = eng.load_current(?ed, name, t.p, t.n);
+    val had_final: bool = slice_n == 0 || slice_p[slice_n - 1] == '\n';
+    val loaded: err[A.Error] = eng.load_current(?ed, name, slice_p, slice_n);
     if (sel loaded.err) {
         eng.dnit(?ed);
         ret fail(e, "oom", "out of memory", 0);
@@ -957,23 +1315,48 @@ fun vim_edit(a: *A.Allocator, name: str, t: *Text, src: *u8, is_ex: bool, e: *Er
             n = w.len;
         }
     }
-    t.p = p;
-    t.n = n;
+    if (sa == 0 && sb == t.n) {
+        t.p = p;
+        t.n = n;
+        ret true;
+    }
+    if (!splice(a, t, sa, sb, p, n)) { ret fail(e, "oom", "out of memory", 0); }
     ret true;
 }
 
-# apply a json list of edits to text[0,n); the result comes from a
+fun line_text_at(a: *A.Allocator, t: *Text, ln: i64) str {
+    if (ln < 1) { ret nil; }
+    val from: usize = line_start(t, ln::usize);
+    if (from >= t.n) { ret nil; }
+    var to: usize = line_start(t, (ln + 1)::usize);
+    if (to > from && t.p[to - 1] == '\n') { to = to - 1; }
+    if (to > from && t.p[to - 1] == '\r') { to = to - 1; }
+    var len: usize = to - from;
+    if (len > 256) { len = 256; }
+    val d: res[str, A.Error] = util.dup_n(a, (t.p::usize + from)::*u8, len);
+    if (sel d.err) { ret nil; }
+    ret d.ok;
+}
+
+# apply a json list of edits (or a single edit object) to text[0,n); the result comes from a
 pub fun apply(a: *A.Allocator, name: str, text: *u8, n: usize, edits: *json.Value, out: **u8, out_len: *usize, e: *Err, norm: *bool, mixed: *bool) bool {
     e.code = nil;
     e.msg = nil;
     e.index = -1;
     e.line = 0;
+    e.col = 0;
+    e.cat = nil;
+    e.scope_lo = 0;
+    e.scope_hi = 0;
+    e.actual = nil;
     @norm = false;
     @mixed = false;
-    if (!json.value_is_array(edits) || json.value_count(edits) == 0) {
+    val single_obj: bool = json.value_is_object(edits);
+    if (!single_obj && (!json.value_is_array(edits) || json.value_count(edits) == 0)) {
         ret fail(e, "edit_bad", "edits must be a non-empty list", 0);
     }
     var t: Text;
+    t.name = name;
     t.p = text;
     t.n = n;
     t.crlf = false;
@@ -991,12 +1374,22 @@ pub fun apply(a: *A.Allocator, name: str, text: *u8, n: usize, edits: *json.Valu
         }
         i = i + 1;
     }
+    var edit_count: usize = 1;
+    if (!single_obj) { edit_count = json.value_count(edits); }
     var k: usize = 0;
-    for (k < json.value_count(edits)) {
+    for (k < edit_count) {
         e.index = k::i64;
-        val g: opt[*json.Value] = json.value_get(edits, k);
-        if (!sel g.some) { ret fail(e, "edit_bad", "missing edit", 0); }
-        val obj: *json.Value = g.some;
+        e.col = 0;
+        e.cat = nil;
+        e.scope_lo = 0;
+        e.scope_hi = 0;
+        e.actual = nil;
+        var obj: *json.Value = edits;
+        if (!single_obj) {
+            val g: opt[*json.Value] = json.value_get(edits, k);
+            if (!sel g.some) { ret fail(e, "edit_bad", "missing edit", 0); }
+            obj = g.some;
+        }
         if (!json.value_is_object(obj)) { ret fail(e, "edit_bad", "each edit must be an object", 0); }
         var ok: bool = false;
         val has_find: opt[*json.Value] = json.value_find(obj, "find");
@@ -1008,6 +1401,7 @@ pub fun apply(a: *A.Allocator, name: str, text: *u8, n: usize, edits: *json.Valu
         val has_prepend: opt[*json.Value] = json.value_find(obj, "prepend");
         val has_ex: opt[*json.Value] = json.value_find(obj, "ex");
         val has_keys: opt[*json.Value] = json.value_find(obj, "keys");
+        val has_sym: opt[*json.Value] = json.value_find(obj, "symbol");
         if (sel has_find_re.some) { ok = re_edit(a, ?t, obj, e); }
         or (sel has_find.some) { ok = find_edit(a, ?t, obj, e); }
         or (sel has_lines.some) { ok = range_edit(a, ?t, obj, e); }
@@ -1036,18 +1430,235 @@ pub fun apply(a: *A.Allocator, name: str, text: *u8, n: usize, edits: *json.Valu
             var p: *u8 = nil;
             var pn: usize = 0;
             if (get_str(a, obj, key, ?p, ?pn) != 1 || pn == 0) { ret fail(e, "edit_bad", "ex and keys take a non-empty string", 0); }
-            ok = vim_edit(a, name, ?t, p, is_ex, e);
+            ok = vim_edit(a, name, ?t, obj, p, is_ex, e);
+        }
+        or (sel has_sym.some) {
+            ok = symbol_edit(a, ?t, obj, e);
         }
         or {
-            ret fail(e, "edit_bad", "an edit needs one of find, find_re, lines, insert_before, insert_after, append, prepend, ex, or keys", 0);
+            ret fail(e, "edit_bad", "an edit needs one of find, find_re, lines, symbol, insert_before, insert_after, append, prepend, ex, or keys", 0);
         }
-        if (!ok) { ret false; }
+        if (!ok) {
+            if (e.line > 0 && e.actual == nil) {
+                e.actual = line_text_at(a, ?t, e.line);
+            }
+            if (e.scope_lo <= 0 && t.n > 0) {
+                e.scope_lo = 1;
+                e.scope_hi = count_lines(?t)::i64;
+            }
+            ret false;
+        }
         k = k + 1;
     }
     @norm = t.normed;
     @mixed = t.mixed;
     @out = t.p;
     @out_len = t.n;
+    ret true;
+}
+
+fun slice_eq(a: *u8, a0: usize, a1: usize, b: *u8, b0: usize, b1: usize) bool {
+    if (a1 < a0 || b1 < b0) { ret false; }
+    val n: usize = a1 - a0;
+    if (b1 - b0 != n) { ret false; }
+    var i: usize = 0;
+    for (i < n) {
+        if (a[a0 + i] != b[b0 + i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# enforce a method/symbol/line scope contract between old_p[0..old_n) and new_p[0..new_n)
+pub fun verify_contract(a: *A.Allocator, name: str, old_p: *u8, old_n: usize, new_p: *u8, new_n: usize, contract: *json.Value, e: *Err) bool {
+    if (contract == nil || !json.value_is_object(contract)) { ret true; }
+    var ot: Text;
+    ot.name = name;
+    ot.p = old_p;
+    ot.n = old_n;
+    var nt: Text;
+    nt.name = name;
+    nt.p = new_p;
+    nt.n = new_n;
+    val ototal: i64 = count_lines(?ot)::i64;
+    val ntotal: i64 = count_lines(?nt)::i64;
+    val lang: str = scan.outline_lang(name);
+
+    # 1. Line range contract: "lines": [first, last]
+    val lf: opt[*json.Value] = json.value_find(contract, "lines");
+    if (sel lf.some) {
+        if (!json.value_is_array(lf.some) || json.value_count(lf.some) != 2) {
+            ret fail(e, "contract_bad", "contract.lines must be [first, last], 1-based and inclusive", 0);
+        }
+        var lo: i64 = 0;
+        var hi: i64 = 0;
+        val g0: opt[*json.Value] = json.value_get(lf.some, 0);
+        val g1: opt[*json.Value] = json.value_get(lf.some, 1);
+        if (sel g0.some) {
+            if (json.value_is_number(g0.some)) { lo = json.value_number(g0.some); }
+        }
+        if (sel g1.some) {
+            if (json.value_is_number(g1.some)) { hi = json.value_number(g1.some); }
+        }
+        if (lo < 1 || hi < lo || hi > ototal) {
+            ret fail(e, "contract_bad", "contract.lines is outside the file", 0);
+        }
+        val pre_end: usize = line_start(?ot, lo::usize);
+        val suf_start: usize = line_start(?ot, (hi + 1)::usize);
+        val suf_len: usize = old_n - suf_start;
+        if (new_n < pre_end + suf_len) {
+            ret fail(e, "contract_violation", "edits modified lines outside the contracted line range", lo);
+        }
+        if (!slice_eq(old_p, 0, pre_end, new_p, 0, pre_end)) {
+            ret fail(e, "contract_violation", "edits modified lines before the contracted line range", 1);
+        }
+        if (!slice_eq(old_p, suf_start, old_n, new_p, new_n - suf_len, new_n)) {
+            ret fail(e, "contract_violation", "edits modified lines after the contracted line range", hi + 1);
+        }
+    }
+
+    # 2. Symbol / method scope contract: "symbol": "name" or "symbols": ["a", "b"] or "methods": ["a", "b"]
+    var sym_names: vector.Vector[str] = vector.init[str](a);
+    var single_sym: *u8 = nil;
+    var single_n: usize = 0;
+    if (get_str(a, contract, "symbol", ?single_sym, ?single_n) == 1 && single_n > 0) {
+        vector.push[str](?sym_names, single_sym);
+    }
+    var arr_f: opt[*json.Value] = json.value_find(contract, "symbols");
+    if (!sel arr_f.some) { arr_f = json.value_find(contract, "methods"); }
+    if (sel arr_f.some) {
+        if (json.value_is_array(arr_f.some)) {
+            var si: usize = 0;
+            for (si < json.value_count(arr_f.some)) {
+                val elem: opt[*json.Value] = json.value_get(arr_f.some, si);
+                if (sel elem.some) {
+                    if (json.value_is_string(elem.some)) {
+                        var raw_n: usize = 0;
+                        val raw: *u8 = json.value_string(elem.some, ?raw_n);
+                        val got: res[*u8, A.Error] = A.allocate[u8](a, raw_n + 1);
+                        if (sel got.ok) {
+                            val spn: usize = decode_lenient(raw, raw_n, got.ok);
+                            if (spn > 0) {
+                                vector.push[str](?sym_names, got.ok);
+                            }
+                        }
+                    }
+                }
+                si = si + 1;
+            }
+        }
+    }
+    if (sym_names.len > 0) {
+        if (lang == nil) {
+            ret fail(e, "contract_bad", "symbol contracts require a supported language file", 0);
+        }
+        var o_los: vector.Vector[i64] = vector.init[i64](a);
+        var o_his: vector.Vector[i64] = vector.init[i64](a);
+        var n_los: vector.Vector[i64] = vector.init[i64](a);
+        var n_his: vector.Vector[i64] = vector.init[i64](a);
+        var i: usize = 0;
+        for (i < sym_names.len) {
+            val sn: str = sym_names.data[i];
+            val sn_len: usize = str_len(sn);
+            var osym: scan.Sym;
+            if (scan.find_symbol_ext(a, lang, old_p, old_n, sn, sn_len, ?osym) != 1) {
+                ret fail(e, "contract_bad", "contracted symbol not found in the original file", 0);
+            }
+            var nsym: scan.Sym;
+            if (scan.find_symbol_ext(a, lang, new_p, new_n, sn, sn_len, ?nsym) != 1) {
+                ret fail(e, "contract_violation", "contracted symbol was deleted or renamed without authorization", osym.line);
+            }
+            vector.push[i64](?o_los, osym.dec_start);
+            vector.push[i64](?o_his, osym.end);
+            vector.push[i64](?n_los, nsym.dec_start);
+            vector.push[i64](?n_his, nsym.end);
+            i = i + 1;
+        }
+        # sort spans by o_los
+        var a_i: usize = 1;
+        for (a_i < o_los.len) {
+            var b_j: usize = a_i;
+            for (b_j > 0 && o_los.data[b_j] < o_los.data[b_j - 1]) {
+                val t1: i64 = o_los.data[b_j]; o_los.data[b_j] = o_los.data[b_j - 1]; o_los.data[b_j - 1] = t1;
+                val t2: i64 = o_his.data[b_j]; o_his.data[b_j] = o_his.data[b_j - 1]; o_his.data[b_j - 1] = t2;
+                val t3: i64 = n_los.data[b_j]; n_los.data[b_j] = n_los.data[b_j - 1]; n_los.data[b_j - 1] = t3;
+                val t4: i64 = n_his.data[b_j]; n_his.data[b_j] = n_his.data[b_j - 1]; n_his.data[b_j - 1] = t4;
+                b_j = b_j - 1;
+            }
+            a_i = a_i + 1;
+        }
+        var o_cur: usize = 0;
+        var n_cur: usize = 0;
+        i = 0;
+        for (i < o_los.len) {
+            val o_start: usize = line_start(?ot, o_los.data[i]::usize);
+            val n_start: usize = line_start(?nt, n_los.data[i]::usize);
+            if (!slice_eq(old_p, o_cur, o_start, new_p, n_cur, n_start)) {
+                ret fail(e, "contract_violation", "edits modified lines outside the contracted symbol scope", o_los.data[i]);
+            }
+            o_cur = line_start(?ot, (o_his.data[i] + 1)::usize);
+            n_cur = line_start(?nt, (n_his.data[i] + 1)::usize);
+            i = i + 1;
+        }
+        if (!slice_eq(old_p, o_cur, old_n, new_p, n_cur, new_n)) {
+            ret fail(e, "contract_violation", "edits modified lines after the contracted symbol scope", o_his.data[o_his.len - 1] + 1);
+        }
+    }
+
+    # 3. Preserve signatures contract: "preserve_signatures": true
+    if (get_bool(contract, "preserve_signatures") && lang != nil) {
+        var old_syms: vector.Vector[scan.Sym] = vector.init[scan.Sym](a);
+        scan.collect_symbols(a, lang, old_p, old_n, ?old_syms);
+        var oi: usize = 0;
+        for (oi < old_syms.len) {
+            val os: *scan.Sym = ?old_syms.data[oi];
+            var ns: scan.Sym;
+            if (scan.find_symbol_ext(a, lang, new_p, new_n, os.name, os.name_n, ?ns) != 1) {
+                ret fail(e, "contract_violation", "a symbol was removed or renamed while preserve_signatures is active", os.line);
+            }
+            val o_s0: usize = line_start(?ot, os.line::usize);
+            val o_s1: usize = line_start(?ot, (os.sig_end + 1)::usize);
+            val n_s0: usize = line_start(?nt, ns.line::usize);
+            val n_s1: usize = line_start(?nt, (ns.sig_end + 1)::usize);
+            if (!slice_eq(old_p, o_s0, o_s1, new_p, n_s0, n_s1)) {
+                ret fail(e, "contract_violation", "a symbol signature was modified while preserve_signatures is active", ns.line);
+            }
+            oi = oi + 1;
+        }
+    }
+
+    # 4. Max lines changed contract: "max_lines_changed": N
+    var max_chg: i64 = 0;
+    if (get_int(contract, "max_lines_changed", ?max_chg) == 1 && max_chg > 0) {
+        var pre_l: i64 = 1;
+        for (pre_l <= ototal && pre_l <= ntotal) {
+            val o0: usize = line_start(?ot, pre_l::usize);
+            val o1: usize = line_start(?ot, (pre_l + 1)::usize);
+            val n0: usize = line_start(?nt, pre_l::usize);
+            val n1: usize = line_start(?nt, (pre_l + 1)::usize);
+            if (!slice_eq(old_p, o0, o1, new_p, n0, n1)) { brk; }
+            pre_l = pre_l + 1;
+        }
+        var o_suf: i64 = ototal;
+        var n_suf: i64 = ntotal;
+        for (o_suf >= pre_l && n_suf >= pre_l) {
+            val o0: usize = line_start(?ot, o_suf::usize);
+            val o1: usize = line_start(?ot, (o_suf + 1)::usize);
+            val n0: usize = line_start(?nt, n_suf::usize);
+            val n1: usize = line_start(?nt, (n_suf + 1)::usize);
+            if (!slice_eq(old_p, o0, o1, new_p, n0, n1)) { brk; }
+            o_suf = o_suf - 1;
+            n_suf = n_suf - 1;
+        }
+        val old_span: i64 = o_suf - pre_l + 1;
+        val new_span: i64 = n_suf - pre_l + 1;
+        var chg: i64 = old_span;
+        if (new_span > chg) { chg = new_span; }
+        if (chg > max_chg) {
+            ret fail(e, "contract_violation", "edits exceeded contract.max_lines_changed", pre_l);
+        }
+    }
+
     ret true;
 }
 
@@ -1156,6 +1767,25 @@ $if (capability.HOSTED) {
         if (run(?a, "alpha\r\nbeta\r\n", "[{\"find_re\":\"alpha\\nbeta\",\"replace\":\"X\"}]", ?out, ?on, ?e, ?norm)) { ret 2; }
         if (e.code == nil || !str_contains(e.code, "edit_not_found")) { ret 3; }
         if (e.msg == nil || !str_contains(e.msg, "\\r\\n")) { ret 4; }
+        ret 0;
+    }
+
+    test edit__symbol_scope_replace_and_vim_within {
+        var a: A.Allocator;
+        val made: err[A.Error] = page.make(?a);
+        if (sel made.err) { ret 1; }
+        val src: str = "def a(x):\n    return x + 1\n\ndef b(x):\n    return x + 1\n";
+        val spec: str = "[{\"symbol\":\"b\",\"find\":\"x + 1\",\"replace\":\"x + 2\"},{\"within\":{\"symbol\":\"a\"},\"ex\":\"%s/x/y/g\"},{\"insert_after\":{\"symbol\":\"a\"},\"with\":\"# between\"}]";
+        val pj: res[json.Value, json.JsonError] = json.parse(spec, str_len(spec), ?a);
+        if (sel pj.err) { ret 2; }
+        var arr: json.Value = pj.ok;
+        var out: *u8 = nil;
+        var on: usize = 0;
+        var e: Err;
+        var norm: bool = false;
+        var mx: bool = false;
+        if (!apply(?a, "calc.py", src, str_len(src), ?arr, ?out, ?on, ?e, ?norm, ?mx)) { ret 3; }
+        if (!same(out, on, "def a(y):\n    return y + 1\n# between\n\ndef b(x):\n    return x + 2\n")) { ret 4; }
         ret 0;
     }
 }

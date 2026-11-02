@@ -335,6 +335,139 @@ pub fun unified(a: *A.Allocator, ap: *u8, an: usize, bp: *u8, bn: usize, w: *jw.
     ret emit_hunks(ap, ?av, bp, ?bv, ?ops, w);
 }
 
+fun build_keep_map(a: *A.Allocator, ap: *u8, av: *vector.Vector[usize], bp: *u8, bv: *vector.Vector[usize], keep: *i64) {
+    val na_all: usize = av.len / 2;
+    val mb_all: usize = bv.len / 2;
+    var i: usize = 0;
+    for (i < na_all) {
+        keep[i] = -1;
+        i = i + 1;
+    }
+    var cp: usize = 0;
+    for (cp < na_all && cp < mb_all && lines_eq(ap, av, cp, bp, bv, cp)) {
+        keep[cp] = cp::i64;
+        cp = cp + 1;
+    }
+    var cs: usize = 0;
+    for (cs < na_all - cp && cs < mb_all - cp && lines_eq(ap, av, na_all - 1 - cs, bp, bv, mb_all - 1 - cs)) {
+        keep[na_all - 1 - cs] = (mb_all - 1 - cs)::i64;
+        cs = cs + 1;
+    }
+    val na: usize = na_all - cp - cs;
+    val ma: usize = mb_all - cp - cs;
+    if (na > 0 && ma > 0) {
+        var ops: vector.Vector[i64] = vector.init[i64](a);
+        if (middle_ops(a, ap, av, cp, na, bp, bv, cp, ma, ?ops)) {
+            var k: usize = 0;
+            for (k < ops.len) {
+                if (ops.data[k] == OP_KEEP) {
+                    val ax: usize = cp + ops.data[k + 1]::usize;
+                    val by: i64 = cp::i64 + ops.data[k + 2];
+                    if (ax < na_all) { keep[ax] = by; }
+                }
+                k = k + 3;
+            }
+        }
+    }
+}
+
+fun slice_lines_eq(ap: *u8, av: *vector.Vector[usize], a0: usize, a1: usize, bp: *u8, bv: *vector.Vector[usize], b0: usize, b1: usize) bool {
+    if (a1 - a0 != b1 - b0) { ret false; }
+    var i: usize = 0;
+    val n: usize = a1 - a0;
+    for (i < n) {
+        if (!lines_eq(ap, av, a0 + i, bp, bv, b0 + i)) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun emit_lines_range(w: *jw.Jw, p: *u8, v: *vector.Vector[usize], l0: usize, l1: usize) {
+    var i: usize = l0;
+    for (i < l1) {
+        val off: usize = v.data[i * 2];
+        val n: usize = v.data[i * 2 + 1];
+        jw.bytes(w, (p::usize + off)::*u8, n);
+        i = i + 1;
+    }
+}
+
+# three-way line merge of base bp[0..bn), current cp[0..cn), and proposed pp[0..pn).
+# returns true with merged bytes in out_p/out_n when clean, or false with 1-based conflict_line on overlap.
+pub fun merge3(a: *A.Allocator, bp: *u8, bn: usize, cp: *u8, cn: usize, pp: *u8, pn: usize, out_p: **u8, out_n: *usize, conflict_line: *i64) bool {
+    @conflict_line = 0;
+    var bv: vector.Vector[usize] = vector.init[usize](a);
+    var cv: vector.Vector[usize] = vector.init[usize](a);
+    var pv: vector.Vector[usize] = vector.init[usize](a);
+    split(a, bp, bn, ?bv);
+    split(a, cp, cn, ?cv);
+    split(a, pp, pn, ?pv);
+    val nb: usize = bv.len / 2;
+    val nc: usize = cv.len / 2;
+    val np: usize = pv.len / 2;
+    val kc_res: res[*i64, A.Error] = A.allocate[i64](a, nb + 1);
+    val kp_res: res[*i64, A.Error] = A.allocate[i64](a, nb + 1);
+    if (sel kc_res.err) { ret false; }
+    if (sel kp_res.err) { ret false; }
+    val c_keep: *i64 = kc_res.ok;
+    val p_keep: *i64 = kp_res.ok;
+    build_keep_map(a, bp, ?bv, cp, ?cv, c_keep);
+    build_keep_map(a, bp, ?bv, pp, ?pv, p_keep);
+
+    var w: jw.Jw = jw.init(a);
+    var b0: usize = 0;
+    var c0: usize = 0;
+    var p0: usize = 0;
+    var b: usize = 0;
+    for (b <= nb) {
+        var is_sync: bool = false;
+        var c1: usize = nc;
+        var p1: usize = np;
+        if (b == nb) {
+            is_sync = true;
+        }
+        or (c_keep[b] >= c0::i64 && p_keep[b] >= p0::i64) {
+            c1 = c_keep[b]::usize;
+            p1 = p_keep[b]::usize;
+            is_sync = true;
+        }
+        if (is_sync) {
+            val c_eq_b: bool = slice_lines_eq(bp, ?bv, b0, b, cp, ?cv, c0, c1);
+            val p_eq_b: bool = slice_lines_eq(bp, ?bv, b0, b, pp, ?pv, p0, p1);
+            if (c_eq_b) {
+                emit_lines_range(?w, pp, ?pv, p0, p1);
+            }
+            or (p_eq_b) {
+                emit_lines_range(?w, cp, ?cv, c0, c1);
+            }
+            or (slice_lines_eq(cp, ?cv, c0, c1, pp, ?pv, p0, p1)) {
+                emit_lines_range(?w, cp, ?cv, c0, c1);
+            }
+            or {
+                @conflict_line = (b0 + 1)::i64;
+                ret false;
+            }
+            if (b < nb) {
+                emit_lines_range(?w, bp, ?bv, b, b + 1);
+                b0 = b + 1;
+                c0 = c1 + 1;
+                p0 = p1 + 1;
+            }
+        }
+        b = b + 1;
+    }
+    if (w.failed) { ret false; }
+    if (w.buf == nil) {
+        @out_p = "";
+        @out_n = 0;
+    }
+    or {
+        @out_p = w.buf;
+        @out_n = w.len;
+    }
+    ret true;
+}
+
 use std.system.capability;
 
 $if (capability.HOSTED) {

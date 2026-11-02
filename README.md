@@ -12,7 +12,7 @@ Three ways in:
 
 | Transport | Start | Shape |
 | --- | --- | --- |
-| MCP | `qark mcp --root <workspace>` | tools `qark_apply`, `qark_read`, `qark_search`, `qark_templates`, `qark_define_template` |
+| MCP | `qark mcp [--root <workspace>]` | tools `qark_apply`, `qark_edit`, `qark_read`, `qark_search`, `qark_impact`, `qark_undo`, `qark_check`, `qark_templates`, `qark_define_template`; resources (`qark://capabilities`, `qark://schema`, `qark://undo`, `qark://events`) & prompts |
 | NDJSON | `qark --headless --stdio --root <workspace>` | one `{"id":1,"op":"apply","args":{...}}` per line |
 | CLI | `qark apply spec.json --root <workspace>` | `apply -` reads the spec from stdin; `--dry-run` previews with diffs |
 
@@ -58,9 +58,10 @@ See `qa --help` and `agent/README.md`.
 | `src/` | the whole tool: spec compiler, edit engine, checkers, commit/journal, ndjson + MCP servers, editor ops |
 | `agent/skill/SKILL.md` | the agent contract — give this file to an agent and it can use Qark |
 | `agent/reference/ops.txt` | `qark --dump ops` — the operation reference |
-| `agent/eval/` | the PowerShell eval suite (95 deterministic checks) and model benches |
+| `agent/eval/` | the PowerShell eval suite (151 deterministic checks) and model benches |
 | `agent/README.md` | how to train/score an agent on Qark |
-| `templates/`, `scripts/` | builtin templates, language checkers, MCP tool schema |
+| `docs/autocode-integration.md` | editor/orchestrator integration guide, fail-closed checker contract, and reference Node.js client |
+| `templates/`, `scripts/` | builtin templates, language checkers (`check.cjs`, `check.py`, `check.ps1`), MCP tool schema |
 
 ## License
 

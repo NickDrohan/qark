@@ -1,15 +1,14 @@
 # model context protocol over stdio: json-rpc 2.0, one message per line
 #
-# the tools are the write layer's operations: qark_apply, qark_read,
-# qark_search, qark_templates, and qark_define_template. a tool result carries the same
-# json object the ndjson worker returns, once as text and once as
-# structuredContent, with isError set when the operation refused.
+# exposes 9 high-ergonomic tools (qark_apply, qark_edit, qark_read, qark_search,
+# qark_impact, qark_undo, qark_check, qark_templates, qark_define_template),
+# 4 live workspace resources (qark://capabilities, qark://schema, qark://undo,
+# qark://events), and 2 guided prompts (qark-edit-symbol, qark-refactor).
 
 use std.data.json;
 use std.types.bool.bool;
 use std.types.bool.false;
 use std.types.bool.true;
-use std.types.error.err;
 use std.types.option.opt;
 use std.types.result.res;
 use std.types.size.usize;
@@ -28,7 +27,7 @@ val TOOLS: [_]u8;
 
 val LATEST: str = "2025-06-18";
 
-val INSTRUCTIONS: str = "Qark is the file writer for this workspace. Use qark_apply for every file you create, replace, edit, move, or delete: it renders templates, syntax-checks the result, and writes all files atomically or none. To change an existing file, read it with qark_read and either pass edits with exact find text or a find_re regex (\\0-\\9 captures; occurrence picks a match, within scopes), or mode replace with expect set to its sha256. To rename a file, pass move with the destination as path. To look before you write, use qark_search (literal or regex, glob-narrowed, no pattern lists files) and qark_read's outline for a file's symbols. Re-sending a request is safe; identical files report unchanged. For many similar scripts, write one template and fan it out with each, or send an expand table (@template, a header, then one row per line). A job writes a self-contained directory under jobs/<job> with manifest.json for whoever runs it.";
+val INSTRUCTIONS: str = "Qark v0.3.0 is the transactional, AST-aware write and code-intelligence layer for this workspace. Prefer Qark's tools over raw file reads/writes:\n1. qark_read: Read files with sha256, symbol outlines (outline: true), specific AST symbols (symbol / symbols), or compact signature-folded views (fold: true).\n2. qark_edit: Perform surgical single-file or glob edits with flat parameters—AST symbol edits (symbol + body | signature | rename | with), exact find/replace, regex find_re/replace (\\0-\\9 captures), or anchored inserts (insert_before/insert_after + with, auto_indent: true). Supports contract (scope enforcement) and rebase: true (3-way merge on stale expect hashes).\n3. qark_apply: Create, replace, edit, move, or delete one or many files atomically, render Handlebars templates, enforce scope contracts, run syntax and staged project validation, and receive a semantic change preview.\n4. qark_search: Ripgrep-speed literal or regex search returning matches grouped per file with sha256 and enclosing AST symbol (or omit pattern to list workspace files).\n5. qark_impact: Trace a symbol's definitions, references, imports, dependents, affected_files, and affected_symbols before refactoring.\n6. qark_undo: Atomically undo (steps: N) or redo (redo: true) multi-file transactions from .qark/undo, or list history (list: true).\n7. qark_check: Run standalone project validation (validate/cmd), verify job manifests (dir), or inspect capabilities/schemas/events.\nRelative paths and full paths inside the workspace root both work; pass root on any tool call to switch workspaces dynamically.";
 
 fun known_version(v: str) bool {
     ret util.eq(v, "2024-11-05") || util.eq(v, "2025-03-26") || util.eq(v, "2025-06-18") || util.eq(v, "2025-11-25");
@@ -83,6 +82,81 @@ fun field_text(a: *A.Allocator, obj: *json.Value, key: str) str {
     ret p;
 }
 
+fun hex_val(c: u8) i64 {
+    if (c >= '0' && c <= '9') { ret (c - '0')::i64; }
+    if (c >= 'a' && c <= 'f') { ret (c - 'a' + 10)::i64; }
+    if (c >= 'A' && c <= 'F') { ret (c - 'A' + 10)::i64; }
+    ret -1;
+}
+
+# convert a file:// URI (or plain path) into a local path string
+fun uri_to_path(a: *A.Allocator, uri: str) str {
+    if (uri == nil || uri[0] == 0) { ret nil; }
+    var p: *u8 = uri;
+    val n: usize = str_len(uri);
+    var start: usize = 0;
+    if (n >= 7 && p[0] == 'f' && p[1] == 'i' && p[2] == 'l' && p[3] == 'e' && p[4] == ':' && p[5] == '/' && p[6] == '/') {
+        start = 7;
+        if (start < n && p[start] == '/') {
+            # On Windows, file:///D:/path or file:///d%3A/path starts after the 3rd slash
+            if (start + 2 < n && ((p[start + 1] >= 'A' && p[start + 1] <= 'Z') || (p[start + 1] >= 'a' && p[start + 1] <= 'z')) && (p[start + 2] == ':' || p[start + 2] == '%')) {
+                start = start + 1;
+            }
+        }
+    }
+    var w: jw.Jw = jw.init(a);
+    var i: usize = start;
+    for (i < n) {
+        if (p[i] == '%' && i + 2 < n) {
+            val hi: i64 = hex_val(p[i + 1]);
+            val lo: i64 = hex_val(p[i + 2]);
+            if (hi >= 0 && lo >= 0) {
+                jw.byte(?w, ((hi * 16) + lo)::u8);
+                i = i + 3;
+                cnt;
+            }
+        }
+        jw.byte(?w, p[i]);
+        i = i + 1;
+    }
+    if (w.failed || w.buf == nil) { ret nil; }
+    ret jw.text(?w);
+}
+
+fun try_init_root(s: *session.Session, params: *json.Value) {
+    if (params == nil || !json.value_is_object(params)) { ret; }
+    val rp: str = field_text(?s.ra, params, "rootPath");
+    if (rp != nil && rp[0] != 0) {
+        val dec: str = uri_to_path(?s.ra, rp);
+        if (dec != nil && session.set_root(s, dec)) { ret; }
+    }
+    val ru: str = field_text(?s.ra, params, "rootUri");
+    if (ru != nil && ru[0] != 0) {
+        val dec: str = uri_to_path(?s.ra, ru);
+        if (dec != nil && session.set_root(s, dec)) { ret; }
+    }
+    val wf: opt[*json.Value] = json.value_find(params, "workspaceFolders");
+    if (sel wf.some) {
+        if (json.value_is_array(wf.some) && json.value_count(wf.some) > 0) {
+            val g0: opt[*json.Value] = json.value_get(wf.some, 0);
+            if (sel g0.some) {
+                if (json.value_is_object(g0.some)) {
+                    val wu: str = field_text(?s.ra, g0.some, "uri");
+                    if (wu != nil && wu[0] != 0) {
+                        val dec: str = uri_to_path(?s.ra, wu);
+                        if (dec != nil && session.set_root(s, dec)) { ret; }
+                    }
+                    val wp: str = field_text(?s.ra, g0.some, "path");
+                    if (wp != nil && wp[0] != 0) {
+                        val dec: str = uri_to_path(?s.ra, wp);
+                        if (dec != nil && session.set_root(s, dec)) { ret; }
+                    }
+                }
+            }
+        }
+    }
+}
+
 fun tools_json(s: *session.Session, w: *jw.Jw) bool {
     val n: usize = $length_of(TOOLS);
     val got: res[*u8, A.Error] = A.allocate[u8](?s.ra, n + 1);
@@ -115,12 +189,33 @@ fun call_tool(s: *session.Session, id: *json.Value, params: *json.Value) res[str
     }
     var inner: jw.Jw = jw.init(?s.ra);
     var ok: bool = false;
-    if (util.eq(name, "qark_apply")) { ok = write.apply(s, args, ?inner); }
-    or (util.eq(name, "qark_read")) { ok = write.read(s, args, ?inner); }
-    or (util.eq(name, "qark_search")) { ok = write.search(s, args, ?inner); }
-    or (util.eq(name, "qark_templates")) { ok = write.templates(s, args, ?inner); }
-    or (util.eq(name, "qark_define_template")) { ok = write.define(s, args, ?inner); }
-    or { ret rpc_error(s, id, -32602, "unknown tool; call tools/list"); }
+    var root_ok: bool = true;
+    val rf: opt[*json.Value] = json.value_find(args, "root");
+    if (sel rf.some) {
+        val rstr: str = field_text(?s.ra, args, "root");
+        if (rstr == nil || rstr[0] == 0) {
+            ok = write.simple_error(?inner, "spec_type", "root must be a non-empty directory path string");
+            root_ok = false;
+        }
+        or {
+            val dec_r: str = uri_to_path(?s.ra, rstr);
+            if (dec_r == nil || !session.set_root(s, dec_r)) {
+                ok = write.simple_error(?inner, "bad_root", "root is not an existing directory");
+                root_ok = false;
+            }
+        }
+    }
+    if (root_ok) {
+        if (util.eq(name, "qark_apply") || util.eq(name, "qark_edit")) { ok = write.apply(s, args, ?inner); }
+        or (util.eq(name, "qark_read")) { ok = write.read(s, args, ?inner); }
+        or (util.eq(name, "qark_search")) { ok = write.search(s, args, ?inner); }
+        or (util.eq(name, "qark_impact")) { ok = write.impact(s, args, ?inner); }
+        or (util.eq(name, "qark_undo")) { ok = write.undo(s, args, ?inner); }
+        or (util.eq(name, "qark_check")) { ok = write.project_validate(s, args, ?inner); }
+        or (util.eq(name, "qark_templates")) { ok = write.templates(s, args, ?inner); }
+        or (util.eq(name, "qark_define_template")) { ok = write.define(s, args, ?inner); }
+        or { ret rpc_error(s, id, -32602, "unknown tool; call tools/list"); }
+    }
     if (inner.failed) { ret rpc_error(s, id, -32603, "out of memory while building the result"); }
     var w: jw.Jw = jw.init(?s.ra);
     open_reply(?w, id);
@@ -137,6 +232,129 @@ fun call_tool(s: *session.Session, id: *json.Value, params: *json.Value) res[str
     jw.key(?w, "structuredContent");
     jw.raw_vn(?w, inner.buf, inner.len);
     jw.f_bool(?w, "isError", !ok);
+    jw.obj_end(?w);
+    jw.obj_end(?w);
+    jw.byte(?w, '\n');
+    ret jw.take(?w, s.a);
+}
+
+fun read_resource(s: *session.Session, id: *json.Value, params: *json.Value) res[str, A.Error] {
+    val uri: str = field_text(?s.ra, params, "uri");
+    if (uri == nil) { ret rpc_error(s, id, -32602, "resources/read needs params.uri"); }
+    var inner: jw.Jw = jw.init(?s.ra);
+    var empty: json.Value;
+    empty.kind = json.OBJECT;
+    if (util.eq(uri, "qark://capabilities")) {
+        write.capabilities(s, ?inner);
+    }
+    or (util.eq(uri, "qark://schema")) {
+        write.schema(s, ?empty, ?inner);
+    }
+    or (util.eq(uri, "qark://undo")) {
+        val lparsed: res[json.Value, json.JsonError] = json.parse("{\"list\":true}", 13, ?s.ra);
+        var ldoc: json.Value;
+        ldoc.kind = json.OBJECT;
+        if (sel lparsed.ok) { ldoc = lparsed.ok; }
+        write.undo(s, ?ldoc, ?inner);
+    }
+    or (util.eq(uri, "qark://events")) {
+        write.events(s, ?empty, ?inner);
+    }
+    or {
+        ret rpc_error(s, id, -32602, "unknown resource uri; call resources/list");
+    }
+    if (inner.failed) { ret rpc_error(s, id, -32603, "out of memory while reading resource"); }
+    var w: jw.Jw = jw.init(?s.ra);
+    open_reply(?w, id);
+    jw.key(?w, "result");
+    jw.obj(?w);
+    jw.key(?w, "contents");
+    jw.arr(?w);
+    jw.obj(?w);
+    jw.f_str(?w, "uri", uri);
+    jw.f_str(?w, "mimeType", "application/json");
+    jw.key(?w, "text");
+    jw.str_n(?w, inner.buf, inner.len);
+    jw.obj_end(?w);
+    jw.arr_end(?w);
+    jw.obj_end(?w);
+    jw.obj_end(?w);
+    jw.byte(?w, '\n');
+    ret jw.take(?w, s.a);
+}
+
+fun get_prompt(s: *session.Session, id: *json.Value, params: *json.Value) res[str, A.Error] {
+    val name: str = field_text(?s.ra, params, "name");
+    if (name == nil) { ret rpc_error(s, id, -32602, "prompts/get needs params.name"); }
+    var args: *json.Value = nil;
+    val af: opt[*json.Value] = json.value_find(params, "arguments");
+    if (sel af.some) {
+        if (json.value_is_object(af.some)) { args = af.some; }
+    }
+    var desc: str = nil;
+    var text: str = nil;
+    if (util.eq(name, "qark-edit-symbol")) {
+        desc = "Surgical AST-aware symbol edit with scope contract";
+        var p: str = "<path>";
+        var sym: str = "<symbol>";
+        if (args != nil) {
+            val pv: str = field_text(?s.ra, args, "path");
+            val sv: str = field_text(?s.ra, args, "symbol");
+            if (pv != nil) { p = pv; }
+            if (sv != nil) { sym = sv; }
+        }
+        var tw: jw.Jw = jw.init(?s.ra);
+        jw.raw(?tw, "Use Qark to surgically edit symbol `");
+        jw.raw(?tw, sym);
+        jw.raw(?tw, "` in `");
+        jw.raw(?tw, p);
+        jw.raw(?tw, "`:\n1. Call `qark_read` with `{\"path\": \"");
+        jw.raw(?tw, p);
+        jw.raw(?tw, "\", \"symbol\": \"");
+        jw.raw(?tw, sym);
+        jw.raw(?tw, "\"}` to inspect the symbol and get the file's `sha256`.\n2. Call `qark_edit` with `{\"path\": \"");
+        jw.raw(?tw, p);
+        jw.raw(?tw, "\", \"symbol\": \"");
+        jw.raw(?tw, sym);
+        jw.raw(?tw, "\", \"body\": \"...\", \"contract\": {\"symbol\": \"");
+        jw.raw(?tw, sym);
+        jw.raw(?tw, "\", \"preserve_signatures\": true}}` to update only its body while guaranteeing no other symbols or signatures are touched.");
+        text = jw.text(?tw);
+    }
+    or (util.eq(name, "qark-refactor")) {
+        desc = "Safe multi-file refactoring using impact graph and atomic apply";
+        var sym: str = "<symbol>";
+        if (args != nil) {
+            val sv: str = field_text(?s.ra, args, "symbol");
+            if (sv != nil) { sym = sv; }
+        }
+        var tw: jw.Jw = jw.init(?s.ra);
+        jw.raw(?tw, "Use Qark to safely refactor `");
+        jw.raw(?tw, sym);
+        jw.raw(?tw, "` across the workspace:\n1. Call `qark_impact` with `{\"symbol\": \"");
+        jw.raw(?tw, sym);
+        jw.raw(?tw, "\"}` to discover all definitions, references, imports, dependents, and affected_files.\n2. Read the affected symbols with `qark_read` (`fold: true` or `symbols: [...]`).\n3. Apply all updates atomically in a single `qark_apply` (or `qark_edit` with `glob`) with `validate` set so any test or build failure rolls back automatically.");
+        text = jw.text(?tw);
+    }
+    or {
+        ret rpc_error(s, id, -32602, "unknown prompt name; call prompts/list");
+    }
+    var w: jw.Jw = jw.init(?s.ra);
+    open_reply(?w, id);
+    jw.key(?w, "result");
+    jw.obj(?w);
+    jw.f_str(?w, "description", desc);
+    jw.key(?w, "messages");
+    jw.arr(?w);
+    jw.obj(?w);
+    jw.f_str(?w, "role", "user");
+    jw.key(?w, "content");
+    jw.obj(?w);
+    jw.f_str(?w, "type", "text");
+    jw.f_str(?w, "text", text);
+    jw.obj_end(?w);
+    jw.obj_end(?w);
+    jw.arr_end(?w);
     jw.obj_end(?w);
     jw.obj_end(?w);
     jw.byte(?w, '\n');
@@ -167,20 +385,23 @@ pub fun handle(s: *session.Session, line: str) res[str, A.Error] {
         if (json.value_is_object(pf.some)) { params = pf.some; }
     }
     if (util.eq(method, "tools/call")) { ret call_tool(s, id, params); }
+    if (util.eq(method, "resources/read")) { ret read_resource(s, id, params); }
+    if (util.eq(method, "prompts/get")) { ret get_prompt(s, id, params); }
     var w: jw.Jw = jw.init(?s.ra);
     open_reply(?w, id);
     jw.key(?w, "result");
     if (util.eq(method, "initialize")) {
+        try_init_root(s, params);
         var version: str = field_text(?s.ra, params, "protocolVersion");
         if (version == nil || !known_version(version)) { version = LATEST; }
         jw.obj(?w);
         jw.f_str(?w, "protocolVersion", version);
         jw.key(?w, "capabilities");
-        jw.raw_v(?w, "{\"tools\":{\"listChanged\":false}}");
+        jw.raw_v(?w, "{\"tools\":{\"listChanged\":false},\"resources\":{\"listChanged\":false},\"prompts\":{\"listChanged\":false}}");
         jw.key(?w, "serverInfo");
         jw.obj(?w);
         jw.f_str(?w, "name", "qark");
-        jw.f_str(?w, "title", "Qark write layer");
+        jw.f_str(?w, "title", "Qark AST-Aware Transactional Write Layer");
         jw.f_str(?w, "version", spec.VERSION);
         jw.obj_end(?w);
         jw.f_str(?w, "instructions", INSTRUCTIONS);
@@ -193,8 +414,12 @@ pub fun handle(s: *session.Session, line: str) res[str, A.Error] {
         if (!tools_json(s, ?w)) { ret rpc_error(s, id, -32603, "the tool list could not be built"); }
         jw.obj_end(?w);
     }
-    or (util.eq(method, "resources/list")) { jw.raw_v(?w, "{\"resources\":[]}"); }
-    or (util.eq(method, "prompts/list")) { jw.raw_v(?w, "{\"prompts\":[]}"); }
+    or (util.eq(method, "resources/list")) {
+        jw.raw_v(?w, "{\"resources\":[{\"uri\":\"qark://capabilities\",\"name\":\"Qark Capabilities & Checkers\",\"description\":\"Supported features, AST edit modes, scope contract fields, languages, limits, and active syntax checkers.\",\"mimeType\":\"application/json\"},{\"uri\":\"qark://schema\",\"name\":\"Qark Operation Schemas\",\"description\":\"Machine-readable input and output schemas for all Qark operations.\",\"mimeType\":\"application/json\"},{\"uri\":\"qark://undo\",\"name\":\"Workspace Undo History\",\"description\":\"Persistent multi-file undo and redo transaction stack under .qark/undo.\",\"mimeType\":\"application/json\"},{\"uri\":\"qark://events\",\"name\":\"Workspace Transaction Journal\",\"description\":\"Recent atomic commit events recorded in .qark/journal.ndjson.\",\"mimeType\":\"application/json\"}]}");
+    }
+    or (util.eq(method, "prompts/list")) {
+        jw.raw_v(?w, "{\"prompts\":[{\"name\":\"qark-edit-symbol\",\"description\":\"Surgical AST-aware symbol edit with enforced scope contract\",\"arguments\":[{\"name\":\"path\",\"description\":\"File path to edit\",\"required\":true},{\"name\":\"symbol\",\"description\":\"Symbol name (e.g. function or Class.method)\",\"required\":true}]},{\"name\":\"qark-refactor\",\"description\":\"Safe multi-file refactoring using Qark impact graph and atomic apply\",\"arguments\":[{\"name\":\"symbol\",\"description\":\"Symbol name to trace and refactor\",\"required\":true}]}]}");
+    }
     or { ret rpc_error(s, id, -32601, "method not found"); }
     jw.obj_end(?w);
     jw.byte(?w, '\n');

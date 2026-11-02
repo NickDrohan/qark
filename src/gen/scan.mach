@@ -24,7 +24,6 @@ use commit: qark.gen.commit;
 use pathx: qark.gen.pathx;
 use jw: qark.rpc.jw;
 use re: qark.core.regex;
-use spec: qark.spec.spec;
 use util: qark.util;
 
 # directories the walk never enters unless the caller sets all
@@ -129,6 +128,15 @@ fun walk(a: *A.Allocator, root: str, dir_rel: str, o: *Opts, out: *vector.Vector
         val j: res[str, A.Error] = pathx.native(a, root, dir_rel);
         if (sel j.err) { ret; }
         full = j.ok;
+        if (depth == 0) {
+            val m0: res[filesystem.Metadata, io_error.Error] = filesystem.metadata_link(full);
+            if (sel m0.ok) {
+                if (m0.ok.kind == filesystem.KIND_FILE) {
+                    if (glob_ok(o.glob, dir_rel)) { vector.push[str](out, dir_rel); }
+                    ret;
+                }
+            }
+        }
     }
     val names: res[vector.Vector[str], filesystem.FsError] = filesystem.read_dir(a, full);
     if (sel names.err) { ret; }
@@ -289,6 +297,9 @@ fun grep_file(a: *A.Allocator, root: str, rel: str, o: *Opts, prog: *re.Prog, w:
         i = i + 1;
     }
     if (matches.len == 0) { ret 0; }
+    var syms: vector.Vector[Sym] = vector.init[Sym](a);
+    val olang: str = outline_lang(rel);
+    if (olang != nil) { collect_symbols(a, olang, p, n, ?syms); }
     var hex: [65]u8;
     commit.hash_hex(p, n, ?hex[0]);
     jw.obj(w);
@@ -301,9 +312,20 @@ fun grep_file(a: *A.Allocator, root: str, rel: str, o: *Opts, prog: *re.Prog, w:
     for (k < matches.len / 2 && @budget > 0) {
         val li: usize = matches.data[k * 2];
         val col: usize = matches.data[k * 2 + 1];
+        val ln1: i64 = (li + 1)::i64;
         jw.obj(w);
-        jw.f_i64(w, "line", (li + 1)::i64);
+        jw.f_i64(w, "line", ln1);
         jw.f_i64(w, "col", (col + 1)::i64);
+        var enc: i64 = -1;
+        var si: usize = 0;
+        for (si < syms.len) {
+            if (syms.data[si].line <= ln1 && ln1 <= syms.data[si].end) { enc = si::i64; }
+            si = si + 1;
+        }
+        if (enc >= 0) {
+            val es: *Sym = ?syms.data[enc::usize];
+            jw.f_strn(w, "symbol", es.name, es.name_n);
+        }
         var vn: usize = 0;
         val v: *u8 = view_fold(a, p, lines.data[li * 2], lines.data[li * 2 + 1], false, ?vn);
         jw.f_strn(w, "text", v, line_cut(v, vn));
@@ -401,12 +423,14 @@ pub fun run(a: *A.Allocator, root: str, o: *Opts, w: *jw.Jw) bool {
 
 # one named thing a file declares, for outline
 pub rec Sym {
-    name:   *u8;
-    name_n: usize;
-    kind:   str;
-    line:   i64;
-    end:    i64;
-    indent: i64;
+    name:      *u8;
+    name_n:    usize;
+    kind:      str;
+    line:      i64;
+    end:       i64;
+    sig_end:   i64;
+    dec_start: i64;
+    indent:    i64;
 }
 
 # locals are noise in an outline: val/var/variable only count at top level
@@ -418,6 +442,8 @@ fun push_sym(out: *vector.Vector[Sym], p: *u8, name_at: usize, name_n: usize, ki
     s.kind = kind;
     s.line = line;
     s.end = -1;
+    s.sig_end = line;
+    s.dec_start = line;
     s.indent = ind;
     vector.push[Sym](out, s);
 }
@@ -455,13 +481,72 @@ fun skip_ws_fwd(p: *u8, n: usize, i: usize) usize {
     ret j;
 }
 
-# python: [async] def name( / class name — indent ends the symbol
+fun py_step_triple(p: *u8, off: usize, n: usize, cur_triple: u8) u8 {
+    var st: u8 = cur_triple;
+    var i: usize = 0;
+    for (i < n) {
+        val c: u8 = p[off + i];
+        if (st == 0) {
+            if (c == '#') { ret 0; }
+            if (i + 2 < n && c == '"' && p[off + i + 1] == '"' && p[off + i + 2] == '"') {
+                st = 1;
+                i = i + 3;
+                cnt;
+            }
+            if (i + 2 < n && c == '\'' && p[off + i + 1] == '\'' && p[off + i + 2] == '\'') {
+                st = 2;
+                i = i + 3;
+                cnt;
+            }
+            if (c == '"' || c == '\'') {
+                val q: u8 = c;
+                i = i + 1;
+                for (i < n && p[off + i] != q && p[off + i] != '\n') {
+                    if (p[off + i] == '\\' && i + 1 < n) { i = i + 1; }
+                    i = i + 1;
+                }
+            }
+        }
+        or (st == 1) {
+            if (p[off + i] == '\\' && i + 1 < n) {
+                i = i + 2;
+                cnt;
+            }
+            if (i + 2 < n && c == '"' && p[off + i + 1] == '"' && p[off + i + 2] == '"') {
+                st = 0;
+                i = i + 3;
+                cnt;
+            }
+        }
+        or (st == 2) {
+            if (p[off + i] == '\\' && i + 1 < n) {
+                i = i + 2;
+                cnt;
+            }
+            if (i + 2 < n && c == '\'' && p[off + i + 1] == '\'' && p[off + i + 2] == '\'') {
+                st = 0;
+                i = i + 3;
+                cnt;
+            }
+        }
+        i = i + 1;
+    }
+    ret st;
+}
+
+# python: [async] def name( / class name — indent ends the symbol; ignores triple-quoted strings
 fun scan_python(p: *u8, lines: *vector.Vector[usize], out: *vector.Vector[Sym]) {
     val nl: usize = lines.len / 2;
     var i: usize = 0;
+    var in_triple: u8 = 0;
     for (i < nl) {
         val off: usize = lines.data[i * 2];
         val n: usize = lines.data[i * 2 + 1];
+        if (in_triple != 0) {
+            in_triple = py_step_triple(p, off, n, in_triple);
+            i = i + 1;
+            cnt;
+        }
         var j: usize = 0;
         for (j < n && (p[off + j] == ' ' || p[off + j] == '\t')) { j = j + 1; }
         val ind: i64 = j::i64;
@@ -486,6 +571,7 @@ fun scan_python(p: *u8, lines: *vector.Vector[usize], out: *vector.Vector[Sym]) 
             val wl: usize = word_len(p, off + n, k);
             if (wl > 0) { push_sym(out, p, k, wl, kind, (i + 1)::i64, ind); }
         }
+        in_triple = py_step_triple(p, off, n, 0);
         i = i + 1;
     }
 }
@@ -506,6 +592,10 @@ fun scan_mach(p: *u8, lines: *vector.Vector[usize], out: *vector.Vector[Sym]) {
         if (pubn > 0) { k = skip_ws_fwd(p, off + n, k + pubn); }
         var kk: usize = 0;
         for (kk < 10) {
+            if ((kk == 3 || kk == 4) && ind > 0 && pubn == 0) {
+                kk = kk + 1;
+                cnt;
+            }
             val kn: usize = kw(p, off + n, k, KEYWORDS[kk]);
             if (kn > 0) {
                 val name_at: usize = skip_ws_fwd(p, off + n, k + kn);
@@ -521,7 +611,7 @@ fun scan_mach(p: *u8, lines: *vector.Vector[usize], out: *vector.Vector[Sym]) {
     }
 }
 
-# javascript: function/class declarations and const/let/var bindings
+# javascript/typescript: function/class/interface/type/enum declarations and const/let/var bindings
 fun scan_js(p: *u8, lines: *vector.Vector[usize], out: *vector.Vector[Sym]) {
     val nl: usize = lines.len / 2;
     var i: usize = 0;
@@ -537,9 +627,9 @@ fun scan_js(p: *u8, lines: *vector.Vector[usize], out: *vector.Vector[Sym]) {
             k = skip_ws_fwd(p, off + n, k + kn);
             val dn: usize = kw(p, off + n, k, "default");
             if (dn > 0) { k = skip_ws_fwd(p, off + n, k + dn); }
-            kn = kw(p, off + n, k, "async");
-            if (kn > 0) { k = skip_ws_fwd(p, off + n, k + kn); }
         }
+        kn = kw(p, off + n, k, "async");
+        if (kn > 0) { k = skip_ws_fwd(p, off + n, k + kn); }
         var kind: str = nil;
         kn = kw(p, off + n, k, "function");
         if (kn > 0) {
@@ -554,18 +644,126 @@ fun scan_js(p: *u8, lines: *vector.Vector[usize], out: *vector.Vector[Sym]) {
                 k = skip_ws_fwd(p, off + n, k + kn);
             }
             or {
-                kn = kw(p, off + n, k, "const");
-                if (kn == 0) { kn = kw(p, off + n, k, "let"); }
-                if (kn == 0) { kn = kw(p, off + n, k, "var"); }
+                kn = kw(p, off + n, k, "interface");
                 if (kn > 0) {
-                    kind = "variable";
+                    kind = "interface";
                     k = skip_ws_fwd(p, off + n, k + kn);
+                }
+                or {
+                    kn = kw(p, off + n, k, "type");
+                    if (kn > 0) {
+                        kind = "type";
+                        k = skip_ws_fwd(p, off + n, k + kn);
+                    }
+                    or {
+                        kn = kw(p, off + n, k, "enum");
+                        if (kn > 0) {
+                            kind = "enum";
+                            k = skip_ws_fwd(p, off + n, k + kn);
+                        }
+                        or (ind == 0) {
+                            kn = kw(p, off + n, k, "const");
+                            if (kn == 0) { kn = kw(p, off + n, k, "let"); }
+                            if (kn == 0) { kn = kw(p, off + n, k, "var"); }
+                            if (kn > 0) {
+                                kind = "variable";
+                                k = skip_ws_fwd(p, off + n, k + kn);
+                            }
+                        }
+                    }
                 }
             }
         }
         if (kind != nil) {
             val wl: usize = word_len(p, off + n, k);
             if (wl > 0) { push_sym(out, p, k, wl, kind, (i + 1)::i64, ind); }
+        }
+        i = i + 1;
+    }
+}
+
+# rust: [pub] [async] [unsafe] fn|struct|enum|trait|mod|type|const|static name
+fun scan_rust(p: *u8, lines: *vector.Vector[usize], out: *vector.Vector[Sym]) {
+    val KEYWORDS: [8]str = [8]str{"fn", "struct", "enum", "trait", "mod", "type", "const", "static"};
+    val nl: usize = lines.len / 2;
+    var i: usize = 0;
+    for (i < nl) {
+        val off: usize = lines.data[i * 2];
+        val n: usize = lines.data[i * 2 + 1];
+        var j: usize = 0;
+        for (j < n && (p[off + j] == ' ' || p[off + j] == '\t')) { j = j + 1; }
+        val ind: i64 = j::i64;
+        var k: usize = off + j;
+        val pubn: usize = kw(p, off + n, k, "pub");
+        if (pubn > 0) {
+            k = k + pubn;
+            if (k < off + n && p[k] == '(') {
+                for (k < off + n && p[k] != ')') { k = k + 1; }
+                if (k < off + n) { k = k + 1; }
+            }
+            k = skip_ws_fwd(p, off + n, k);
+        }
+        val asn: usize = kw(p, off + n, k, "async");
+        if (asn > 0) { k = skip_ws_fwd(p, off + n, k + asn); }
+        val unsn: usize = kw(p, off + n, k, "unsafe");
+        if (unsn > 0) { k = skip_ws_fwd(p, off + n, k + unsn); }
+        var kk: usize = 0;
+        for (kk < 8) {
+            if ((kk == 6 || kk == 7) && ind > 0 && pubn == 0) {
+                kk = kk + 1;
+                cnt;
+            }
+            val kn: usize = kw(p, off + n, k, KEYWORDS[kk]);
+            if (kn > 0) {
+                val name_at: usize = skip_ws_fwd(p, off + n, k + kn);
+                val wl: usize = word_len(p, off + n, name_at);
+                if (wl > 0) {
+                    var kind: str = KEYWORDS[kk];
+                    if (kk == 0) { kind = "function"; }
+                    push_sym(out, p, name_at, wl, kind, (i + 1)::i64, ind);
+                    kk = 8;
+                }
+            }
+            kk = kk + 1;
+        }
+        i = i + 1;
+    }
+}
+
+# go: func [(recv)] name and type name
+fun scan_go(p: *u8, lines: *vector.Vector[usize], out: *vector.Vector[Sym]) {
+    val nl: usize = lines.len / 2;
+    var i: usize = 0;
+    for (i < nl) {
+        val off: usize = lines.data[i * 2];
+        val n: usize = lines.data[i * 2 + 1];
+        var j: usize = 0;
+        for (j < n && (p[off + j] == ' ' || p[off + j] == '\t')) { j = j + 1; }
+        val ind: i64 = j::i64;
+        var k: usize = off + j;
+        var kn: usize = kw(p, off + n, k, "func");
+        if (kn > 0) {
+            k = skip_ws_fwd(p, off + n, k + kn);
+            if (k < off + n && p[k] == '(') {
+                var depth: i64 = 1;
+                k = k + 1;
+                for (k < off + n && depth > 0) {
+                    if (p[k] == '(') { depth = depth + 1; }
+                    or (p[k] == ')') { depth = depth - 1; }
+                    k = k + 1;
+                }
+                k = skip_ws_fwd(p, off + n, k);
+            }
+            val wl: usize = word_len(p, off + n, k);
+            if (wl > 0) { push_sym(out, p, k, wl, "function", (i + 1)::i64, ind); }
+        }
+        or {
+            kn = kw(p, off + n, k, "type");
+            if (kn > 0) {
+                k = skip_ws_fwd(p, off + n, k + kn);
+                val wl: usize = word_len(p, off + n, k);
+                if (wl > 0) { push_sym(out, p, k, wl, "type", (i + 1)::i64, ind); }
+            }
         }
         i = i + 1;
     }
@@ -630,40 +828,387 @@ fun scan_toml(p: *u8, lines: *vector.Vector[usize], out: *vector.Vector[Sym]) {
     }
 }
 
+fun line_is_blank(p: *u8, lines: *vector.Vector[usize], ln1: i64) bool {
+    if (ln1 < 1 || ln1::usize > lines.len / 2) { ret true; }
+    val idx: usize = (ln1 - 1)::usize;
+    val off: usize = lines.data[idx * 2];
+    val n: usize = lines.data[idx * 2 + 1];
+    var j: usize = 0;
+    for (j < n) {
+        val c: u8 = p[off + j];
+        if (c != ' ' && c != '\t' && c != '\r' && c != '\n') { ret false; }
+        j = j + 1;
+    }
+    ret true;
+}
+
+fun line_is_preamble(p: *u8, lines: *vector.Vector[usize], ln1: i64) bool {
+    if (ln1 < 1 || ln1::usize > lines.len / 2) { ret false; }
+    val idx: usize = (ln1 - 1)::usize;
+    val off: usize = lines.data[idx * 2];
+    val n: usize = lines.data[idx * 2 + 1];
+    var j: usize = 0;
+    for (j < n && (p[off + j] == ' ' || p[off + j] == '\t')) { j = j + 1; }
+    if (j >= n) { ret false; }
+    if (p[off + j] == '#' || p[off + j] == '@') { ret true; }
+    if (j + 1 < n && p[off + j] == '/' && p[off + j + 1] == '/') { ret true; }
+    ret false;
+}
+
+fun has_ext(rel: str, ext: str) bool {
+    if (rel == nil) { ret false; }
+    val rn: usize = str_len(rel);
+    val en: usize = str_len(ext);
+    if (rn < en) { ret false; }
+    var i: usize = 0;
+    for (i < en) {
+        var c: u8 = rel[rn - en + i];
+        if (c >= 'A' && c <= 'Z') { c = c + 32; }
+        if (c != ext[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+pub fun outline_lang(rel: str) str {
+    if (has_ext(rel, ".py") || has_ext(rel, ".pyw")) { ret "python"; }
+    if (has_ext(rel, ".mach")) { ret "mach"; }
+    if (has_ext(rel, ".js") || has_ext(rel, ".mjs") || has_ext(rel, ".cjs") || has_ext(rel, ".ts") || has_ext(rel, ".tsx") || has_ext(rel, ".jsx")) { ret "node"; }
+    if (has_ext(rel, ".ps1") || has_ext(rel, ".psm1")) { ret "powershell"; }
+    if (has_ext(rel, ".sh") || has_ext(rel, ".bash")) { ret "bash"; }
+    if (has_ext(rel, ".toml")) { ret "toml"; }
+    if (has_ext(rel, ".rs")) { ret "rust"; }
+    if (has_ext(rel, ".go")) { ret "go"; }
+    ret nil;
+}
+
+fun line_is_decorator(p: *u8, lines: *vector.Vector[usize], ln1: i64, expect_ind: i64) bool {
+    if (ln1 < 1 || ln1::usize > lines.len / 2) { ret false; }
+    val idx: usize = (ln1 - 1)::usize;
+    val off: usize = lines.data[idx * 2];
+    val n: usize = lines.data[idx * 2 + 1];
+    var j: usize = 0;
+    for (j < n && (p[off + j] == ' ' || p[off + j] == '\t')) { j = j + 1; }
+    if (j >= n || j::i64 != expect_ind) { ret false; }
+    if (p[off + j] == '@') { ret true; }
+    if (j + 1 < n && p[off + j] == '#' && p[off + j + 1] == '[') { ret true; }
+    ret false;
+}
+
+fun refine_python_sym(p: *u8, lines: *vector.Vector[usize], s: *Sym, max_end: i64) {
+    var d: i64 = s.line;
+    for (d > 1 && line_is_decorator(p, lines, d - 1, s.indent)) { d = d - 1; }
+    s.dec_start = d;
+    var pdepth: i64 = 0;
+    var sig: i64 = s.line;
+    var ln: i64 = s.line;
+    for (ln <= max_end) {
+        val idx: usize = (ln - 1)::usize;
+        val off: usize = lines.data[idx * 2];
+        val n: usize = lines.data[idx * 2 + 1];
+        var j: usize = 0;
+        var saw_colon: bool = false;
+        for (j < n) {
+            val c: u8 = p[off + j];
+            if (c == '#') { brk; }
+            if (c == '"' || c == '\'') {
+                val q: u8 = c;
+                j = j + 1;
+                for (j < n && p[off + j] != q) {
+                    if (p[off + j] == '\\' && j + 1 < n) { j = j + 1; }
+                    j = j + 1;
+                }
+            }
+            or (c == '(' || c == '[' || c == '{') { pdepth = pdepth + 1; }
+            or (c == ')' || c == ']' || c == '}') {
+                if (pdepth > 0) { pdepth = pdepth - 1; }
+            }
+            or (c == ':' && pdepth == 0) { saw_colon = true; }
+            j = j + 1;
+        }
+        if (pdepth == 0 && saw_colon) {
+            sig = ln;
+            brk;
+        }
+        ln = ln + 1;
+    }
+    s.sig_end = sig;
+    var in_triple: u8 = 0;
+    var bdepth: i64 = 0;
+    ln = sig + 1;
+    var end: i64 = max_end;
+    for (ln <= max_end) {
+        val idx: usize = (ln - 1)::usize;
+        val off: usize = lines.data[idx * 2];
+        val n: usize = lines.data[idx * 2 + 1];
+        if (in_triple != 0) {
+            in_triple = py_step_triple(p, off, n, in_triple);
+            ln = ln + 1;
+            cnt;
+        }
+        var j: usize = 0;
+        for (j < n && (p[off + j] == ' ' || p[off + j] == '\t')) { j = j + 1; }
+        var rem: usize = n - j;
+        for (rem > 0 && (p[off + j + rem - 1] == '\n' || p[off + j + rem - 1] == '\r')) { rem = rem - 1; }
+        if (rem > 0 && p[off + j] != '#') {
+            if (bdepth == 0 && j::i64 <= s.indent) {
+                end = ln - 1;
+                brk;
+            }
+        }
+        var k: usize = j;
+        for (k < n) {
+            val c: u8 = p[off + k];
+            if (c == '#') { brk; }
+            if (k + 2 < n && ((c == '"' && p[off + k + 1] == '"' && p[off + k + 2] == '"') || (c == '\'' && p[off + k + 1] == '\'' && p[off + k + 2] == '\''))) {
+                k = n;
+                brk;
+            }
+            if (c == '"' || c == '\'') {
+                val q: u8 = c;
+                k = k + 1;
+                for (k < n && p[off + k] != q) {
+                    if (p[off + k] == '\\' && k + 1 < n) { k = k + 1; }
+                    k = k + 1;
+                }
+            }
+            or (c == '(' || c == '[' || c == '{') { bdepth = bdepth + 1; }
+            or (c == ')' || c == ']' || c == '}') {
+                if (bdepth > 0) { bdepth = bdepth - 1; }
+            }
+            k = k + 1;
+        }
+        in_triple = py_step_triple(p, off, n, 0);
+        ln = ln + 1;
+    }
+    for (end > s.line && (line_is_blank(p, lines, end) || line_is_preamble(p, lines, end))) { end = end - 1; }
+    if (end < s.line) { end = s.line; }
+    s.end = end;
+}
+
+fun refine_brace_sym(p: *u8, lines: *vector.Vector[usize], s: *Sym, max_end: i64, hash_comment: bool) {
+    var d: i64 = s.line;
+    for (d > 1 && line_is_decorator(p, lines, d - 1, s.indent)) { d = d - 1; }
+    s.dec_start = d;
+    var bdepth: i64 = 0;
+    var saw_open: bool = false;
+    var in_block_comment: bool = false;
+    var ln: i64 = s.line;
+    var end: i64 = max_end;
+    var sig: i64 = s.line;
+    for (ln <= max_end) {
+        val idx: usize = (ln - 1)::usize;
+        val off: usize = lines.data[idx * 2];
+        val n: usize = lines.data[idx * 2 + 1];
+        var j: usize = 0;
+        var saw_semi: bool = false;
+        for (j < n) {
+            val c: u8 = p[off + j];
+            if (in_block_comment) {
+                if (j + 1 < n && c == '*' && p[off + j + 1] == '/') {
+                    in_block_comment = false;
+                    j = j + 2;
+                    cnt;
+                }
+                j = j + 1;
+                cnt;
+            }
+            if (hash_comment && c == '#') { brk; }
+            if (!hash_comment && j + 1 < n && c == '/' && p[off + j + 1] == '/') { brk; }
+            if (!hash_comment && j + 1 < n && c == '/' && p[off + j + 1] == '*') {
+                in_block_comment = true;
+                j = j + 2;
+                cnt;
+            }
+            if (c == '"' || c == '\'' || c == '`') {
+                val q: u8 = c;
+                j = j + 1;
+                for (j < n && p[off + j] != q) {
+                    if (p[off + j] == '\\' && j + 1 < n) { j = j + 1; }
+                    j = j + 1;
+                }
+            }
+            or (c == '{') {
+                if (!saw_open) {
+                    saw_open = true;
+                    sig = ln;
+                }
+                bdepth = bdepth + 1;
+            }
+            or (c == '}') {
+                if (bdepth > 0) { bdepth = bdepth - 1; }
+                if (saw_open && bdepth == 0) {
+                    end = ln;
+                    s.sig_end = sig;
+                    s.end = end;
+                    ret;
+                }
+            }
+            or (c == ';' && !saw_open) {
+                saw_semi = true;
+            }
+            j = j + 1;
+        }
+        if (!saw_open && saw_semi) {
+            s.sig_end = ln;
+            s.end = ln;
+            ret;
+        }
+        ln = ln + 1;
+    }
+    s.sig_end = sig;
+    for (end > s.line && (line_is_blank(p, lines, end) || line_is_preamble(p, lines, end))) { end = end - 1; }
+    if (end < s.line) { end = s.line; }
+    s.end = end;
+}
+
+pub fun collect_symbols(a: *A.Allocator, lang: str, p: *u8, n: usize, syms: *vector.Vector[Sym]) {
+    var lines: vector.Vector[usize] = vector.init[usize](a);
+    split_lines(p, n, ?lines);
+    if (util.eq(lang, "python")) { scan_python(p, ?lines, syms); }
+    or (util.eq(lang, "mach")) { scan_mach(p, ?lines, syms); }
+    or (util.eq(lang, "node") || util.eq(lang, "javascript") || util.eq(lang, "typescript")) { scan_js(p, ?lines, syms); }
+    or (util.eq(lang, "powershell")) { scan_shell(p, ?lines, syms, false); }
+    or (util.eq(lang, "bash")) { scan_shell(p, ?lines, syms, true); }
+    or (util.eq(lang, "toml")) { scan_toml(p, ?lines, syms); }
+    or (util.eq(lang, "rust")) { scan_rust(p, ?lines, syms); }
+    or (util.eq(lang, "go")) { scan_go(p, ?lines, syms); }
+    val nl: i64 = (lines.len / 2)::i64;
+    val is_py: bool = util.eq(lang, "python");
+    val is_toml: bool = util.eq(lang, "toml");
+    val hash_cmt: bool = util.eq(lang, "mach") || util.eq(lang, "powershell") || util.eq(lang, "bash");
+    var i: usize = 0;
+    for (i < syms.len) {
+        var j: usize = i + 1;
+        var end: i64 = nl;
+        var next_sym: bool = false;
+        for (j < syms.len) {
+            if (syms.data[j].indent <= syms.data[i].indent) {
+                end = syms.data[j].line - 1;
+                next_sym = true;
+                j = syms.len;
+            }
+            j = j + 1;
+        }
+        if (next_sym) {
+            for (end > syms.data[i].line && line_is_preamble(p, ?lines, end)) { end = end - 1; }
+        }
+        for (end > syms.data[i].line && line_is_blank(p, ?lines, end)) { end = end - 1; }
+        if (end < syms.data[i].line) { end = syms.data[i].line; }
+        syms.data[i].end = end;
+        if (is_py) {
+            refine_python_sym(p, ?lines, ?syms.data[i], end);
+        }
+        or (!is_toml) {
+            refine_brace_sym(p, ?lines, ?syms.data[i], end, hash_cmt);
+        }
+        i = i + 1;
+    }
+}
+
+fun sym_name_eq(s: *Sym, name: *u8, n: usize) bool {
+    if (s.name_n != n) { ret false; }
+    var i: usize = 0;
+    for (i < n) {
+        if (s.name[i] != name[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# 1 found uniquely, 0 not found, 2 ambiguous
+pub fun find_symbol_ext(a: *A.Allocator, lang: str, p: *u8, n: usize, sym_name: *u8, sym_n: usize, out_sym: *Sym) i64 {
+    if (lang == nil || sym_name == nil || sym_n == 0) { ret 0; }
+    var syms: vector.Vector[Sym] = vector.init[Sym](a);
+    collect_symbols(a, lang, p, n, ?syms);
+    if (syms.len == 0) { ret 0; }
+    var dot: usize = sym_n;
+    if (!util.eq(lang, "toml")) {
+        var d: usize = 0;
+        for (d < sym_n) {
+            if (sym_name[d] == '.') {
+                dot = d;
+                brk;
+            }
+            d = d + 1;
+        }
+    }
+    var min_line: i64 = 1;
+    var max_line: i64 = 2147483647;
+    var target: *u8 = sym_name;
+    var target_n: usize = sym_n;
+    if (dot < sym_n) {
+        var found_parent: bool = false;
+        var pi: usize = 0;
+        for (pi < syms.len) {
+            if (sym_name_eq(?syms.data[pi], sym_name, dot)) {
+                min_line = syms.data[pi].line;
+                max_line = syms.data[pi].end;
+                found_parent = true;
+                brk;
+            }
+            pi = pi + 1;
+        }
+        if (!found_parent) { ret 0; }
+        target = (sym_name::usize + dot + 1)::*u8;
+        target_n = sym_n - dot - 1;
+    }
+    var hits: i64 = 0;
+    var i: usize = 0;
+    for (i < syms.len) {
+        val s: *Sym = ?syms.data[i];
+        if (s.line >= min_line && s.line <= max_line && sym_name_eq(s, target, target_n)) {
+            if (hits == 0) {
+                @out_sym = @s;
+            }
+            hits = hits + 1;
+        }
+        i = i + 1;
+    }
+    if (hits == 1) { ret 1; }
+    if (hits > 1) { ret 2; }
+    ret 0;
+}
+
+# 1 found uniquely, 0 not found, 2 ambiguous
+pub fun find_symbol(a: *A.Allocator, lang: str, p: *u8, n: usize, sym_name: *u8, sym_n: usize, lo_line: *i64, hi_line: *i64) i64 {
+    var s: Sym;
+    val r: i64 = find_symbol_ext(a, lang, p, n, sym_name, sym_n, ?s);
+    if (r == 1) {
+        @lo_line = s.line;
+        @hi_line = s.end;
+    }
+    ret r;
+}
+
+pub fun list_symbol_names(a: *A.Allocator, lang: str, p: *u8, n: usize) str {
+    if (lang == nil) { ret "(none)"; }
+    var syms: vector.Vector[Sym] = vector.init[Sym](a);
+    collect_symbols(a, lang, p, n, ?syms);
+    if (syms.len == 0) { ret "(none)"; }
+    var w: jw.Jw = jw.init(a);
+    var i: usize = 0;
+    for (i < syms.len && i < 16) {
+        if (i > 0) { jw.raw(?w, ", "); }
+        jw.bytes(?w, syms.data[i].name, syms.data[i].name_n);
+        i = i + 1;
+    }
+    if (syms.len > 16) { jw.raw(?w, ", ..."); }
+    if (w.failed || w.buf == nil) { ret "(none)"; }
+    ret w.buf;
+}
+
 # emit the outline of one file's bytes for its checker language; mach included
 # ---
 # symbols carry the lines the symbol covers so a caller can read or edit
 # exactly it; end is the line before the next same-or-shallower symbol, or
 # the file's last line
 pub fun outline(a: *A.Allocator, lang: str, p: *u8, n: usize, w: *jw.Jw) {
-    var lines: vector.Vector[usize] = vector.init[usize](a);
-    split_lines(p, n, ?lines);
     var syms: vector.Vector[Sym] = vector.init[Sym](a);
-    if (util.eq(lang, "python")) { scan_python(p, ?lines, ?syms); }
-    or (util.eq(lang, "mach")) { scan_mach(p, ?lines, ?syms); }
-    or (util.eq(lang, "node")) { scan_js(p, ?lines, ?syms); }
-    or (util.eq(lang, "powershell")) { scan_shell(p, ?lines, ?syms, false); }
-    or (util.eq(lang, "bash")) { scan_shell(p, ?lines, ?syms, true); }
-    or (util.eq(lang, "toml")) { scan_toml(p, ?lines, ?syms); }
-    val nl: i64 = (lines.len / 2)::i64;
-    var i: usize = 0;
-    for (i < syms.len) {
-        var j: usize = i + 1;
-        var end: i64 = nl;
-        for (j < syms.len) {
-            if (syms.data[j].indent <= syms.data[i].indent) {
-                end = syms.data[j].line - 1;
-                j = syms.len;
-            }
-            j = j + 1;
-        }
-        if (end < syms.data[i].line) { end = syms.data[i].line; }
-        syms.data[i].end = end;
-        i = i + 1;
-    }
+    collect_symbols(a, lang, p, n, ?syms);
     jw.key(w, "symbols");
     jw.arr(w);
-    i = 0;
+    var i: usize = 0;
     for (i < syms.len) {
         jw.obj(w);
         jw.f_i64(w, "line", syms.data[i].line);
@@ -675,6 +1220,504 @@ pub fun outline(a: *A.Allocator, lang: str, p: *u8, n: usize, w: *jw.Jw) {
         i = i + 1;
     }
     jw.arr_end(w);
+}
+
+# collect workspace-relative paths matching a glob pattern
+pub fun glob_files(a: *A.Allocator, root: str, glob: str, out: *vector.Vector[str]) {
+    var o: Opts;
+    o.pat = nil;
+    o.patn = 0;
+    o.is_re = false;
+    o.icase = false;
+    o.glob = glob;
+    o.path = nil;
+    o.ctx = 0;
+    o.max = 0;
+    o.max_files = 1024;
+    o.all = false;
+    walk(a, root, nil, ?o, out, 0);
+    sort_rels(out);
+}
+
+fun is_foldable_kind(k: str) bool {
+    if (k == nil) { ret false; }
+    ret util.eq(k, "function") || util.eq(k, "fun") || util.eq(k, "pub fun") || util.eq(k, "def") || util.eq(k, "fn") || util.eq(k, "pub fn") || util.eq(k, "func");
+}
+
+# build a signature-folded view of the file, keeping full bodies for any symbols in keep_syms
+pub fun fold_view(a: *A.Allocator, lang: str, p: *u8, n: usize, keep_syms: *vector.Vector[str], out_len: *usize) *u8 {
+    @out_len = n;
+    if (lang == nil || n == 0) { ret p; }
+    var syms: vector.Vector[Sym] = vector.init[Sym](a);
+    collect_symbols(a, lang, p, n, ?syms);
+    if (syms.len == 0) { ret p; }
+    var lines: vector.Vector[usize] = vector.init[usize](a);
+    split_lines(p, n, ?lines);
+    val nl: usize = lines.len / 2;
+    if (nl == 0) { ret p; }
+    var w: jw.Jw = jw.init(a);
+    var li: usize = 0;
+    for (li < nl) {
+        val ln1: i64 = (li + 1)::i64;
+        var fold_sym: i64 = -1;
+        var si: usize = 0;
+        for (si < syms.len) {
+            val s: *Sym = ?syms.data[si];
+            if (s.line == ln1 && s.end >= s.line + 2 && is_foldable_kind(s.kind)) {
+                var kept: bool = false;
+                if (keep_syms != nil) {
+                    var ki: usize = 0;
+                    for (ki < keep_syms.len) {
+                        val kn: str = keep_syms.data[ki];
+                        val knn: usize = str_len(kn);
+                        if (sym_name_eq(s, kn, knn)) {
+                            kept = true;
+                            brk;
+                        }
+                        var slo: i64 = 0;
+                        var shi: i64 = 0;
+                        if (find_symbol(a, lang, p, n, kn, knn, ?slo, ?shi) == 1 && slo == s.line && shi == s.end) {
+                            kept = true;
+                            brk;
+                        }
+                        ki = ki + 1;
+                    }
+                }
+                if (!kept) {
+                    fold_sym = si::i64;
+                    brk;
+                }
+            }
+            si = si + 1;
+        }
+        val off: usize = lines.data[li * 2];
+        val len: usize = lines.data[li * 2 + 1];
+        jw.bytes(?w, (p::usize + off)::*u8, len);
+        if (li + 1 < nl || (off + len < n && p[off + len] == '\n')) {
+            if (off + len > 0 && off + len <= n && p[off + len - 1] == '\r') { jw.byte(?w, '\n'); }
+            or (off + len < n && p[off + len] == '\n') { jw.byte(?w, '\n'); }
+        }
+        if (fold_sym >= 0) {
+            val fs: *Sym = ?syms.data[fold_sym::usize];
+            var ind: i64 = 0;
+            for (ind < fs.indent + 4) {
+                jw.byte(?w, ' ');
+                ind = ind + 1;
+            }
+            jw.raw(?w, "# ... [lines ");
+            var nb: [24]u8;
+            val n1: usize = util.fmt_i64(?nb[0], 24, fs.line + 1);
+            jw.bytes(?w, ?nb[0], n1);
+            jw.byte(?w, '-');
+            val n2: usize = util.fmt_i64(?nb[0], 24, fs.end);
+            jw.bytes(?w, ?nb[0], n2);
+            jw.raw(?w, " folded: ");
+            jw.bytes(?w, fs.name, fs.name_n);
+            jw.raw(?w, "]\n");
+            li = fs.end::usize;
+            cnt;
+        }
+        li = li + 1;
+    }
+    if (w.failed || w.buf == nil) { ret p; }
+    @out_len = w.len;
+    ret w.buf;
+}
+
+fun span_bytes(p: *u8, n: usize, lines: *vector.Vector[usize], lo: i64, hi: i64, out_p: **u8, out_n: *usize) {
+    val nl: i64 = (lines.len / 2)::i64;
+    if (lo < 1 || hi < lo || lo > nl) {
+        @out_p = p;
+        @out_n = 0;
+        ret;
+    }
+    var h: i64 = hi;
+    if (h > nl) { h = nl; }
+    val start: usize = lines.data[(lo - 1)::usize * 2];
+    val last_idx: usize = (h - 1)::usize;
+    val end: usize = lines.data[last_idx * 2] + lines.data[last_idx * 2 + 1];
+    if (end <= start || end > n) {
+        @out_p = p;
+        @out_n = 0;
+        ret;
+    }
+    @out_p = (p::usize + start)::*u8;
+    @out_n = end - start;
+}
+
+fun bytes_eq(a: *u8, an: usize, b: *u8, bn: usize) bool {
+    if (an != bn) { ret false; }
+    var i: usize = 0;
+    for (i < an) {
+        if (a[i] != b[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+# emit semantic symbol-level diff between old_p and new_p into w under "semantic"
+pub fun semantic_diff(a: *A.Allocator, lang: str, old_p: *u8, old_n: usize, new_p: *u8, new_n: usize, w: *jw.Jw) {
+    if (lang == nil) { ret; }
+    var old_syms: vector.Vector[Sym] = vector.init[Sym](a);
+    var new_syms: vector.Vector[Sym] = vector.init[Sym](a);
+    var old_lines: vector.Vector[usize] = vector.init[usize](a);
+    var new_lines: vector.Vector[usize] = vector.init[usize](a);
+    if (old_p != nil && old_n > 0) {
+        collect_symbols(a, lang, old_p, old_n, ?old_syms);
+        split_lines(old_p, old_n, ?old_lines);
+    }
+    if (new_p != nil && new_n > 0) {
+        collect_symbols(a, lang, new_p, new_n, ?new_syms);
+        split_lines(new_p, new_n, ?new_lines);
+    }
+    if (old_syms.len == 0 && new_syms.len == 0) { ret; }
+    jw.key(w, "semantic");
+    jw.obj(w);
+    jw.key(w, "added");
+    jw.arr(w);
+    var ni: usize = 0;
+    for (ni < new_syms.len) {
+        val ns: *Sym = ?new_syms.data[ni];
+        var found: bool = false;
+        var oi: usize = 0;
+        for (oi < old_syms.len) {
+            if (sym_name_eq(?old_syms.data[oi], ns.name, ns.name_n) && util.eq(old_syms.data[oi].kind, ns.kind)) {
+                found = true;
+                brk;
+            }
+            oi = oi + 1;
+        }
+        if (!found) {
+            jw.obj(w);
+            jw.f_strn(w, "name", ns.name, ns.name_n);
+            jw.f_str(w, "kind", ns.kind);
+            jw.f_i64(w, "line", ns.line);
+            jw.f_i64(w, "end", ns.end);
+            jw.obj_end(w);
+        }
+        ni = ni + 1;
+    }
+    jw.arr_end(w);
+    jw.key(w, "modified");
+    jw.arr(w);
+    ni = 0;
+    for (ni < new_syms.len) {
+        val ns: *Sym = ?new_syms.data[ni];
+        var oi: usize = 0;
+        for (oi < old_syms.len) {
+            val os: *Sym = ?old_syms.data[oi];
+            if (sym_name_eq(os, ns.name, ns.name_n) && util.eq(os.kind, ns.kind)) {
+                var osp: *u8 = nil;
+                var osn: usize = 0;
+                var nsp: *u8 = nil;
+                var nsn: usize = 0;
+                span_bytes(old_p, old_n, ?old_lines, os.line, os.end, ?osp, ?osn);
+                span_bytes(new_p, new_n, ?new_lines, ns.line, ns.end, ?nsp, ?nsn);
+                if (!bytes_eq(osp, osn, nsp, nsn)) {
+                    var osig_p: *u8 = nil;
+                    var osig_n: usize = 0;
+                    var nsig_p: *u8 = nil;
+                    var nsig_n: usize = 0;
+                    span_bytes(old_p, old_n, ?old_lines, os.line, os.sig_end, ?osig_p, ?osig_n);
+                    span_bytes(new_p, new_n, ?new_lines, ns.line, ns.sig_end, ?nsig_p, ?nsig_n);
+                    val sig_changed: bool = !bytes_eq(osig_p, osig_n, nsig_p, nsig_n);
+                    jw.obj(w);
+                    jw.f_strn(w, "name", ns.name, ns.name_n);
+                    jw.f_str(w, "kind", ns.kind);
+                    jw.f_i64(w, "line", ns.line);
+                    jw.f_i64(w, "end", ns.end);
+                    jw.f_bool(w, "signature_changed", sig_changed);
+                    jw.obj_end(w);
+                }
+                brk;
+            }
+            oi = oi + 1;
+        }
+        ni = ni + 1;
+    }
+    jw.arr_end(w);
+    jw.key(w, "removed");
+    jw.arr(w);
+    var oi: usize = 0;
+    for (oi < old_syms.len) {
+        val os: *Sym = ?old_syms.data[oi];
+        var found: bool = false;
+        ni = 0;
+        for (ni < new_syms.len) {
+            if (sym_name_eq(?new_syms.data[ni], os.name, os.name_n) && util.eq(new_syms.data[ni].kind, os.kind)) {
+                found = true;
+                brk;
+            }
+            ni = ni + 1;
+        }
+        if (!found) {
+            jw.obj(w);
+            jw.f_strn(w, "name", os.name, os.name_n);
+            jw.f_str(w, "kind", os.kind);
+            jw.f_i64(w, "line", os.line);
+            jw.f_i64(w, "end", os.end);
+            jw.obj_end(w);
+        }
+        oi = oi + 1;
+    }
+    jw.arr_end(w);
+    jw.obj_end(w);
+}
+
+fun has_str(v: *vector.Vector[str], s: str) bool {
+    var i: usize = 0;
+    for (i < v.len) {
+        if (util.eq(v.data[i], s)) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+fun extract_imports(a: *A.Allocator, p: *u8, lines: *vector.Vector[usize], out: *vector.Vector[str]) {
+    val nl: usize = lines.len / 2;
+    var i: usize = 0;
+    for (i < nl) {
+        val off: usize = lines.data[i * 2];
+        val n: usize = lines.data[i * 2 + 1];
+        var j: usize = 0;
+        for (j < n && (p[off + j] == ' ' || p[off + j] == '\t')) { j = j + 1; }
+        val k: usize = off + j;
+        var kn: usize = kw(p, off + n, k, "import");
+        if (kn == 0) { kn = kw(p, off + n, k, "from"); }
+        if (kn == 0) { kn = kw(p, off + n, k, "use"); }
+        if (kn > 0) {
+            var st: usize = skip_ws_fwd(p, off + n, k + kn);
+            var en: usize = st;
+            for (en < off + n && p[en] != ' ' && p[en] != '\t' && p[en] != ';' && p[en] != '\r' && p[en] != '\n' && p[en] != ':') {
+                en = en + 1;
+            }
+            if (en == off + n || p[en] == ':') {
+                if (en < off + n && p[en] == ':') {
+                    st = skip_ws_fwd(p, off + n, en + 1);
+                    en = st;
+                    for (en < off + n && p[en] != ' ' && p[en] != '\t' && p[en] != ';' && p[en] != '\r' && p[en] != '\n') {
+                        en = en + 1;
+                    }
+                }
+            }
+            if (en > st) {
+                val dup: res[str, A.Error] = util.dup_n(a, (p::usize + st)::*u8, en - st);
+                if (sel dup.ok) {
+                    if (!has_str(out, dup.ok)) { vector.push[str](out, dup.ok); }
+                }
+            }
+        }
+        i = i + 1;
+    }
+}
+
+fun find_word_col(p: *u8, off: usize, n: usize, w: *u8, wn: usize) i64 {
+    if (wn == 0 || n < wn) { ret -1; }
+    var i: usize = 0;
+    for (i + wn <= n) {
+        if ((i == 0 || !ident_byte(p[off + i - 1])) && (i + wn == n || !ident_byte(p[off + i + wn]))) {
+            var ok: bool = true;
+            var j: usize = 0;
+            for (j < wn) {
+                if (p[off + i + j] != w[j]) {
+                    ok = false;
+                    brk;
+                }
+                j = j + 1;
+            }
+            if (ok) { ret (i + 1)::i64; }
+        }
+        i = i + 1;
+    }
+    ret -1;
+}
+
+fun stem_of(a: *A.Allocator, rel: str) str {
+    if (rel == nil) { ret ""; }
+    val n: usize = str_len(rel);
+    var base: usize = 0;
+    var dot: usize = n;
+    var i: usize = 0;
+    for (i < n) {
+        if (rel[i] == '/') { base = i + 1; }
+        i = i + 1;
+    }
+    i = base;
+    for (i < n) {
+        if (rel[i] == '.') { dot = i; }
+        i = i + 1;
+    }
+    if (dot <= base) { dot = n; }
+    val d: res[str, A.Error] = util.dup_n(a, (rel::usize + base)::*u8, dot - base);
+    if (sel d.ok) { ret d.ok; }
+    ret rel;
+}
+
+# build a resolved reference and impact graph for a symbol and/or file path across the workspace
+pub fun impact_graph(a: *A.Allocator, root: str, sym_name: *u8, sym_n: usize, target_path: str, glob: str, w: *jw.Jw) bool {
+    var files: vector.Vector[str] = vector.init[str](a);
+    glob_files(a, root, glob, ?files);
+    var defs_w: jw.Jw = jw.init(a);
+    var refs_w: jw.Jw = jw.init(a);
+    var imps_w: jw.Jw = jw.init(a);
+    var deps_w: jw.Jw = jw.init(a);
+    var aff_files: vector.Vector[str] = vector.init[str](a);
+    var aff_syms: vector.Vector[str] = vector.init[str](a);
+    jw.arr(?defs_w);
+    jw.arr(?refs_w);
+    jw.arr(?imps_w);
+    jw.arr(?deps_w);
+    val target_stem: str = stem_of(a, target_path);
+    val target_stem_n: usize = str_len(target_stem);
+    var fi: usize = 0;
+    for (fi < files.len) {
+        val rel: str = files.data[fi];
+        val full: res[str, A.Error] = pathx.native(a, root, rel);
+        if (sel full.ok) {
+            val m: res[filesystem.Metadata, io_error.Error] = filesystem.metadata_link(full.ok);
+            if (sel m.ok) {
+                if (m.ok.size <= MAX_SCAN_BYTES::u64) {
+                    val bytes: res[vector.Vector[u8], filesystem.FsError] = filesystem.read_bytes(a, full.ok);
+                    if (sel bytes.ok) {
+                        val p: *u8 = bytes.ok.data;
+                        val n: usize = bytes.ok.len;
+                        if (n == 0 || utf8.validate(p, n)) {
+                            var sha: [65]u8;
+                            commit.hash_hex(p, n, ?sha[0]);
+                            var lines: vector.Vector[usize] = vector.init[usize](a);
+                            split_lines(p, n, ?lines);
+                            val lang: str = outline_lang(rel);
+                            var syms: vector.Vector[Sym] = vector.init[Sym](a);
+                            if (lang != nil && n > 0) { collect_symbols(a, lang, p, n, ?syms); }
+                            var file_imps: vector.Vector[str] = vector.init[str](a);
+                            extract_imports(a, p, ?lines, ?file_imps);
+                            if (target_path != nil && util.eq(rel, target_path)) {
+                                var ii: usize = 0;
+                                for (ii < file_imps.len) {
+                                    jw.str_v(?imps_w, file_imps.data[ii]);
+                                    ii = ii + 1;
+                                }
+                            }
+                            or (target_path != nil && target_stem_n > 0) {
+                                var ii: usize = 0;
+                                for (ii < file_imps.len) {
+                                    val imp: str = file_imps.data[ii];
+                                    if (find_word_col(imp, 0, str_len(imp), target_stem, target_stem_n) > 0) {
+                                        jw.str_v(?deps_w, rel);
+                                        if (!has_str(?aff_files, rel)) { vector.push[str](?aff_files, rel); }
+                                        brk;
+                                    }
+                                    ii = ii + 1;
+                                }
+                            }
+                            if (sym_name != nil && sym_n > 0) {
+                                var si: usize = 0;
+                                for (si < syms.len) {
+                                    val s: *Sym = ?syms.data[si];
+                                    if (sym_name_eq(s, sym_name, sym_n)) {
+                                        jw.obj(?defs_w);
+                                        jw.f_str(?defs_w, "path", rel);
+                                        jw.f_str(?defs_w, "sha256", ?sha[0]);
+                                        jw.f_strn(?defs_w, "name", s.name, s.name_n);
+                                        jw.f_str(?defs_w, "kind", s.kind);
+                                        jw.f_i64(?defs_w, "line", s.line);
+                                        jw.f_i64(?defs_w, "end", s.end);
+                                        jw.obj_end(?defs_w);
+                                        if (!has_str(?aff_files, rel)) { vector.push[str](?aff_files, rel); }
+                                    }
+                                    si = si + 1;
+                                }
+                                val nl: usize = lines.len / 2;
+                                var li: usize = 0;
+                                for (li < nl) {
+                                    val loff: usize = lines.data[li * 2];
+                                    val llen: usize = lines.data[li * 2 + 1];
+                                    val col: i64 = find_word_col(p, loff, llen, sym_name, sym_n);
+                                    if (col > 0) {
+                                        val ln1: i64 = (li + 1)::i64;
+                                        var is_def_line: bool = false;
+                                        var enc: i64 = -1;
+                                        si = 0;
+                                        for (si < syms.len) {
+                                            val s: *Sym = ?syms.data[si];
+                                            if (s.line == ln1 && sym_name_eq(s, sym_name, sym_n)) {
+                                                is_def_line = true;
+                                            }
+                                            if (s.line <= ln1 && ln1 <= s.end) {
+                                                if (enc < 0 || s.line >= syms.data[enc::usize].line) {
+                                                    enc = si::i64;
+                                                }
+                                            }
+                                            si = si + 1;
+                                        }
+                                        if (!is_def_line) {
+                                            jw.obj(?refs_w);
+                                            jw.f_str(?refs_w, "path", rel);
+                                            jw.f_str(?refs_w, "sha256", ?sha[0]);
+                                            jw.f_i64(?refs_w, "line", ln1);
+                                            jw.f_i64(?refs_w, "col", col);
+                                            if (enc >= 0) {
+                                                val es: *Sym = ?syms.data[enc::usize];
+                                                jw.f_strn(?refs_w, "symbol", es.name, es.name_n);
+                                                var sw: jw.Jw = jw.init(a);
+                                                jw.raw(?sw, rel);
+                                                jw.raw(?sw, ":");
+                                                jw.bytes(?sw, es.name, es.name_n);
+                                                val sk: str = jw.text(?sw);
+                                                if (!has_str(?aff_syms, sk)) { vector.push[str](?aff_syms, sk); }
+                                            }
+                                            var vn: usize = 0;
+                                            val v: *u8 = view_fold(a, p, loff, llen, false, ?vn);
+                                            jw.f_strn(?refs_w, "text", v, line_cut(v, vn));
+                                            jw.obj_end(?refs_w);
+                                            if (!has_str(?aff_files, rel)) { vector.push[str](?aff_files, rel); }
+                                        }
+                                    }
+                                    li = li + 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        fi = fi + 1;
+    }
+    jw.arr_end(?defs_w);
+    jw.arr_end(?refs_w);
+    jw.arr_end(?imps_w);
+    jw.arr_end(?deps_w);
+    jw.obj(w);
+    if (sym_name != nil && sym_n > 0) { jw.f_strn(w, "symbol", sym_name, sym_n); }
+    if (target_path != nil) { jw.f_str(w, "path", target_path); }
+    jw.key(w, "definitions");
+    jw.raw_v(w, jw.text(?defs_w));
+    jw.key(w, "references");
+    jw.raw_v(w, jw.text(?refs_w));
+    if (target_path != nil) {
+        jw.key(w, "imports");
+        jw.raw_v(w, jw.text(?imps_w));
+        jw.key(w, "dependents");
+        jw.raw_v(w, jw.text(?deps_w));
+    }
+    jw.key(w, "affected_files");
+    jw.arr(w);
+    var ai: usize = 0;
+    for (ai < aff_files.len) {
+        jw.str_v(w, aff_files.data[ai]);
+        ai = ai + 1;
+    }
+    jw.arr_end(w);
+    jw.key(w, "affected_symbols");
+    jw.arr(w);
+    ai = 0;
+    for (ai < aff_syms.len) {
+        jw.str_v(w, aff_syms.data[ai]);
+        ai = ai + 1;
+    }
+    jw.arr_end(w);
+    jw.obj_end(w);
+    ret true;
 }
 
 use std.system.capability;

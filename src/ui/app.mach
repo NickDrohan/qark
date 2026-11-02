@@ -1,10 +1,7 @@
 # full-screen loop over the current buffer
 
 use std.system.os;
-use std.types.bool.bool;
 use std.types.option.opt;
-use std.types.size.usize;
-use std.types.string.str;
 
 use buffer: qark.core.buffer;
 use mode: qark.core.mode;

@@ -288,7 +288,7 @@ fun substitute(ex: *Ex, buf: *buffer.Buffer, r1: i64, r2: i64, rest: str) err[A.
         if (sel g.some) {
             var out: [4096]u8;
             var out_len: usize = 0;
-            val hit: bool = re.replace_first(?progv, g.some.data, g.some.len::i64, (rest::usize + p2)::*u8, p2n::i64, ?out[0], 4096, ?out_len);
+            val hit: bool = re.replace_line(?progv, g.some.data, g.some.len::i64, (rest::usize + p2)::*u8, p2n::i64, global, ?out[0], 4096, ?out_len);
             if (hit) {
                 var srcs: [1]*u8;
                 var lens: [1]usize;
@@ -298,18 +298,6 @@ fun substitute(ex: *Ex, buf: *buffer.Buffer, r1: i64, r2: i64, rest: str) err[A.
                 if (sel sp.err) {
                     re.dnit(?progv);
                     ret sp;
-                }
-                if (global) {
-                    # one extra pass is enough for the common double
-                    val g2: opt[*text.Line] = text.line_at(?buf.text, row);
-                    if (sel g2.some) {
-                        val hit2: bool = re.replace_first(?progv, g2.some.data, g2.some.len::i64, (rest::usize + p2)::*u8, p2n::i64, ?out[0], 4096, ?out_len);
-                        if (hit2) {
-                            srcs[0] = ?out[0];
-                            lens[0] = out_len;
-                            buffer.splice(ex.bufs, buf.id, row, row + 1, ?srcs[0], ?lens[0], 1, true);
-                        }
-                    }
                 }
             }
         }
