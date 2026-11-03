@@ -562,6 +562,64 @@ fun emit_hex_field(a: *A.Allocator, w: *jw.Jw, key: str, data: *u8, len: usize) 
         val n: usize = util.fmt_hex(got.ok, hlen, data, len);
         jw.f_strn(w, key, got.ok, n);
     }
+    or {
+        w.failed = true;
+    }
+}
+
+fun emit_set_files_snapshot(a: *A.Allocator, w: *jw.Jw, set: *commit.Set) bool {
+    jw.key(w, "files");
+    jw.arr(w);
+    var i: usize = 0;
+    for (i < commit.count(set)) {
+        val e: *commit.Entry = commit.entry(set, i);
+        if (e.status == commit.ST_CREATE || e.status == commit.ST_REPLACE || e.status == commit.ST_DELETE) {
+            if (e.mode != commit.MODE_DELETE && (e.len > spec.MAX_FILE_BYTES || (e.len > 0 && e.data == nil))) {
+                ret false;
+            }
+            if (e.existed && (e.old_len > spec.MAX_FILE_BYTES || (e.old_len > 0 && e.old == nil))) {
+                ret false;
+            }
+            jw.obj(w);
+            jw.f_str(w, "path", e.rel);
+            jw.f_str(w, "status", commit.status_name(e.status));
+            if (e.exec) { jw.f_bool(w, "exec", true); }
+            if (e.target_perm != 0) { jw.f_i64(w, "target_perm", e.target_perm::i64); }
+            if (e.mode != commit.MODE_DELETE) {
+                jw.f_str(w, "sha256", ?e.sha[0]);
+                if (e.len == 0) {
+                    jw.f_str(w, "new_text", "");
+                }
+                or {
+                    if (utf8.validate(e.data, e.len)) {
+                        jw.f_strn(w, "new_text", e.data, e.len);
+                    }
+                    or {
+                        emit_hex_field(a, w, "new_hex", e.data, e.len);
+                    }
+                }
+            }
+            if (e.existed) {
+                jw.f_str(w, "prev_sha256", ?e.old_sha[0]);
+                jw.f_i64(w, "old_perm", e.old_perm::i64);
+                if (e.old_len == 0) {
+                    jw.f_str(w, "old_text", "");
+                }
+                or {
+                    if (utf8.validate(e.old, e.old_len)) {
+                        jw.f_strn(w, "old_text", e.old, e.old_len);
+                    }
+                    or {
+                        emit_hex_field(a, w, "old_hex", e.old, e.old_len);
+                    }
+                }
+            }
+            jw.obj_end(w);
+        }
+        i = i + 1;
+    }
+    jw.arr_end(w);
+    ret !w.failed;
 }
 
 fun write_undo_snapshot(s: *session.Session, sp: *spec.Spec, txn: *u8) bool {
@@ -589,50 +647,7 @@ fun write_undo_snapshot(s: *session.Session, sp: *spec.Spec, txn: *u8) bool {
     if (prev_p != nil && prev_n > 0) {
         jw.f_strn(?w, "prev_txn", prev_p, prev_n);
     }
-    jw.key(?w, "files");
-    jw.arr(?w);
-    var i: usize = 0;
-    for (i < commit.count(?sp.set)) {
-        val e: *commit.Entry = commit.entry(?sp.set, i);
-        if (e.status == commit.ST_CREATE || e.status == commit.ST_REPLACE || e.status == commit.ST_DELETE) {
-            jw.obj(?w);
-            jw.f_str(?w, "path", e.rel);
-            jw.f_str(?w, "status", commit.status_name(e.status));
-            if (e.exec) { jw.f_bool(?w, "exec", true); }
-            if (e.mode != commit.MODE_DELETE) {
-                jw.f_str(?w, "sha256", ?e.sha[0]);
-                if (e.len == 0) {
-                    jw.f_str(?w, "new_text", "");
-                }
-                or (e.data != nil && e.len <= spec.MAX_FILE_BYTES) {
-                    if (utf8.validate(e.data, e.len)) {
-                        jw.f_strn(?w, "new_text", e.data, e.len);
-                    }
-                    or {
-                        emit_hex_field(a, ?w, "new_hex", e.data, e.len);
-                    }
-                }
-            }
-            if (e.existed) {
-                jw.f_str(?w, "prev_sha256", ?e.old_sha[0]);
-                jw.f_i64(?w, "old_perm", e.old_perm::i64);
-                if (e.old_len == 0) {
-                    jw.f_str(?w, "old_text", "");
-                }
-                or (e.old != nil && e.old_len <= spec.MAX_FILE_BYTES) {
-                    if (utf8.validate(e.old, e.old_len)) {
-                        jw.f_strn(?w, "old_text", e.old, e.old_len);
-                    }
-                    or {
-                        emit_hex_field(a, ?w, "old_hex", e.old, e.old_len);
-                    }
-                }
-            }
-            jw.obj_end(?w);
-        }
-        i = i + 1;
-    }
-    jw.arr_end(?w);
+    if (!emit_set_files_snapshot(a, ?w, ?sp.set)) { ret false; }
     jw.obj_end(?w);
     jw.byte(?w, '\n');
     if (w.failed || w.buf == nil) { ret false; }
@@ -649,13 +664,16 @@ fun write_undo_snapshot(s: *session.Session, sp: *spec.Spec, txn: *u8) bool {
 
 fun commit_undo_pointers(s: *session.Session, txn: *u8) bool {
     val a: *A.Allocator = ?s.ra;
+    if (!commit.check_control_dir(a, s.root)) { ret false; }
     val lat_full: res[str, A.Error] = pathx.native(a, s.root, ".qark/undo/latest");
     if (sel lat_full.err) { ret false; }
     val wrote: err[filesystem.FsError] = filesystem.replace_bytes_atomic(a, lat_full.ok, txn, str_len(txn), 384, 448);
     if (sel wrote.err) { ret false; }
     val redo_full: res[str, A.Error] = pathx.native(a, s.root, ".qark/undo/redo");
-    if (sel redo_full.ok) {
-        filesystem.remove_file(redo_full.ok);
+    if (sel redo_full.err) { ret false; }
+    val rm: err[io_error.Error] = filesystem.remove_file(redo_full.ok);
+    if (sel rm.err) {
+        if (rm.err.kind != io_error.NOT_FOUND) { ret false; }
     }
     ret true;
 }
@@ -671,12 +689,16 @@ fun remove_undo_snapshot(a: *A.Allocator, root: str, txn: *u8) {
     }
 }
 
-fun write_wal(a: *A.Allocator, root: str, txn: *u8) bool {
+fun write_wal_publishing(a: *A.Allocator, root: str, op_name: str, txn: *u8, set: *commit.Set, inline_files: bool) bool {
     if (!commit.check_control_dir(a, root)) { ret false; }
     var w: jw.Jw = jw.init(a);
     jw.obj(?w);
+    jw.f_str(?w, "op", op_name);
     jw.f_str(?w, "txn", txn);
     jw.f_str(?w, "state", "publishing");
+    if (inline_files && set != nil) {
+        if (!emit_set_files_snapshot(a, ?w, set)) { ret false; }
+    }
     jw.obj_end(?w);
     jw.byte(?w, '\n');
     if (w.failed || w.buf == nil) { ret false; }
@@ -687,109 +709,260 @@ fun write_wal(a: *A.Allocator, root: str, txn: *u8) bool {
     ret true;
 }
 
-fun clear_wal(a: *A.Allocator, root: str) {
-    val wal_full: res[str, A.Error] = pathx.native(a, root, ".qark/wal.json");
-    if (sel wal_full.ok) {
-        filesystem.remove_file(wal_full.ok);
+fun write_wal_committed(a: *A.Allocator, root: str, op_name: str, txn: *u8, latest_txn: *u8, latest_n: usize, redo_buf: *u8, redo_n: usize, clear_redo: bool) bool {
+    if (!commit.check_control_dir(a, root)) { ret false; }
+    var w: jw.Jw = jw.init(a);
+    jw.obj(?w);
+    jw.f_str(?w, "op", op_name);
+    jw.f_str(?w, "txn", txn);
+    jw.f_str(?w, "state", "committed");
+    if (latest_txn != nil) {
+        jw.f_strn(?w, "latest_txn", latest_txn, latest_n);
     }
+    or {
+        jw.f_str(?w, "latest_txn", "");
+    }
+    if (clear_redo) {
+        jw.f_bool(?w, "clear_redo", true);
+    }
+    or (redo_buf != nil && redo_n > 0) {
+        jw.f_strn(?w, "redo_buf", redo_buf, redo_n);
+    }
+    jw.obj_end(?w);
+    jw.byte(?w, '\n');
+    if (w.failed || w.buf == nil) { ret false; }
+    val wal_full: res[str, A.Error] = pathx.native(a, root, ".qark/wal.json");
+    if (sel wal_full.err) { ret false; }
+    val wrote: err[filesystem.FsError] = filesystem.replace_bytes_atomic(a, wal_full.ok, w.buf, w.len, 384, 448);
+    if (sel wrote.err) { ret false; }
+    ret true;
+}
+
+fun clear_wal(a: *A.Allocator, root: str) bool {
+    val wal_full: res[str, A.Error] = pathx.native(a, root, ".qark/wal.json");
+    if (sel wal_full.err) { ret false; }
+    val rm: err[io_error.Error] = filesystem.remove_file(wal_full.ok);
+    if (sel rm.err) {
+        if (rm.err.kind != io_error.NOT_FOUND) { ret false; }
+    }
+    ret true;
+}
+
+fun has_pending_wal(a: *A.Allocator, root: str) bool {
+    if (!commit.check_control_dir(a, root)) { ret true; }
+    val wal_full: res[str, A.Error] = pathx.native(a, root, ".qark/wal.json");
+    if (sel wal_full.err) { ret true; }
+    val m: res[filesystem.Metadata, io_error.Error] = filesystem.metadata_link(wal_full.ok);
+    if (sel m.err) {
+        if (m.err.kind == io_error.NOT_FOUND || m.err.kind == io_error.NOT_DIRECTORY) { ret false; }
+        ret true;
+    }
+    ret true;
+}
+
+fun recovery_error(w: *jw.Jw, msg: str) bool {
+    error_obj(w, "recovery_required", msg);
+    jw.f_bool(w, "recovery_required", true);
+    jw.obj_end(w);
+    ret false;
 }
 
 # Recover an interrupted multi-file transaction recorded in .qark/wal.json
-fun recover_wal(a: *A.Allocator, root: str) bool {
+# Returns 0 when no WAL exists or recovery succeeded; returns -1 when recovery failed (leaving WAL intact).
+fun recover_wal(a: *A.Allocator, root: str) i64 {
+    if (!commit.check_control_dir(a, root)) { ret -1; }
     val wal_full: res[str, A.Error] = pathx.native(a, root, ".qark/wal.json");
-    if (sel wal_full.err) { ret true; }
-    val wal_txt: res[str, filesystem.FsError] = filesystem.read_string(a, wal_full.ok);
-    if (sel wal_txt.err) { ret true; }
-    val parsed: res[json.Value, json.JsonError] = json.parse(wal_txt.ok, str_len(wal_txt.ok), a);
-    if (sel parsed.err) {
-        filesystem.remove_file(wal_full.ok);
-        ret true;
+    if (sel wal_full.err) { ret -1; }
+    val wm: res[filesystem.Metadata, io_error.Error] = filesystem.metadata_link(wal_full.ok);
+    if (sel wm.err) {
+        if (wm.err.kind == io_error.NOT_FOUND || wm.err.kind == io_error.NOT_DIRECTORY) { ret 0; }
+        ret -1;
     }
+    if (wm.ok.kind != filesystem.KIND_FILE) { ret -1; }
+    val wal_txt: res[str, filesystem.FsError] = filesystem.read_string(a, wal_full.ok);
+    if (sel wal_txt.err) { ret -1; }
+    val parsed: res[json.Value, json.JsonError] = json.parse(wal_txt.ok, str_len(wal_txt.ok), a);
+    if (sel parsed.err) { ret -1; }
     var wdoc: json.Value = parsed.ok;
+    if (!json.value_is_object(?wdoc)) { ret -1; }
     var wtxn: *u8 = nil;
     var wtxn_n: usize = 0;
     val tf: opt[*json.Value] = json.value_find(?wdoc, "txn");
     if (sel tf.some) {
         if (json.value_is_string(tf.some)) { spec.decode_pub(a, tf.some, ?wtxn, ?wtxn_n); }
     }
-    if (wtxn == nil || wtxn_n == 0 || pathx.check(wtxn) != pathx.P_OK) {
-        filesystem.remove_file(wal_full.ok);
-        ret true;
+    if (wtxn == nil || wtxn_n == 0 || pathx.check(wtxn) != pathx.P_OK) { ret -1; }
+    var wstate: *u8 = nil;
+    var wstate_n: usize = 0;
+    val st_f: opt[*json.Value] = json.value_find(?wdoc, "state");
+    if (sel st_f.some) {
+        if (json.value_is_string(st_f.some)) { spec.decode_pub(a, st_f.some, ?wstate, ?wstate_n); }
     }
-    var pw: jw.Jw = jw.init(a);
-    jw.raw(?pw, ".qark/undo/");
-    jw.raw(?pw, wtxn);
-    jw.raw(?pw, ".json");
-    val snap_full: res[str, A.Error] = pathx.native(a, root, jw.text(?pw));
-    if (sel snap_full.ok) {
-        val snap_txt: res[str, filesystem.FsError] = filesystem.read_string(a, snap_full.ok);
-        if (sel snap_txt.ok) {
-            val sp_parsed: res[json.Value, json.JsonError] = json.parse(snap_txt.ok, str_len(snap_txt.ok), a);
-            if (sel sp_parsed.ok) {
-                var sdoc: json.Value = sp_parsed.ok;
-                val ff: opt[*json.Value] = json.value_find(?sdoc, "files");
-                if (sel ff.some) {
-                    if (json.value_is_array(ff.some)) {
-                        var i: usize = 0;
-                        for (i < json.value_count(ff.some)) {
-                            val g: opt[*json.Value] = json.value_get(ff.some, i);
-                            if (sel g.some) {
-                                var p: *u8 = nil;
-                                var pn: usize = 0;
-                                var st: *u8 = nil;
-                                var stn: usize = 0;
-                                val pf: opt[*json.Value] = json.value_find(g.some, "path");
-                                val stf: opt[*json.Value] = json.value_find(g.some, "status");
-                                if (sel pf.some) { spec.decode_pub(a, pf.some, ?p, ?pn); }
-                                if (sel stf.some) { spec.decode_pub(a, stf.some, ?st, ?stn); }
-                                if (p != nil && st != nil && pathx.check(p) == pathx.P_OK && commit.check_ancestry(a, root, p) == nil) {
-                                    val ffull: res[str, A.Error] = pathx.native(a, root, p);
-                                    if (sel ffull.ok) {
-                                        if (util.eq(st, "created")) {
-                                            filesystem.remove_file(ffull.ok);
-                                        }
-                                        or (util.eq(st, "replaced") || util.eq(st, "deleted")) {
-                                            var old_b: *u8 = nil;
-                                            var old_n: usize = 0;
-                                            var has_old: bool = false;
-                                            val otf: opt[*json.Value] = json.value_find(g.some, "old_text");
-                                            if (sel otf.some) {
-                                                if (spec.decode_pub(a, otf.some, ?old_b, ?old_n)) { has_old = true; }
-                                            }
-                                            if (!has_old) {
-                                                val ohf: opt[*json.Value] = json.value_find(g.some, "old_hex");
-                                                var hp: *u8 = nil;
-                                                var hn: usize = 0;
-                                                if (sel ohf.some) {
-                                                    if (spec.decode_pub(a, ohf.some, ?hp, ?hn) && decode_hex_bytes(a, hp, hn, ?old_b, ?old_n)) {
-                                                        has_old = true;
-                                                    }
-                                                }
-                                            }
-                                            var perm: u32 = 420;
-                                            val pmf: opt[*json.Value] = json.value_find(g.some, "old_perm");
-                                            if (sel pmf.some) {
-                                                if (json.value_is_number(pmf.some) && json.value_number(pmf.some) > 0) {
-                                                    perm = json.value_number(pmf.some)::u32;
-                                                }
-                                            }
-                                            if (has_old) {
-                                                filesystem.replace_bytes_atomic(a, ffull.ok, old_b, old_n, (perm & 511)::i32, 493);
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            i = i + 1;
-                        }
+    if (wstate == nil) { ret -1; }
+    var wop: *u8 = "apply";
+    var wop_n: usize = 5;
+    val op_f: opt[*json.Value] = json.value_find(?wdoc, "op");
+    if (sel op_f.some) {
+        if (json.value_is_string(op_f.some)) { spec.decode_pub(a, op_f.some, ?wop, ?wop_n); }
+    }
+
+    if (util.eq(wstate, "committed")) {
+        val lat_f: opt[*json.Value] = json.value_find(?wdoc, "latest_txn");
+        if (sel lat_f.some) {
+            if (!json.value_is_string(lat_f.some)) { ret -1; }
+            var l_p: *u8 = nil;
+            var l_n: usize = 0;
+            if (!spec.decode_pub(a, lat_f.some, ?l_p, ?l_n)) { ret -1; }
+            val lat_full: res[str, A.Error] = pathx.native(a, root, ".qark/undo/latest");
+            if (sel lat_full.err) { ret -1; }
+            if (l_n > 0) {
+                val wr_lat: err[filesystem.FsError] = filesystem.replace_bytes_atomic(a, lat_full.ok, l_p, l_n, 384, 448);
+                if (sel wr_lat.err) { ret -1; }
+            }
+            or {
+                val rm_lat: err[io_error.Error] = filesystem.remove_file(lat_full.ok);
+                if (sel rm_lat.err && rm_lat.err.kind != io_error.NOT_FOUND) { ret -1; }
+            }
+        }
+        if (spec.fbool_pub(?wdoc, "clear_redo")) {
+            val redo_full: res[str, A.Error] = pathx.native(a, root, ".qark/undo/redo");
+            if (sel redo_full.err) { ret -1; }
+            val rm_redo: err[io_error.Error] = filesystem.remove_file(redo_full.ok);
+            if (sel rm_redo.err && rm_redo.err.kind != io_error.NOT_FOUND) { ret -1; }
+        }
+        or {
+            val rb_f: opt[*json.Value] = json.value_find(?wdoc, "redo_buf");
+            if (sel rb_f.some) {
+                var r_p: *u8 = nil;
+                var r_n: usize = 0;
+                if (!json.value_is_string(rb_f.some) || !spec.decode_pub(a, rb_f.some, ?r_p, ?r_n)) { ret -1; }
+                val redo_full2: res[str, A.Error] = pathx.native(a, root, ".qark/undo/redo");
+                if (sel redo_full2.err) { ret -1; }
+                val wr_redo: err[filesystem.FsError] = filesystem.replace_bytes_atomic(a, redo_full2.ok, r_p, r_n, 384, 448);
+                if (sel wr_redo.err) { ret -1; }
+            }
+        }
+        if (!clear_wal(a, root)) { ret -1; }
+        ret 0;
+    }
+
+    if (!util.eq(wstate, "publishing")) { ret -1; }
+
+    var files_arr: *json.Value = nil;
+    var has_snap_file: bool = false;
+    var snap_path: str = nil;
+    val in_ff: opt[*json.Value] = json.value_find(?wdoc, "files");
+    var sdoc: json.Value;
+    if (sel in_ff.some) {
+        if (json.value_is_array(in_ff.some)) { files_arr = in_ff.some; }
+    }
+    if (files_arr == nil) {
+        var pw: jw.Jw = jw.init(a);
+        jw.raw(?pw, ".qark/undo/");
+        jw.raw(?pw, wtxn);
+        jw.raw(?pw, ".json");
+        val snap_full: res[str, A.Error] = pathx.native(a, root, jw.text(?pw));
+        if (sel snap_full.err) { ret -1; }
+        snap_path = snap_full.ok;
+        has_snap_file = true;
+        val snap_txt: res[str, filesystem.FsError] = filesystem.read_string(a, snap_path);
+        if (sel snap_txt.err) { ret -1; }
+        val sp_parsed: res[json.Value, json.JsonError] = json.parse(snap_txt.ok, str_len(snap_txt.ok), a);
+        if (sel sp_parsed.err) { ret -1; }
+        sdoc = sp_parsed.ok;
+        val ff: opt[*json.Value] = json.value_find(?sdoc, "files");
+        if (sel ff.some) {
+            if (json.value_is_array(ff.some)) { files_arr = ff.some; }
+        }
+    }
+    if (files_arr == nil || json.value_count(files_arr) == 0) { ret -1; }
+
+    var i: usize = 0;
+    for (i < json.value_count(files_arr)) {
+        val g: opt[*json.Value] = json.value_get(files_arr, i);
+        if (!sel g.some) { ret -1; }
+        var g_val: *json.Value = nil;
+        if (sel g.some) { g_val = g.some; }
+        if (g_val == nil || !json.value_is_object(g_val)) { ret -1; }
+        var p: *u8 = nil;
+        var pn: usize = 0;
+        var st: *u8 = nil;
+        var stn: usize = 0;
+        val pf: opt[*json.Value] = json.value_find(g_val, "path");
+        val stf: opt[*json.Value] = json.value_find(g_val, "status");
+        if (sel pf.some) { spec.decode_pub(a, pf.some, ?p, ?pn); }
+        if (sel stf.some) { spec.decode_pub(a, stf.some, ?st, ?stn); }
+        if (p == nil || pn == 0 || st == nil || pathx.check(p) != pathx.P_OK || commit.check_ancestry(a, root, p) != nil) {
+            ret -1;
+        }
+        val ffull: res[str, A.Error] = pathx.native(a, root, p);
+        if (sel ffull.err) { ret -1; }
+        if (util.eq(st, "created")) {
+            val rm: err[io_error.Error] = filesystem.remove_file(ffull.ok);
+            if (sel rm.err && rm.err.kind != io_error.NOT_FOUND) { ret -1; }
+            val m_after: res[filesystem.Metadata, io_error.Error] = filesystem.metadata_link(ffull.ok);
+            if (sel m_after.ok) { ret -1; }
+            if (sel m_after.err && m_after.err.kind != io_error.NOT_FOUND && m_after.err.kind != io_error.NOT_DIRECTORY) {
+                ret -1;
+            }
+        }
+        or (util.eq(st, "replaced") || util.eq(st, "deleted")) {
+            var old_b: *u8 = nil;
+            var old_n: usize = 0;
+            var has_old: bool = false;
+            val otf: opt[*json.Value] = json.value_find(g_val, "old_text");
+            if (sel otf.some) {
+                if (spec.decode_pub(a, otf.some, ?old_b, ?old_n)) { has_old = true; }
+            }
+            if (!has_old) {
+                val ohf: opt[*json.Value] = json.value_find(g_val, "old_hex");
+                var hp: *u8 = nil;
+                var hn: usize = 0;
+                if (sel ohf.some) {
+                    if (spec.decode_pub(a, ohf.some, ?hp, ?hn) && decode_hex_bytes(a, hp, hn, ?old_b, ?old_n)) {
+                        has_old = true;
                     }
                 }
             }
+            if (!has_old) { ret -1; }
+            var psha: *u8 = nil;
+            var pshan: usize = 0;
+            val psf: opt[*json.Value] = json.value_find(g_val, "prev_sha256");
+            if (sel psf.some) { spec.decode_pub(a, psf.some, ?psha, ?pshan); }
+            var expected_sha: [65]u8;
+            commit.hash_hex(old_b, old_n, ?expected_sha[0]);
+            if (psha != nil && pshan == 64 && !util.eq(psha, ?expected_sha[0])) {
+                ret -1;
+            }
+            var perm: u32 = 420;
+            val pmf: opt[*json.Value] = json.value_find(g_val, "old_perm");
+            if (sel pmf.some) {
+                if (json.value_is_number(pmf.some) && json.value_number(pmf.some) > 0) {
+                    perm = json.value_number(pmf.some)::u32;
+                }
+            }
+            var perm_bits: i32 = (perm & 511)::i32;
+            if (perm_bits == 0) { perm_bits = 420; }
+            val wr: err[filesystem.FsError] = filesystem.replace_bytes_atomic(a, ffull.ok, old_b, old_n, perm_bits, 493);
+            if (sel wr.err) { ret -1; }
+            val verify_b: res[vector.Vector[u8], filesystem.FsError] = filesystem.read_bytes(a, ffull.ok);
+            if (sel verify_b.err) { ret -1; }
+            var disk_sha: [65]u8;
+            commit.hash_hex(verify_b.ok.data, verify_b.ok.len, ?disk_sha[0]);
+            if (!util.eq(?disk_sha[0], ?expected_sha[0])) { ret -1; }
         }
-        filesystem.remove_file(snap_full.ok);
+        or {
+            ret -1;
+        }
+        i = i + 1;
     }
-    filesystem.remove_file(wal_full.ok);
-    ret true;
+
+    if (has_snap_file && snap_path != nil && util.eq(wop, "apply")) {
+        val rm_snap: err[io_error.Error] = filesystem.remove_file(snap_path);
+        if (sel rm_snap.err && rm_snap.err.kind != io_error.NOT_FOUND) { ret -1; }
+    }
+    if (!clear_wal(a, root)) { ret -1; }
+    ret 0;
 }
 
 fun undo_list(s: *session.Session, w: *jw.Jw) bool {
@@ -876,168 +1049,11 @@ fun undo_list(s: *session.Session, w: *jw.Jw) bool {
             var rp: *u8 = rtxt.ok;
             var rn: usize = str_len(rp);
             for (rn > 0 && (rp[rn - 1] == '\n' || rp[rn - 1] == '\r' || rp[rn - 1] == ' ')) { rn = rn - 1; }
-            if (rn > 0) { jw.f_strn(w, "redo_txn", rp, rn); }
+            var start: usize = rn;
+            for (start > 0 && rp[start - 1] != '\n' && rp[start - 1] != '\r') { start = start - 1; }
+            if (rn > start) { jw.f_strn(w, "redo_txn", (rp::usize + start)::*u8, rn - start); }
         }
     }
-    jw.obj_end(w);
-    ret true;
-}
-
-# redo a previously undone transaction using its persistent .qark/undo/<txn>.json snapshot
-pub fun redo(s: *session.Session, args: *json.Value, w: *jw.Jw) bool {
-    val a: *A.Allocator = ?s.ra;
-    var txn: *u8 = nil;
-    var txn_n: usize = 0;
-    val tf: opt[*json.Value] = json.value_find(args, "txn");
-    if (sel tf.some) {
-        if (json.value_is_string(tf.some)) { spec.decode_pub(a, tf.some, ?txn, ?txn_n); }
-    }
-    if (txn == nil || txn_n == 0 || util.eq(txn, "latest")) {
-        val redo_full: res[str, A.Error] = pathx.native(a, s.root, ".qark/undo/redo");
-        if (sel redo_full.err) { ret simple_error(w, "oom", "out of memory"); }
-        val redo_txt: res[str, filesystem.FsError] = filesystem.read_string(a, redo_full.ok);
-        if (sel redo_txt.err) { ret simple_error(w, "redo_missing", "no undone transaction to redo in .qark/undo"); }
-        var rp: *u8 = redo_txt.ok;
-        var rn: usize = str_len(rp);
-        for (rn > 0 && (rp[rn - 1] == '\n' || rp[rn - 1] == '\r' || rp[rn - 1] == ' ')) { rn = rn - 1; }
-        val d: res[str, A.Error] = util.dup_n(a, rp, rn);
-        if (sel d.err) { ret simple_error(w, "oom", "out of memory"); }
-        txn = d.ok;
-        txn_n = rn;
-    }
-    if (txn_n == 0 || pathx.check(txn) != pathx.P_OK) {
-        ret simple_error(w, "redo_missing", "invalid transaction id");
-    }
-    var pw: jw.Jw = jw.init(a);
-    jw.raw(?pw, ".qark/undo/");
-    jw.raw(?pw, txn);
-    jw.raw(?pw, ".json");
-    val snap_full: res[str, A.Error] = pathx.native(a, s.root, jw.text(?pw));
-    if (sel snap_full.err) { ret simple_error(w, "oom", "out of memory"); }
-    val snap_txt: res[str, filesystem.FsError] = filesystem.read_string(a, snap_full.ok);
-    if (sel snap_txt.err) { ret simple_error(w, "redo_missing", "no snapshot found for that transaction"); }
-    val parsed: res[json.Value, json.JsonError] = json.parse(snap_txt.ok, str_len(snap_txt.ok), a);
-    if (sel parsed.err) { ret simple_error(w, "undo_corrupt", "the snapshot could not be parsed"); }
-    var doc: json.Value = parsed.ok;
-    val files_f: opt[*json.Value] = json.value_find(?doc, "files");
-    if (!sel files_f.some) { ret simple_error(w, "undo_corrupt", "the snapshot has no files list"); }
-    if (!json.value_is_array(files_f.some)) { ret simple_error(w, "undo_corrupt", "the snapshot has no files list"); }
-    val dry: bool = spec.fbool_pub(args, "dry_run") || s.force_dry;
-    val force: bool = spec.fbool_pub(args, "force");
-    val show_diff: bool = spec.fbool_pub(args, "diff");
-    var fwd_set: commit.Set = commit.init(a, s.root);
-    var i: usize = 0;
-    for (i < json.value_count(files_f.some)) {
-        val g: opt[*json.Value] = json.value_get(files_f.some, i);
-        if (sel g.some) {
-            var p: *u8 = nil;
-            var pn: usize = 0;
-            var st: *u8 = nil;
-            var stn: usize = 0;
-            var psha: *u8 = nil;
-            var pshan: usize = 0;
-            var new_t: *u8 = nil;
-            var new_n: usize = 0;
-            var has_new: bool = false;
-            val pf: opt[*json.Value] = json.value_find(g.some, "path");
-            val stf: opt[*json.Value] = json.value_find(g.some, "status");
-            val psf: opt[*json.Value] = json.value_find(g.some, "prev_sha256");
-            val ntf: opt[*json.Value] = json.value_find(g.some, "new_text");
-            if (sel pf.some) { spec.decode_pub(a, pf.some, ?p, ?pn); }
-            if (sel stf.some) { spec.decode_pub(a, stf.some, ?st, ?stn); }
-            if (sel psf.some) { spec.decode_pub(a, psf.some, ?psha, ?pshan); }
-            if (sel ntf.some) {
-                if (spec.decode_pub(a, ntf.some, ?new_t, ?new_n)) { has_new = true; }
-            }
-            if (!has_new) {
-                val nhf: opt[*json.Value] = json.value_find(g.some, "new_hex");
-                var hp: *u8 = nil;
-                var hn: usize = 0;
-                if (sel nhf.some) {
-                    if (spec.decode_pub(a, nhf.some, ?hp, ?hn) && decode_hex_bytes(a, hp, hn, ?new_t, ?new_n)) {
-                        has_new = true;
-                    }
-                }
-            }
-            val is_exec: bool = spec.fbool_pub(g.some, "exec");
-            if (p != nil && st != nil) {
-                if (util.eq(st, "created")) {
-                    if (!has_new) { ret simple_error(w, "redo_unavailable", "snapshot does not hold new_text for a created file"); }
-                    var mode: u8 = commit.MODE_CREATE;
-                    if (force) { mode = commit.MODE_UPSERT; }
-                    val added: res[usize, A.Error] = commit.add(?fwd_set, p, new_t, new_n, mode);
-                    if (sel added.ok) { commit.entry(?fwd_set, added.ok).exec = is_exec; }
-                }
-                or (util.eq(st, "replaced")) {
-                    if (!has_new) { ret simple_error(w, "redo_unavailable", "snapshot does not hold new_text for a replaced file"); }
-                    var mode: u8 = commit.MODE_REPLACE;
-                    if (force) { mode = commit.MODE_UPSERT; }
-                    val added: res[usize, A.Error] = commit.add(?fwd_set, p, new_t, new_n, mode);
-                    if (sel added.ok) {
-                        val ent: *commit.Entry = commit.entry(?fwd_set, added.ok);
-                        ent.exec = is_exec;
-                        if (!force && psha != nil) {
-                            commit.set_expect(ent, psha);
-                        }
-                    }
-                }
-                or (util.eq(st, "deleted")) {
-                    val added: res[usize, A.Error] = commit.add(?fwd_set, p, nil, 0, commit.MODE_DELETE);
-                    if (sel added.ok) {
-                        if (!force && psha != nil) {
-                            commit.set_expect(commit.entry(?fwd_set, added.ok), psha);
-                        }
-                    }
-                }
-            }
-        }
-        i = i + 1;
-    }
-    var held: commit.Lock;
-    val locked: i64 = commit.lock(?fwd_set, s.lock_ms, ?held);
-    if (locked == 1) { ret simple_error(w, "locked", "another qark process held the workspace lock"); }
-    if (locked != 0) { ret simple_error(w, "lock_failed", "the workspace lock under .qark could not be taken"); }
-    recover_wal(a, s.root);
-    commit.observe(?fwd_set);
-    val conflicts: i64 = commit.tally(?fwd_set, commit.ST_CONFLICT);
-    if (conflicts > 0 && !dry) {
-        commit.unlock(?held);
-        error_obj(w, "conflict", "a file was modified since undo; nothing was redone. pass force: true to overwrite");
-        files_list(w, ?fwd_set, false, false, true, false, a);
-        jw.obj_end(w);
-        ret false;
-    }
-    var rtxn: [17]u8;
-    txn_id(?rtxn[0]);
-    if (!dry && commit.dirty(?fwd_set)) {
-        val out: commit.Outcome = commit.publish(?fwd_set);
-        if (!out.ok) {
-            commit.unlock(?held);
-            error_obj(w, out.code, out.msg);
-            if (out.rollback_failed) {
-                jw.f_bool(w, "rollback_failed", true);
-                jw.f_bool(w, "recovery_required", true);
-            }
-            jw.obj_end(w);
-            ret false;
-        }
-        val lat_p: res[str, A.Error] = pathx.native(a, s.root, ".qark/undo/latest");
-        if (sel lat_p.ok) {
-            filesystem.replace_bytes_atomic(a, lat_p.ok, txn, txn_n, 384, 448);
-        }
-        val redo_p: res[str, A.Error] = pathx.native(a, s.root, ".qark/undo/redo");
-        if (sel redo_p.ok) {
-            filesystem.remove_file(redo_p.ok);
-        }
-        undo_journal_line(s, ?fwd_set, "transaction.redone", ?rtxn[0], txn);
-    }
-    commit.unlock(?held);
-    jw.obj(w);
-    jw.f_str(w, "txn", ?rtxn[0]);
-    jw.f_str(w, "redone_txn", txn);
-    jw.f_bool(w, "dry_run", dry);
-    counts(w, ?fwd_set);
-    files_list(w, ?fwd_set, dry, false, false, show_diff, a);
     jw.obj_end(w);
     ret true;
 }
@@ -1050,6 +1066,307 @@ fun find_rev_entry(set: *commit.Set, rel: str) i64 {
         i = i + 1;
     }
     ret -1;
+}
+
+# redo a previously undone transaction sequence using persistent .qark/undo/<txn>.json snapshots
+pub fun redo(s: *session.Session, args: *json.Value, w: *jw.Jw) bool {
+    val a: *A.Allocator = ?s.ra;
+    val dry: bool = spec.fbool_pub(args, "dry_run") || s.force_dry;
+    val force: bool = spec.fbool_pub(args, "force");
+    val show_diff: bool = spec.fbool_pub(args, "diff");
+
+    var fwd_set: commit.Set = commit.init(a, s.root);
+    var held: commit.Lock;
+    val locked: i64 = commit.lock(?fwd_set, s.lock_ms, ?held);
+    if (locked == 1) { ret simple_error(w, "locked", "another qark process held the workspace lock"); }
+    if (locked != 0) { ret simple_error(w, "lock_failed", "the workspace lock under .qark could not be taken"); }
+
+    if (dry) {
+        if (has_pending_wal(a, s.root)) {
+            commit.unlock(?held);
+            ret recovery_error(w, "an interrupted transaction requires workspace recovery before previewing redo");
+        }
+    }
+    or {
+        if (recover_wal(a, s.root) < 0) {
+            commit.unlock(?held);
+            ret recovery_error(w, "workspace recovery from an interrupted transaction failed; manual inspection is required");
+        }
+    }
+
+    var txn_arg: *u8 = nil;
+    var txn_arg_n: usize = 0;
+    val tf: opt[*json.Value] = json.value_find(args, "txn");
+    if (sel tf.some) {
+        if (json.value_is_string(tf.some)) { spec.decode_pub(a, tf.some, ?txn_arg, ?txn_arg_n); }
+    }
+    var txns: [32]*u8;
+    var txn_lens: [32]usize;
+    var txn_cnt: usize = 0;
+    if (txn_arg != nil && txn_arg_n > 0 && !util.eq(txn_arg, "latest") && !util.eq(txn_arg, "redo")) {
+        if (pathx.check(txn_arg) != pathx.P_OK) {
+            commit.unlock(?held);
+            ret simple_error(w, "redo_missing", "invalid transaction id");
+        }
+        txns[0] = txn_arg;
+        txn_lens[0] = txn_arg_n;
+        txn_cnt = 1;
+    }
+    or {
+        val redo_full: res[str, A.Error] = pathx.native(a, s.root, ".qark/undo/redo");
+        if (sel redo_full.err) { commit.unlock(?held); ret simple_error(w, "oom", "out of memory"); }
+        val redo_txt: res[str, filesystem.FsError] = filesystem.read_string(a, redo_full.ok);
+        if (sel redo_txt.err) { commit.unlock(?held); ret simple_error(w, "redo_missing", "no undone transaction to redo in .qark/undo"); }
+        var rp: *u8 = redo_txt.ok;
+        var rn: usize = str_len(rp);
+        var pos: usize = 0;
+        for (pos < rn && txn_cnt < 32) {
+            for (pos < rn && (rp[pos] == '\n' || rp[pos] == '\r' || rp[pos] == ' ')) { pos = pos + 1; }
+            val start: usize = pos;
+            for (pos < rn && rp[pos] != '\n' && rp[pos] != '\r' && rp[pos] != ' ') { pos = pos + 1; }
+            if (pos > start) {
+                val len_i: usize = pos - start;
+                val d: res[str, A.Error] = util.dup_n(a, (rp::usize + start)::*u8, len_i);
+                if (sel d.err) { commit.unlock(?held); ret simple_error(w, "oom", "out of memory"); }
+                if (pathx.check(d.ok) != pathx.P_OK) {
+                    commit.unlock(?held);
+                    ret simple_error(w, "redo_missing", "invalid transaction id in .qark/undo/redo");
+                }
+                txns[txn_cnt] = d.ok;
+                txn_lens[txn_cnt] = len_i;
+                txn_cnt = txn_cnt + 1;
+            }
+        }
+    }
+    if (txn_cnt == 0) {
+        commit.unlock(?held);
+        ret simple_error(w, "redo_missing", "no undone transaction to redo in .qark/undo");
+    }
+
+    var ti: usize = 0;
+    for (ti < txn_cnt) {
+        val cur_txn: *u8 = txns[ti];
+        var pw: jw.Jw = jw.init(a);
+        jw.raw(?pw, ".qark/undo/");
+        jw.raw(?pw, cur_txn);
+        jw.raw(?pw, ".json");
+        val snap_full: res[str, A.Error] = pathx.native(a, s.root, jw.text(?pw));
+        if (sel snap_full.err) { commit.unlock(?held); ret simple_error(w, "oom", "out of memory"); }
+        val snap_txt: res[str, filesystem.FsError] = filesystem.read_string(a, snap_full.ok);
+        if (sel snap_txt.err) { commit.unlock(?held); ret simple_error(w, "redo_missing", "no snapshot found for that transaction"); }
+        val parsed: res[json.Value, json.JsonError] = json.parse(snap_txt.ok, str_len(snap_txt.ok), a);
+        if (sel parsed.err) { commit.unlock(?held); ret simple_error(w, "undo_corrupt", "the snapshot could not be parsed"); }
+        var doc: json.Value = parsed.ok;
+        val files_f: opt[*json.Value] = json.value_find(?doc, "files");
+        if (!sel files_f.some) { commit.unlock(?held); ret simple_error(w, "undo_corrupt", "the snapshot has no files list"); }
+        var files_arr: *json.Value = nil;
+        if (sel files_f.some) { files_arr = files_f.some; }
+        if (files_arr == nil || !json.value_is_array(files_arr)) {
+            commit.unlock(?held);
+            ret simple_error(w, "undo_corrupt", "the snapshot has no files list");
+        }
+        var i: usize = 0;
+        for (i < json.value_count(files_arr)) {
+            val g: opt[*json.Value] = json.value_get(files_arr, i);
+            if (sel g.some) {
+                var p: *u8 = nil;
+                var pn: usize = 0;
+                var st: *u8 = nil;
+                var stn: usize = 0;
+                var psha: *u8 = nil;
+                var pshan: usize = 0;
+                var sha: *u8 = nil;
+                var shan: usize = 0;
+                var new_t: *u8 = nil;
+                var new_n: usize = 0;
+                var has_new: bool = false;
+                val pf: opt[*json.Value] = json.value_find(g.some, "path");
+                val stf: opt[*json.Value] = json.value_find(g.some, "status");
+                val psf: opt[*json.Value] = json.value_find(g.some, "prev_sha256");
+                val shf: opt[*json.Value] = json.value_find(g.some, "sha256");
+                val ntf: opt[*json.Value] = json.value_find(g.some, "new_text");
+                if (sel pf.some) { spec.decode_pub(a, pf.some, ?p, ?pn); }
+                if (sel stf.some) { spec.decode_pub(a, stf.some, ?st, ?stn); }
+                if (sel psf.some) { spec.decode_pub(a, psf.some, ?psha, ?pshan); }
+                if (sel shf.some) { spec.decode_pub(a, shf.some, ?sha, ?shan); }
+                if (sel ntf.some) {
+                    if (spec.decode_pub(a, ntf.some, ?new_t, ?new_n)) { has_new = true; }
+                }
+                if (!has_new) {
+                    val nhf: opt[*json.Value] = json.value_find(g.some, "new_hex");
+                    var hp: *u8 = nil;
+                    var hn: usize = 0;
+                    if (sel nhf.some) {
+                        if (spec.decode_pub(a, nhf.some, ?hp, ?hn) && decode_hex_bytes(a, hp, hn, ?new_t, ?new_n)) {
+                            has_new = true;
+                        }
+                    }
+                }
+                val is_exec: bool = spec.fbool_pub(g.some, "exec");
+                var tperm: u32 = 0;
+                val tpf: opt[*json.Value] = json.value_find(g.some, "target_perm");
+                if (sel tpf.some) {
+                    if (json.value_is_number(tpf.some) && json.value_number(tpf.some) > 0) {
+                        tperm = json.value_number(tpf.some)::u32;
+                    }
+                }
+                if (p == nil || pn == 0 || st == nil || pathx.check(p) != pathx.P_OK) {
+                    commit.unlock(?held);
+                    ret simple_error(w, "undo_corrupt", "invalid file entry in snapshot");
+                }
+                if (has_new && sha != nil && shan == 64) {
+                    var chk_sha: [65]u8;
+                    commit.hash_hex(new_t, new_n, ?chk_sha[0]);
+                    if (!util.eq(sha, ?chk_sha[0])) {
+                        commit.unlock(?held);
+                        ret simple_error(w, "undo_corrupt", "snapshot new_text hash does not match recorded sha256");
+                    }
+                }
+                val existing_idx: i64 = find_rev_entry(?fwd_set, p);
+                if (existing_idx >= 0) {
+                    val ent: *commit.Entry = commit.entry(?fwd_set, existing_idx::usize);
+                    if (util.eq(st, "created") || util.eq(st, "replaced")) {
+                        if (!has_new) {
+                            commit.unlock(?held);
+                            ret simple_error(w, "redo_unavailable", "snapshot does not hold new_text for a file");
+                        }
+                        ent.must_be_absent = false;
+                        ent.data = new_t;
+                        ent.len = new_n;
+                        ent.exec = is_exec;
+                        ent.target_perm = tperm;
+                        commit.hash_hex(new_t, new_n, ?ent.sha[0]);
+                        if (force) { ent.mode = commit.MODE_UPSERT; }
+                        or (ent.has_expect) { ent.mode = commit.MODE_REPLACE; }
+                        or { ent.mode = commit.MODE_CREATE; }
+                    }
+                    or (util.eq(st, "deleted")) {
+                        ent.mode = commit.MODE_DELETE;
+                        ent.data = nil;
+                        ent.len = 0;
+                        ent.target_perm = 0;
+                        if (!force && !ent.has_expect) { ent.must_be_absent = true; }
+                        or { ent.must_be_absent = false; }
+                    }
+                    or {
+                        commit.unlock(?held);
+                        ret simple_error(w, "undo_corrupt", "unknown status in snapshot");
+                    }
+                }
+                or {
+                    if (util.eq(st, "created")) {
+                        if (!has_new) {
+                            commit.unlock(?held);
+                            ret simple_error(w, "redo_unavailable", "snapshot does not hold new_text for a created file");
+                        }
+                        var mode: u8 = commit.MODE_CREATE;
+                        if (force) { mode = commit.MODE_UPSERT; }
+                        val added: res[usize, A.Error] = commit.add(?fwd_set, p, new_t, new_n, mode);
+                        if (sel added.ok) {
+                            val ent: *commit.Entry = commit.entry(?fwd_set, added.ok);
+                            ent.exec = is_exec;
+                            ent.target_perm = tperm;
+                        }
+                    }
+                    or (util.eq(st, "replaced")) {
+                        if (!has_new) {
+                            commit.unlock(?held);
+                            ret simple_error(w, "redo_unavailable", "snapshot does not hold new_text for a replaced file");
+                        }
+                        var mode: u8 = commit.MODE_REPLACE;
+                        if (force) { mode = commit.MODE_UPSERT; }
+                        val added: res[usize, A.Error] = commit.add(?fwd_set, p, new_t, new_n, mode);
+                        if (sel added.ok) {
+                            val ent: *commit.Entry = commit.entry(?fwd_set, added.ok);
+                            ent.exec = is_exec;
+                            ent.target_perm = tperm;
+                            if (!force && psha != nil) {
+                                commit.set_expect(ent, psha);
+                            }
+                        }
+                    }
+                    or (util.eq(st, "deleted")) {
+                        val added: res[usize, A.Error] = commit.add(?fwd_set, p, nil, 0, commit.MODE_DELETE);
+                        if (sel added.ok) {
+                            if (!force && psha != nil) {
+                                commit.set_expect(commit.entry(?fwd_set, added.ok), psha);
+                            }
+                        }
+                    }
+                    or {
+                        commit.unlock(?held);
+                        ret simple_error(w, "undo_corrupt", "unknown status in snapshot");
+                    }
+                }
+            }
+            i = i + 1;
+        }
+        ti = ti + 1;
+    }
+
+    val last_txn: *u8 = txns[txn_cnt - 1];
+    val last_txn_n: usize = txn_lens[txn_cnt - 1];
+
+    commit.observe(?fwd_set);
+    val conflicts: i64 = commit.tally(?fwd_set, commit.ST_CONFLICT);
+    if (conflicts > 0 && !dry) {
+        commit.unlock(?held);
+        error_obj(w, "conflict", "a file was modified since undo; nothing was redone. pass force: true to overwrite");
+        files_list(w, ?fwd_set, false, false, true, false, a);
+        jw.obj_end(w);
+        ret false;
+    }
+    var rtxn: [17]u8;
+    txn_id(?rtxn[0]);
+    if (!dry) {
+        if (commit.dirty(?fwd_set)) {
+            if (!write_wal_publishing(a, s.root, "redo", ?rtxn[0], ?fwd_set, true)) {
+                clear_wal(a, s.root);
+                commit.unlock(?held);
+                ret simple_error(w, "undo_failed", "could not persist write-ahead log under .qark before redo; nothing was written");
+            }
+            val out: commit.Outcome = commit.publish(?fwd_set);
+            if (!out.ok) {
+                if (!out.rollback_failed) {
+                    clear_wal(a, s.root);
+                }
+                commit.unlock(?held);
+                error_obj(w, out.code, out.msg);
+                if (out.rollback_failed) {
+                    jw.f_bool(w, "rollback_failed", true);
+                    jw.f_bool(w, "recovery_required", true);
+                }
+                jw.obj_end(w);
+                ret false;
+            }
+        }
+        val joff: i64 = undo_journal_line(s, ?fwd_set, "transaction.redone", ?rtxn[0], last_txn);
+        if (joff < 0 || !write_wal_committed(a, s.root, "redo", ?rtxn[0], last_txn, last_txn_n, nil, 0, true)) {
+            val r_st: i64 = recover_wal(a, s.root);
+            commit.unlock(?held);
+            if (r_st < 0) {
+                ret recovery_error(w, "redo journal write failed and automatic rollback also failed; workspace recovery is required");
+            }
+            ret simple_error(w, "journal_failed", "redo could not be recorded in .qark/journal.ndjson; changes were rolled back");
+        }
+        if (!commit_undo_pointers(s, last_txn)) {
+            commit.unlock(?held);
+            ret simple_error(w, "undo_failed", "redo committed, but updating .qark/undo/latest failed");
+        }
+        clear_wal(a, s.root);
+    }
+    commit.unlock(?held);
+    jw.obj(w);
+    jw.f_str(w, "txn", ?rtxn[0]);
+    jw.f_str(w, "redone_txn", last_txn);
+    if (txn_cnt > 1) {
+        jw.f_i64(w, "steps_redone", txn_cnt::i64);
+    }
+    jw.f_bool(w, "dry_run", dry);
+    counts(w, ?fwd_set);
+    files_list(w, ?fwd_set, dry, false, false, show_diff, a);
+    jw.obj_end(w);
+    ret true;
 }
 
 # revert one or more previously applied transactions atomically using .qark/undo/<txn>.json snapshots
@@ -1096,7 +1413,19 @@ pub fun undo(s: *session.Session, args: *json.Value, w: *jw.Jw) bool {
     val locked: i64 = commit.lock(?rev_set, s.lock_ms, ?held);
     if (locked == 1) { ret simple_error(w, "locked", "another qark process held the workspace lock"); }
     if (locked != 0) { ret simple_error(w, "lock_failed", "the workspace lock under .qark could not be taken"); }
-    recover_wal(a, s.root);
+
+    if (dry) {
+        if (has_pending_wal(a, s.root)) {
+            commit.unlock(?held);
+            ret recovery_error(w, "an interrupted transaction requires workspace recovery before previewing undo");
+        }
+    }
+    or {
+        if (recover_wal(a, s.root) < 0) {
+            commit.unlock(?held);
+            ret recovery_error(w, "workspace recovery from an interrupted transaction failed; manual inspection is required");
+        }
+    }
 
     if (txn == nil || txn_n == 0 || util.eq(txn, "latest")) {
         val lat_full: res[str, A.Error] = pathx.native(a, s.root, ".qark/undo/latest");
@@ -1116,8 +1445,8 @@ pub fun undo(s: *session.Session, args: *json.Value, w: *jw.Jw) bool {
         ret simple_error(w, "undo_missing", "invalid transaction id");
     }
 
-    val first_txn: *u8 = txn;
-    val first_txn_n: usize = txn_n;
+    var undone_txns: [32]*u8;
+    var undone_lens: [32]usize;
     var cur_txn: *u8 = txn;
     var cur_txn_n: usize = txn_n;
     var last_reverted: *u8 = txn;
@@ -1130,6 +1459,8 @@ pub fun undo(s: *session.Session, args: *json.Value, w: *jw.Jw) bool {
             commit.unlock(?held);
             ret simple_error(w, "undo_missing", "not enough transactions in undo history for requested steps");
         }
+        undone_txns[step_i::usize] = cur_txn;
+        undone_lens[step_i::usize] = cur_txn_n;
         var pw: jw.Jw = jw.init(a);
         jw.raw(?pw, ".qark/undo/");
         jw.raw(?pw, cur_txn);
@@ -1176,16 +1507,20 @@ pub fun undo(s: *session.Session, args: *json.Value, w: *jw.Jw) bool {
                 var stn: usize = 0;
                 var sha: *u8 = nil;
                 var shan: usize = 0;
+                var psha: *u8 = nil;
+                var pshan: usize = 0;
                 var old_t: *u8 = nil;
                 var old_n: usize = 0;
                 var has_old: bool = false;
                 val pf: opt[*json.Value] = json.value_find(g.some, "path");
                 val stf2: opt[*json.Value] = json.value_find(g.some, "status");
                 val shf: opt[*json.Value] = json.value_find(g.some, "sha256");
+                val psf: opt[*json.Value] = json.value_find(g.some, "prev_sha256");
                 val otf: opt[*json.Value] = json.value_find(g.some, "old_text");
                 if (sel pf.some) { spec.decode_pub(a, pf.some, ?p, ?pn); }
                 if (sel stf2.some) { spec.decode_pub(a, stf2.some, ?st, ?stn); }
                 if (sel shf.some) { spec.decode_pub(a, shf.some, ?sha, ?shan); }
+                if (sel psf.some) { spec.decode_pub(a, psf.some, ?psha, ?pshan); }
                 if (sel otf.some) {
                     if (spec.decode_pub(a, otf.some, ?old_t, ?old_n)) { has_old = true; }
                 }
@@ -1199,58 +1534,96 @@ pub fun undo(s: *session.Session, args: *json.Value, w: *jw.Jw) bool {
                         }
                     }
                 }
-                if (p != nil && st != nil) {
-                    val existing_idx: i64 = find_rev_entry(?rev_set, p);
-                    if (existing_idx >= 0) {
-                        val ent: *commit.Entry = commit.entry(?rev_set, existing_idx::usize);
-                        if (util.eq(st, "created")) {
-                            ent.mode = commit.MODE_DELETE;
-                            ent.data = nil;
-                            ent.len = 0;
+                var operm: u32 = 0;
+                val opmf: opt[*json.Value] = json.value_find(g.some, "old_perm");
+                if (sel opmf.some) {
+                    if (json.value_is_number(opmf.some) && json.value_number(opmf.some) > 0) {
+                        operm = json.value_number(opmf.some)::u32;
+                    }
+                }
+                if (p == nil || pn == 0 || st == nil || pathx.check(p) != pathx.P_OK) {
+                    commit.unlock(?held);
+                    ret simple_error(w, "undo_corrupt", "invalid file entry in undo snapshot");
+                }
+                if (has_old && psha != nil && pshan == 64) {
+                    var chk_psha: [65]u8;
+                    commit.hash_hex(old_t, old_n, ?chk_psha[0]);
+                    if (!util.eq(psha, ?chk_psha[0])) {
+                        commit.unlock(?held);
+                        ret simple_error(w, "undo_corrupt", "undo snapshot old_text hash does not match recorded prev_sha256");
+                    }
+                }
+                val existing_idx: i64 = find_rev_entry(?rev_set, p);
+                if (existing_idx >= 0) {
+                    val ent: *commit.Entry = commit.entry(?rev_set, existing_idx::usize);
+                    if (util.eq(st, "created")) {
+                        ent.mode = commit.MODE_DELETE;
+                        ent.data = nil;
+                        ent.len = 0;
+                        ent.target_perm = 0;
+                        if (!force && !ent.has_expect) { ent.must_be_absent = true; }
+                        or { ent.must_be_absent = false; }
+                    }
+                    or (util.eq(st, "replaced") || util.eq(st, "deleted")) {
+                        if (!has_old) {
+                            commit.unlock(?held);
+                            ret simple_error(w, "undo_unavailable", "undo snapshot does not hold previous text for a file");
                         }
-                        or (util.eq(st, "replaced") || util.eq(st, "deleted")) {
-                            if (!has_old) {
-                                commit.unlock(?held);
-                                ret simple_error(w, "undo_unavailable", "undo snapshot does not hold previous text for a file");
+                        ent.must_be_absent = false;
+                        ent.data = old_t;
+                        ent.len = old_n;
+                        ent.target_perm = operm;
+                        commit.hash_hex(old_t, old_n, ?ent.sha[0]);
+                        if (force) { ent.mode = commit.MODE_UPSERT; }
+                        or (ent.has_expect) { ent.mode = commit.MODE_REPLACE; }
+                        or { ent.mode = commit.MODE_CREATE; }
+                    }
+                    or {
+                        commit.unlock(?held);
+                        ret simple_error(w, "undo_corrupt", "unknown status in undo snapshot");
+                    }
+                }
+                or {
+                    if (util.eq(st, "created")) {
+                        val added: res[usize, A.Error] = commit.add(?rev_set, p, nil, 0, commit.MODE_DELETE);
+                        if (sel added.ok) {
+                            if (!force && sha != nil) {
+                                commit.set_expect(commit.entry(?rev_set, added.ok), sha);
                             }
-                            ent.mode = commit.MODE_UPSERT;
-                            ent.data = old_t;
-                            ent.len = old_n;
-                            commit.hash_hex(old_t, old_n, ?ent.sha[0]);
+                        }
+                    }
+                    or (util.eq(st, "replaced")) {
+                        if (!has_old) {
+                            commit.unlock(?held);
+                            ret simple_error(w, "undo_unavailable", "undo snapshot does not hold previous text for a replaced file");
+                        }
+                        var mode: u8 = commit.MODE_REPLACE;
+                        if (force) { mode = commit.MODE_UPSERT; }
+                        val added: res[usize, A.Error] = commit.add(?rev_set, p, old_t, old_n, mode);
+                        if (sel added.ok) {
+                            val ent: *commit.Entry = commit.entry(?rev_set, added.ok);
+                            ent.target_perm = operm;
+                            if (!force && sha != nil) {
+                                commit.set_expect(ent, sha);
+                            }
+                        }
+                    }
+                    or (util.eq(st, "deleted")) {
+                        if (!has_old) {
+                            commit.unlock(?held);
+                            ret simple_error(w, "undo_unavailable", "undo snapshot does not hold previous text for a deleted file");
+                        }
+                        var mode: u8 = commit.MODE_CREATE;
+                        if (force) { mode = commit.MODE_UPSERT; }
+                        val added: res[usize, A.Error] = commit.add(?rev_set, p, old_t, old_n, mode);
+                        if (sel added.ok) {
+                            val ent: *commit.Entry = commit.entry(?rev_set, added.ok);
+                            ent.target_perm = operm;
                         }
                     }
                     or {
-                        if (util.eq(st, "created")) {
-                            val added: res[usize, A.Error] = commit.add(?rev_set, p, nil, 0, commit.MODE_DELETE);
-                            if (sel added.ok) {
-                                if (!force && sha != nil) {
-                                    commit.set_expect(commit.entry(?rev_set, added.ok), sha);
-                                }
-                            }
-                        }
-                        or (util.eq(st, "replaced")) {
-                            if (!has_old) {
-                                commit.unlock(?held);
-                                ret simple_error(w, "undo_unavailable", "undo snapshot does not hold previous text for a replaced file");
-                            }
-                            var mode: u8 = commit.MODE_REPLACE;
-                            if (force) { mode = commit.MODE_UPSERT; }
-                            val added: res[usize, A.Error] = commit.add(?rev_set, p, old_t, old_n, mode);
-                            if (sel added.ok) {
-                                if (!force && sha != nil) {
-                                    commit.set_expect(commit.entry(?rev_set, added.ok), sha);
-                                }
-                            }
-                        }
-                        or (util.eq(st, "deleted")) {
-                            if (!has_old) {
-                                commit.unlock(?held);
-                                ret simple_error(w, "undo_unavailable", "undo snapshot does not hold previous text for a deleted file");
-                            }
-                            var mode: u8 = commit.MODE_CREATE;
-                            if (force) { mode = commit.MODE_UPSERT; }
-                            commit.add(?rev_set, p, old_t, old_n, mode);
-                        }
+                        commit.unlock(?held);
+                        ret simple_error(w, "undo_corrupt", "unknown status in undo snapshot");
                     }
                 }
             }
@@ -1260,6 +1633,14 @@ pub fun undo(s: *session.Session, args: *json.Value, w: *jw.Jw) bool {
         cur_txn = prev_txn;
         cur_txn_n = prev_n;
         step_i = step_i + 1;
+    }
+
+    var redo_w: jw.Jw = jw.init(a);
+    var rk: usize = steps::usize;
+    for (rk > 0) {
+        rk = rk - 1;
+        if (redo_w.len > 0) { jw.byte(?redo_w, '\n'); }
+        jw.raw_vn(?redo_w, undone_txns[rk], undone_lens[rk]);
     }
 
     commit.observe(?rev_set);
@@ -1273,32 +1654,61 @@ pub fun undo(s: *session.Session, args: *json.Value, w: *jw.Jw) bool {
     }
     var utxn: [17]u8;
     txn_id(?utxn[0]);
-    if (!dry && commit.dirty(?rev_set)) {
-        val out: commit.Outcome = commit.publish(?rev_set);
-        if (!out.ok) {
-            commit.unlock(?held);
-            error_obj(w, out.code, out.msg);
-            if (out.rollback_failed) {
-                jw.f_bool(w, "rollback_failed", true);
-                jw.f_bool(w, "recovery_required", true);
+    if (!dry) {
+        if (commit.dirty(?rev_set)) {
+            if (!write_wal_publishing(a, s.root, "undo", ?utxn[0], ?rev_set, true)) {
+                clear_wal(a, s.root);
+                commit.unlock(?held);
+                ret simple_error(w, "undo_failed", "could not persist write-ahead log under .qark before undo; nothing was reverted");
             }
-            jw.obj_end(w);
-            ret false;
+            val out: commit.Outcome = commit.publish(?rev_set);
+            if (!out.ok) {
+                if (!out.rollback_failed) {
+                    clear_wal(a, s.root);
+                }
+                commit.unlock(?held);
+                error_obj(w, out.code, out.msg);
+                if (out.rollback_failed) {
+                    jw.f_bool(w, "rollback_failed", true);
+                    jw.f_bool(w, "recovery_required", true);
+                }
+                jw.obj_end(w);
+                ret false;
+            }
+        }
+        val joff: i64 = undo_journal_line(s, ?rev_set, "transaction.undone", ?utxn[0], last_reverted);
+        if (joff < 0 || !write_wal_committed(a, s.root, "undo", ?utxn[0], prev_txn, prev_n, redo_w.buf, redo_w.len, false)) {
+            val r_st: i64 = recover_wal(a, s.root);
+            commit.unlock(?held);
+            if (r_st < 0) {
+                ret recovery_error(w, "undo journal write failed and automatic rollback also failed; workspace recovery is required");
+            }
+            ret simple_error(w, "journal_failed", "undo could not be recorded in .qark/journal.ndjson; changes were rolled back");
         }
         val redo_p: res[str, A.Error] = pathx.native(a, s.root, ".qark/undo/redo");
-        if (sel redo_p.ok) {
-            filesystem.replace_bytes_atomic(a, redo_p.ok, first_txn, first_txn_n, 384, 448);
+        if (sel redo_p.err) { commit.unlock(?held); ret simple_error(w, "oom", "out of memory"); }
+        val wr_redo: err[filesystem.FsError] = filesystem.replace_bytes_atomic(a, redo_p.ok, redo_w.buf, redo_w.len, 384, 448);
+        if (sel wr_redo.err) {
+            commit.unlock(?held);
+            ret simple_error(w, "undo_failed", "undo committed, but writing .qark/undo/redo failed");
         }
         val lat_p: res[str, A.Error] = pathx.native(a, s.root, ".qark/undo/latest");
-        if (sel lat_p.ok) {
-            if (prev_txn != nil && prev_n > 0) {
-                filesystem.replace_bytes_atomic(a, lat_p.ok, prev_txn, prev_n, 384, 448);
-            }
-            or {
-                filesystem.remove_file(lat_p.ok);
+        if (sel lat_p.err) { commit.unlock(?held); ret simple_error(w, "oom", "out of memory"); }
+        if (prev_txn != nil && prev_n > 0) {
+            val wr_lat: err[filesystem.FsError] = filesystem.replace_bytes_atomic(a, lat_p.ok, prev_txn, prev_n, 384, 448);
+            if (sel wr_lat.err) {
+                commit.unlock(?held);
+                ret simple_error(w, "undo_failed", "undo committed, but updating .qark/undo/latest failed");
             }
         }
-        undo_journal_line(s, ?rev_set, "transaction.undone", ?utxn[0], last_reverted);
+        or {
+            val rm_lat: err[io_error.Error] = filesystem.remove_file(lat_p.ok);
+            if (sel rm_lat.err && rm_lat.err.kind != io_error.NOT_FOUND) {
+                commit.unlock(?held);
+                ret simple_error(w, "undo_failed", "undo committed, but clearing .qark/undo/latest failed");
+            }
+        }
+        clear_wal(a, s.root);
     }
     commit.unlock(?held);
     jw.obj(w);
@@ -1340,7 +1750,7 @@ fun has_any_file_check(set: *commit.Set) bool {
     ret false;
 }
 
-fun eval_check_block(set: *commit.Set, sp_check: u8, out_failed: *i64, out_errored: *i64, out_req_unavail: *i64) bool {
+fun eval_check_block(set: *commit.Set, sp_check: u8, proj_val_ok: bool, out_failed: *i64, out_errored: *i64, out_req_unavail: *i64) bool {
     var failed_n: i64 = 0;
     var err_n: i64 = 0;
     var req_n: i64 = 0;
@@ -1356,7 +1766,7 @@ fun eval_check_block(set: *commit.Set, sp_check: u8, out_failed: *i64, out_error
                 or (e.check == commit.CK_ERROR && pol != spec.CHECK_PERMISSIVE) {
                     err_n = err_n + 1;
                 }
-                or (pol == spec.CHECK_REQUIRED && (e.check == commit.CK_SKIPPED || e.check == commit.CK_NONE)) {
+                or (pol == spec.CHECK_REQUIRED && (e.check == commit.CK_SKIPPED || (e.check == commit.CK_NONE && !proj_val_ok))) {
                     req_n = req_n + 1;
                 }
             }
@@ -1367,6 +1777,64 @@ fun eval_check_block(set: *commit.Set, sp_check: u8, out_failed: *i64, out_error
     @out_errored = err_n;
     @out_req_unavail = req_n;
     ret failed_n > 0 || err_n > 0 || req_n > 0;
+}
+
+# 0 no existing record, 1 matched & replayed into w, -1 mismatch or corrupt (error emitted into w)
+fun check_idempotency(a: *A.Allocator, root: str, idem_rel: str, req_sha: *u8, w: *jw.Jw) i64 {
+    if (idem_rel == nil) { ret 0; }
+    if (!commit.check_control_dir(a, root)) {
+        simple_error(w, "idempotency_corrupt", "invalid .qark/idempotency control directory");
+        ret -1;
+    }
+    val ifull: res[str, A.Error] = pathx.native(a, root, idem_rel);
+    if (sel ifull.err) {
+        simple_error(w, "oom", "out of memory");
+        ret -1;
+    }
+    val im: res[filesystem.Metadata, io_error.Error] = filesystem.metadata_link(ifull.ok);
+    if (sel im.err) {
+        if (im.err.kind == io_error.NOT_FOUND || im.err.kind == io_error.NOT_DIRECTORY) { ret 0; }
+        simple_error(w, "idempotency_corrupt", "could not inspect existing idempotency record");
+        ret -1;
+    }
+    if (im.ok.kind != filesystem.KIND_FILE) {
+        simple_error(w, "idempotency_corrupt", "idempotency record is not a regular file");
+        ret -1;
+    }
+    val itxt: res[str, filesystem.FsError] = filesystem.read_string(a, ifull.ok);
+    if (sel itxt.err) {
+        simple_error(w, "idempotency_corrupt", "could not read existing idempotency record");
+        ret -1;
+    }
+    val iparsed: res[json.Value, json.JsonError] = json.parse(itxt.ok, str_len(itxt.ok), a);
+    if (sel iparsed.err) {
+        simple_error(w, "idempotency_corrupt", "existing idempotency record is not valid json");
+        ret -1;
+    }
+    var idoc: json.Value = iparsed.ok;
+    if (!json.value_is_object(?idoc)) {
+        simple_error(w, "idempotency_corrupt", "existing idempotency record root must be an object");
+        ret -1;
+    }
+    var isha: *u8 = nil;
+    var ishan: usize = 0;
+    val isf: opt[*json.Value] = json.value_find(?idoc, "spec_sha256");
+    if (sel isf.some) { spec.decode_pub(a, isf.some, ?isha, ?ishan); }
+    if (isha == nil || ishan != 64) {
+        simple_error(w, "idempotency_corrupt", "existing idempotency record is missing spec_sha256");
+        ret -1;
+    }
+    if (!util.eq(isha, req_sha)) {
+        simple_error(w, "idempotency_mismatch", "idempotency_key was already used with a different spec payload");
+        ret -1;
+    }
+    val irec: opt[*json.Value] = json.value_find(?idoc, "receipt");
+    if (!sel irec.some) {
+        simple_error(w, "idempotency_corrupt", "existing idempotency record is missing receipt");
+        ret -1;
+    }
+    spec.emit_json(w, irec.some, false, 0);
+    ret 1;
 }
 
 # apply a spec: compile, observe, check, validate, then publish under the workspace lock
@@ -1402,6 +1870,7 @@ pub fun apply(s: *session.Session, args: *json.Value, w: *jw.Jw) bool {
     }
     var ik_p: *u8 = nil;
     var ik_n: usize = 0;
+    var idem_rel: str = nil;
     if (json.value_is_object(args)) {
         val ikf: opt[*json.Value] = json.value_find(args, "idempotency_key");
         if (sel ikf.some) {
@@ -1413,6 +1882,11 @@ pub fun apply(s: *session.Session, args: *json.Value, w: *jw.Jw) bool {
             if (pathx.check(ik_p) != pathx.P_OK || sel sl1.some || sel sl2.some) {
                 ret simple_error(w, "spec_type", "idempotency_key must be a single path-safe token");
             }
+            var iw: jw.Jw = jw.init(a);
+            jw.raw(?iw, ".qark/idempotency/");
+            jw.raw(?iw, ik_p);
+            jw.raw(?iw, ".json");
+            idem_rel = jw.text(?iw);
         }
     }
     var ev_w: jw.Jw = jw.init(a);
@@ -1424,8 +1898,22 @@ pub fun apply(s: *session.Session, args: *json.Value, w: *jw.Jw) bool {
         val pcf: opt[*json.Value] = json.value_find(args, "project_check");
         if (sel pcf.some) { val_spec = pcf.some; }
     }
+    if (s.require_check && val_spec != nil && json.value_is_bool(val_spec) && !json.value_bool(val_spec)) {
+        ret simple_error(w, "check_unavailable", "session requires syntax checking (--require-check); validate cannot be disabled");
+    }
+
     var compact: jw.Jw = jw.init(a);
     spec.emit_json(?compact, args, false, 0);
+    var req_sha: [65]u8;
+    commit.hash_hex(compact.buf, compact.len, ?req_sha[0]);
+
+    # Check idempotency BEFORE spec.compile so retries of already-applied edits/moves/deletes succeed
+    if (idem_rel != nil) {
+        val id_st0: i64 = check_idempotency(a, s.root, idem_rel, ?req_sha[0], w);
+        if (id_st0 == 1) { ret true; }
+        if (id_st0 < 0) { ret false; }
+    }
+
     var sp: spec.Spec;
     var e: spec.Err;
     var lib: spec.Lib;
@@ -1434,41 +1922,31 @@ pub fun apply(s: *session.Session, args: *json.Value, w: *jw.Jw) bool {
     if (!spec.compile(?sp, a, s.root, args, compact.buf, compact.len, ?lib, ?e)) { ret spec_error(w, ?e); }
     if (s.force_dry) { sp.dry = true; }
     if (s.require_check) {
-        if (sp.check == spec.CHECK_OFF || sp.check == spec.CHECK_PERMISSIVE) {
-            ret simple_error(w, "check_unavailable", "session requires syntax checking (--require-check); check cannot be disabled or permissive");
-        }
-        sp.check = spec.CHECK_REQUIRED;
-    }
-
-    # Check idempotency record if idempotency_key was supplied
-    var idem_rel: str = nil;
-    if (ik_p != nil && ik_n > 0) {
-        var iw: jw.Jw = jw.init(a);
-        jw.raw(?iw, ".qark/idempotency/");
-        jw.raw(?iw, ik_p);
-        jw.raw(?iw, ".json");
-        idem_rel = jw.text(?iw);
-        val ifull: res[str, A.Error] = pathx.native(a, s.root, idem_rel);
-        if (sel ifull.ok) {
-            val itxt: res[str, filesystem.FsError] = filesystem.read_string(a, ifull.ok);
-            if (sel itxt.ok) {
-                val iparsed: res[json.Value, json.JsonError] = json.parse(itxt.ok, str_len(itxt.ok), a);
-                if (sel iparsed.ok) {
-                    var idoc: json.Value = iparsed.ok;
-                    var isha: *u8 = nil;
-                    var ishan: usize = 0;
-                    val isf: opt[*json.Value] = json.value_find(?idoc, "spec_sha256");
-                    if (sel isf.some) { spec.decode_pub(a, isf.some, ?isha, ?ishan); }
-                    if (isha != nil && !util.eq(isha, ?sp.sha[0])) {
-                        ret simple_error(w, "idempotency_mismatch", "idempotency_key was already used with a different spec payload");
-                    }
-                    val irec: opt[*json.Value] = json.value_find(?idoc, "receipt");
-                    if (sel irec.some) {
-                        spec.emit_json(w, irec.some, false, 0);
-                        ret true;
+        var top_chk_weak: bool = sp.check == spec.CHECK_OFF || sp.check == spec.CHECK_PERMISSIVE;
+        if (json.value_is_object(args)) {
+            val top_cf: opt[*json.Value] = json.value_find(args, "check");
+            if (sel top_cf.some) {
+                if (json.value_is_string(top_cf.some)) {
+                    var tcp: *u8 = nil;
+                    var tcn: usize = 0;
+                    if (spec.decode_pub(a, top_cf.some, ?tcp, ?tcn) && util.eq(tcp, "strict")) {
+                        top_chk_weak = true;
                     }
                 }
             }
+        }
+        if (top_chk_weak) {
+            ret simple_error(w, "check_unavailable", "session requires syntax checking (--require-check); check policy cannot be weakened");
+        }
+        sp.check = spec.CHECK_REQUIRED;
+        var pci: usize = 0;
+        for (pci < commit.count(?sp.set)) {
+            val pce: *commit.Entry = commit.entry(?sp.set, pci);
+            if (pce.check_policy == commit.CP_OFF || pce.check_policy == commit.CP_PERMISSIVE || pce.check_policy == commit.CP_STRICT) {
+                ret simple_error(w, "check_unavailable", "session requires syntax checking (--require-check); per-file check policy cannot weaken required checking");
+            }
+            pce.check_policy = commit.CP_REQUIRED;
+            pci = pci + 1;
         }
     }
 
@@ -1476,21 +1954,54 @@ pub fun apply(s: *session.Session, args: *json.Value, w: *jw.Jw) bool {
     val t_compile: i64 = now_us(t0);
     if (stream) { push_event(?ev_w, ?ev_cnt, "compile", "ok", t_compile, commit.count(?sp.set)::i64); }
 
-    var dheld: commit.Lock;
+    var held: commit.Lock;
+    val locked: i64 = commit.lock(?sp.set, s.lock_ms, ?held);
+    if (locked == 1) { ret simple_error(w, "locked", "another qark process held the workspace lock too long; nothing was written. retry the same request"); }
+    if (locked != 0) { ret simple_error(w, "lock_failed", "the workspace lock under .qark could not be taken; nothing was written"); }
+
     if (sp.dry) {
-        val dlocked: i64 = commit.lock(?sp.set, s.lock_ms, ?dheld);
-        if (dlocked == 1) { ret simple_error(w, "locked", "another qark process held the workspace lock too long; retry the same request"); }
-        if (dlocked != 0) { ret simple_error(w, "lock_failed", "the workspace lock under .qark could not be taken"); }
-        recover_wal(a, s.root);
+        if (has_pending_wal(a, s.root)) {
+            commit.unlock(?held);
+            ret recovery_error(w, "an interrupted transaction requires workspace recovery before previewing changes");
+        }
+    }
+    or {
+        if (recover_wal(a, s.root) < 0) {
+            commit.unlock(?held);
+            ret recovery_error(w, "workspace recovery from an interrupted transaction failed; manual inspection is required");
+        }
+        if (idem_rel != nil) {
+            val id_st1: i64 = check_idempotency(a, s.root, idem_rel, ?req_sha[0], w);
+            if (id_st1 == 1) {
+                commit.unlock(?held);
+                ret true;
+            }
+            if (id_st1 < 0) {
+                commit.unlock(?held);
+                ret false;
+            }
+        }
     }
 
     commit.observe(?sp.set);
+    var sz_i: usize = 0;
+    for (sz_i < commit.count(?sp.set)) {
+        val sze: *commit.Entry = commit.entry(?sp.set, sz_i);
+        if ((sze.status == commit.ST_REPLACE || sze.status == commit.ST_DELETE) && sze.old_len > spec.MAX_FILE_BYTES) {
+            commit.unlock(?held);
+            error_obj(w, "spec_limit", "an existing file exceeds the 8 MiB transaction recovery snapshot limit; nothing was written");
+            jw.f_str(w, "path", sze.rel);
+            jw.obj_end(w);
+            ret false;
+        }
+        sz_i = sz_i + 1;
+    }
     if (req_expect) {
         var rxi: usize = 0;
         for (rxi < commit.count(?sp.set)) {
             val rxe: *commit.Entry = commit.entry(?sp.set, rxi);
             if (rxe.existed && !rxe.has_expect) {
-                if (sp.dry) { commit.unlock(?dheld); }
+                commit.unlock(?held);
                 error_obj(w, "expect_required", "require_expect is true, but an existing file was modified or deleted without expect");
                 jw.f_str(w, "path", rxe.rel);
                 jw.f_str(w, "current_sha256", ?rxe.old_sha[0]);
@@ -1507,6 +2018,7 @@ pub fun apply(s: *session.Session, args: *json.Value, w: *jw.Jw) bool {
         push_event(?ev_w, ?ev_cnt, "observe", obs_st, now_us(t0) - t_compile, conflicts);
     }
     if (conflicts > 0 && !sp.dry) {
+        commit.unlock(?held);
         error_obj(w, "conflict", "a file conflicts with what is on disk; nothing was written. each conflict below names the reason and the current sha256");
         files_list(w, ?sp.set, false, false, true, false, a);
         jw.obj_end(w);
@@ -1520,12 +2032,12 @@ pub fun apply(s: *session.Session, args: *json.Value, w: *jw.Jw) bool {
     val do_check: bool = sp.check != spec.CHECK_OFF || has_any_file_check(?sp.set);
     if (do_check) {
         check.run(a, s.a, s.root, ?sp.set, ?s.tools, timeout_ms);
-        if (sp.dry && conflicts == 0 && check.has_staged(a, s.root, ?sp.set)) {
+        if (conflicts == 0 && check.has_staged(a, s.root, ?sp.set)) {
             check.run_staged(a, s.root, ?sp.set, timeout_ms);
         }
         t_check = now_us(t0);
     }
-    if (sp.dry && conflicts == 0 && val_spec != nil) {
+    if (conflicts == 0 && (val_spec != nil || do_check)) {
         val t_dval0: i64 = now_us(t0);
         val_ok = check.run_project_validation(a, s.root, ?sp.set, val_spec, timeout_ms, ?val_ran, ?val_msg);
         if (val_ran && stream) {
@@ -1535,14 +2047,11 @@ pub fun apply(s: *session.Session, args: *json.Value, w: *jw.Jw) bool {
         }
         t_check = now_us(t0);
     }
-    if (sp.dry) {
-        commit.unlock(?dheld);
-    }
 
     var failed: i64 = 0;
     var errored: i64 = 0;
     var req_unavail: i64 = 0;
-    val chk_blocked: bool = eval_check_block(?sp.set, sp.check, ?failed, ?errored, ?req_unavail);
+    val chk_blocked: bool = eval_check_block(?sp.set, sp.check, val_ran && val_ok, ?failed, ?errored, ?req_unavail);
     val total_errored: i64 = check_tally(?sp.set, commit.CK_ERROR);
     if (do_check && stream) {
         var chk_ev_st: str = "ok";
@@ -1551,7 +2060,11 @@ pub fun apply(s: *session.Session, args: *json.Value, w: *jw.Jw) bool {
     }
     val blocked: bool = chk_blocked || (val_ran && !val_ok);
     if (blocked && !sp.dry) {
-        if (failed > 0) {
+        commit.unlock(?held);
+        if (val_ran && !val_ok && failed == 0 && errored == 0) {
+            error_obj(w, "check_failed", "project validation failed before commit; nothing was written");
+        }
+        or (failed > 0) {
             error_obj(w, "check_failed", "a file failed its syntax check; nothing was written. fix the lines named below and apply again");
         }
         or (errored > 0) {
@@ -1559,6 +2072,9 @@ pub fun apply(s: *session.Session, args: *json.Value, w: *jw.Jw) bool {
         }
         or {
             error_obj(w, "check_unavailable", "check is required but a checker could not run or no checker is configured for a file; nothing was written");
+        }
+        if (val_ran && !val_ok && val_msg != nil) {
+            jw.f_str(w, "validation_message", val_msg);
         }
         jw.f_str(w, "check_policy", check_policy_name(sp.check));
         jw.f_bool(w, "validation_complete", false);
@@ -1585,120 +2101,44 @@ pub fun apply(s: *session.Session, args: *json.Value, w: *jw.Jw) bool {
     var txn: [17]u8;
     txn_id(?txn[0]);
     var journal: i64 = -1;
-    val need_lock: bool = !sp.dry && (commit.dirty(?sp.set) || val_spec != nil);
-    if (need_lock) {
-        var held: commit.Lock;
-        val locked: i64 = commit.lock(?sp.set, s.lock_ms, ?held);
-        if (locked == 1) { ret simple_error(w, "locked", "another qark process held the workspace lock too long; nothing was written. retry the same request"); }
-        if (locked != 0) { ret simple_error(w, "lock_failed", "the workspace lock under .qark could not be taken; nothing was written"); }
-        recover_wal(a, s.root);
-        commit.observe(?sp.set);
-        if (req_expect) {
-            var rxi2: usize = 0;
-            for (rxi2 < commit.count(?sp.set)) {
-                val rxe2: *commit.Entry = commit.entry(?sp.set, rxi2);
-                if (rxe2.existed && !rxe2.has_expect) {
-                    commit.unlock(?held);
-                    error_obj(w, "expect_required", "require_expect is true, but an existing file was modified or deleted without expect");
-                    jw.f_str(w, "path", rxe2.rel);
-                    jw.f_str(w, "current_sha256", ?rxe2.old_sha[0]);
-                    jw.obj_end(w);
-                    ret false;
-                }
-                rxi2 = rxi2 + 1;
-            }
-        }
-        if (commit.tally(?sp.set, commit.ST_CONFLICT) > 0) {
+    if (!sp.dry && commit.dirty(?sp.set)) {
+        if (!write_undo_snapshot(s, ?sp, ?txn[0]) || !write_wal_publishing(a, s.root, "apply", ?txn[0], nil, false)) {
+            remove_undo_snapshot(a, s.root, ?txn[0]);
+            clear_wal(a, s.root);
             commit.unlock(?held);
-            error_obj(w, "conflict", "a file changed while this apply was checking; nothing was written");
-            files_list(w, ?sp.set, false, false, true, false, a);
+            ret simple_error(w, "undo_failed", "could not persist undo snapshot or write-ahead log under .qark before commit; nothing was written");
+        }
+        val out: commit.Outcome = commit.publish(?sp.set);
+        if (!out.ok) {
+            if (!out.rollback_failed) {
+                remove_undo_snapshot(a, s.root, ?txn[0]);
+                clear_wal(a, s.root);
+            }
+            commit.unlock(?held);
+            error_obj(w, out.code, out.msg);
+            if (out.index >= 0) { jw.f_str(w, "path", commit.entry(?sp.set, out.index::usize).rel); }
+            if (out.rollback_failed) {
+                jw.f_bool(w, "rollback_failed", true);
+                jw.f_bool(w, "recovery_required", true);
+                files_list(w, ?sp.set, false, false, false, false, a);
+            }
             jw.obj_end(w);
             ret false;
         }
-        if (do_check) {
-            check.run_staged(a, s.root, ?sp.set, timeout_ms);
-            t_check = now_us(t0);
-            var st_fail: i64 = 0;
-            var st_err: i64 = 0;
-            var st_req: i64 = 0;
-            if (eval_check_block(?sp.set, sp.check, ?st_fail, ?st_err, ?st_req)) {
-                commit.unlock(?held);
-                if (st_fail > 0) {
-                    error_obj(w, "check_failed", "a file failed its project check; nothing was written. fix the lines named below and apply again");
-                }
-                or (st_err > 0) {
-                    error_obj(w, "checker_error", "a project checker crashed or timed out; nothing was written");
-                }
-                or {
-                    error_obj(w, "check_unavailable", "check is required but a checker could not run; nothing was written");
-                }
-                jw.f_str(w, "check_policy", check_policy_name(sp.check));
-                jw.f_bool(w, "validation_complete", false);
-                emit_checks_summary(w, ?sp.set);
-                jw.key(w, "files");
-                jw.arr(w);
-                var ci: usize = 0;
-                for (ci < commit.count(?sp.set)) {
-                    val en: *commit.Entry = commit.entry(?sp.set, ci);
-                    if (en.check == commit.CK_FAILED || en.check == commit.CK_ERROR) { file_receipt(w, a, en, false, false, false); }
-                    ci = ci + 1;
-                }
-                jw.arr_end(w);
-                jw.obj_end(w);
-                ret false;
+        journal = journal_line(s, ?sp, ?txn[0], val_ran, val_ok);
+        if (journal < 0 || !write_wal_committed(a, s.root, "apply", ?txn[0], ?txn[0], str_len(?txn[0]), nil, 0, true)) {
+            val r_st: i64 = recover_wal(a, s.root);
+            commit.unlock(?held);
+            if (r_st < 0) {
+                ret recovery_error(w, "journal write failed after publish and automatic rollback also failed; workspace recovery is required");
             }
+            ret simple_error(w, "journal_failed", "transaction could not be recorded in .qark/journal.ndjson; changes were rolled back");
         }
-        if (val_spec != nil || do_check) {
-            val t_val0: i64 = now_us(t0);
-            val_ok = check.run_project_validation(a, s.root, ?sp.set, val_spec, timeout_ms, ?val_ran, ?val_msg);
-            if (val_ran && stream) {
-                var vst: str = "ok";
-                if (!val_ok) { vst = "failed"; }
-                push_event(?ev_w, ?ev_cnt, "validate", vst, now_us(t0) - t_val0, -1);
-            }
-            if (val_ran && !val_ok) {
-                commit.unlock(?held);
-                error_obj(w, "check_failed", "project validation failed before commit; nothing was written");
-                if (val_msg != nil) { jw.f_str(w, "validation_message", val_msg); }
-                files_list(w, ?sp.set, false, false, false, false, a);
-                jw.obj_end(w);
-                ret false;
-            }
+        if (!commit_undo_pointers(s, ?txn[0])) {
+            commit.unlock(?held);
+            ret simple_error(w, "undo_failed", "transaction committed, but updating .qark/undo/latest failed");
         }
-        if (commit.dirty(?sp.set)) {
-            if (!write_undo_snapshot(s, ?sp, ?txn[0]) || !write_wal(a, s.root, ?txn[0])) {
-                remove_undo_snapshot(a, s.root, ?txn[0]);
-                clear_wal(a, s.root);
-                commit.unlock(?held);
-                ret simple_error(w, "undo_failed", "could not persist undo snapshot or write-ahead log under .qark before commit; nothing was written");
-            }
-            val out: commit.Outcome = commit.publish(?sp.set);
-            if (!out.ok) {
-                if (!out.rollback_failed) {
-                    remove_undo_snapshot(a, s.root, ?txn[0]);
-                    clear_wal(a, s.root);
-                }
-                commit.unlock(?held);
-                error_obj(w, out.code, out.msg);
-                if (out.index >= 0) { jw.f_str(w, "path", commit.entry(?sp.set, out.index::usize).rel); }
-                if (out.rollback_failed) {
-                    jw.f_bool(w, "rollback_failed", true);
-                    jw.f_bool(w, "recovery_required", true);
-                    files_list(w, ?sp.set, false, false, false, false, a);
-                }
-                jw.obj_end(w);
-                ret false;
-            }
-            journal = journal_line(s, ?sp, ?txn[0], val_ran, val_ok);
-            if (journal < 0 || !commit_undo_pointers(s, ?txn[0])) {
-                recover_wal(a, s.root);
-                commit.unlock(?held);
-                ret simple_error(w, "journal_failed", "transaction could not be recorded in .qark/journal.ndjson; changes were rolled back");
-            }
-            clear_wal(a, s.root);
-            s.written = s.written + commit.tally(?sp.set, commit.ST_CREATE) + commit.tally(?sp.set, commit.ST_REPLACE);
-        }
-        commit.unlock(?held);
+        s.written = s.written + commit.tally(?sp.set, commit.ST_CREATE) + commit.tally(?sp.set, commit.ST_REPLACE);
     }
     s.applies = s.applies + 1;
     val t_total: i64 = now_us(t0);
@@ -1757,23 +2197,37 @@ pub fun apply(s: *session.Session, args: *json.Value, w: *jw.Jw) bool {
     jw.obj_end(?rw);
 
     if (!sp.dry && idem_rel != nil && !rw.failed && rw.buf != nil && rw.len >= 2) {
-        if (commit.check_control_dir(a, s.root)) {
-            val ifull2: res[str, A.Error] = pathx.native(a, s.root, idem_rel);
-            if (sel ifull2.ok) {
-                var idw: jw.Jw = jw.init(a);
-                jw.obj(?idw);
-                jw.f_str(?idw, "spec_sha256", ?sp.sha[0]);
-                jw.key(?idw, "receipt");
-                jw.raw_vn(?idw, rw.buf, rw.len - 1);
-                jw.raw(?idw, ",\"replayed\":true}");
-                jw.obj_end(?idw);
-                jw.byte(?idw, '\n');
-                if (!idw.failed && idw.buf != nil) {
-                    filesystem.replace_bytes_atomic(a, ifull2.ok, idw.buf, idw.len, 384, 448);
-                }
-            }
+        if (!commit.check_control_dir(a, s.root)) {
+            commit.unlock(?held);
+            ret simple_error(w, "idempotency_failed", "transaction committed, but .qark/idempotency is invalid");
+        }
+        val ifull2: res[str, A.Error] = pathx.native(a, s.root, idem_rel);
+        if (sel ifull2.err) {
+            commit.unlock(?held);
+            ret simple_error(w, "oom", "out of memory");
+        }
+        var idw: jw.Jw = jw.init(a);
+        jw.obj(?idw);
+        jw.f_str(?idw, "spec_sha256", ?req_sha[0]);
+        jw.key(?idw, "receipt");
+        jw.raw_vn(?idw, rw.buf, rw.len - 1);
+        jw.raw(?idw, ",\"replayed\":true,\"idempotent_replay\":true}");
+        jw.obj_end(?idw);
+        jw.byte(?idw, '\n');
+        if (idw.failed || idw.buf == nil) {
+            commit.unlock(?held);
+            ret simple_error(w, "oom", "out of memory");
+        }
+        val wr_idem: err[filesystem.FsError] = filesystem.replace_bytes_atomic(a, ifull2.ok, idw.buf, idw.len, 384, 448);
+        if (sel wr_idem.err) {
+            commit.unlock(?held);
+            ret simple_error(w, "idempotency_failed", "transaction committed, but persisting .qark/idempotency record failed");
         }
     }
+    if (!sp.dry && commit.dirty(?sp.set)) {
+        clear_wal(a, s.root);
+    }
+    commit.unlock(?held);
     jw.raw_vn(w, rw.buf, rw.len);
     ret true;
 }
@@ -1806,7 +2260,7 @@ fun line_span_bytes(p: *u8, n: usize, use_lo: i64, use_hi: i64, from_out: *usize
     @to_out = to;
 }
 
-fun read_one(s: *session.Session, rel_in: str, content: bool, max: usize, lo: i64, hi: i64, sym_p: *u8, sym_n: usize, syms_list: *vector.Vector[str], fold: bool, outline: bool, w: *jw.Jw) {
+fun read_one(s: *session.Session, rel_in: str, content: bool, rem_bytes: *usize, io_trunc: *bool, lo: i64, hi: i64, sym_p: *u8, sym_n: usize, syms_list: *vector.Vector[str], fold: bool, outline: bool, w: *jw.Jw) {
     val a: *A.Allocator = ?s.ra;
     jw.obj(w);
     val stripped: str = pathx.strip_root(s.root, rel_in);
@@ -1889,7 +2343,10 @@ fun read_one(s: *session.Session, rel_in: str, content: bool, max: usize, lo: i6
                 k = k + 1;
             }
             jw.arr_end(w);
-            if (list.len > 2000) { jw.f_bool(w, "truncated", true); }
+            if (list.len > 2000) {
+                jw.f_bool(w, "truncated", true);
+                @io_trunc = true;
+            }
         }
         jw.obj_end(w);
         ret;
@@ -1953,8 +2410,6 @@ fun read_one(s: *session.Session, rel_in: str, content: bool, max: usize, lo: i6
     if (!fold && sym_p == nil && syms_list != nil && syms_list.len > 0) {
         jw.key(w, "spans");
         jw.arr(w);
-        var combined: jw.Jw = jw.init(a);
-        var rem_bytes: usize = max;
         var any_trunc: bool = false;
         var si: usize = 0;
         for (si < syms_list.len) {
@@ -1973,30 +2428,21 @@ fun read_one(s: *session.Session, rel_in: str, content: bool, max: usize, lo: i6
                 val slen: usize = sto - sfrom;
                 var stake: usize = slen;
                 var scut: bool = false;
-                if (stake > rem_bytes) {
-                    stake = truncate_utf8_len((p::usize + sfrom)::*u8, slen, rem_bytes);
+                if (stake > @rem_bytes) {
+                    stake = truncate_utf8_len((p::usize + sfrom)::*u8, slen, @rem_bytes);
                     scut = true;
                     any_trunc = true;
+                    @io_trunc = true;
                 }
                 jw.f_strn(w, "text", (p::usize + sfrom)::*u8, stake);
                 if (scut) { jw.f_bool(w, "truncated", true); }
-                if (rem_bytes >= stake) { rem_bytes = rem_bytes - stake; }
-                or { rem_bytes = 0; }
-                if (si > 0 && rem_bytes > 0) {
-                    jw.byte(?combined, '\n');
-                    rem_bytes = rem_bytes - 1;
-                }
-                jw.bytes(?combined, (p::usize + sfrom)::*u8, stake);
+                if (@rem_bytes >= stake) { @rem_bytes = @rem_bytes - stake; }
+                or { @rem_bytes = 0; }
             }
             jw.obj_end(w);
             si = si + 1;
         }
         jw.arr_end(w);
-        if (content && !combined.failed && combined.buf != nil) {
-            var ctake: usize = truncate_utf8_len(combined.buf, combined.len, max);
-            if (ctake < combined.len) { any_trunc = true; }
-            jw.f_strn(w, "text", combined.buf, ctake);
-        }
         if (any_trunc) { jw.f_bool(w, "truncated", true); }
         jw.obj_end(w);
         ret;
@@ -2009,10 +2455,13 @@ fun read_one(s: *session.Session, rel_in: str, content: bool, max: usize, lo: i6
             jw.f_bool(w, "folded", true);
             var ftake: usize = fn_len;
             var fcut: bool = false;
-            if (ftake > max) {
-                ftake = truncate_utf8_len(fp, fn_len, max);
+            if (ftake > @rem_bytes) {
+                ftake = truncate_utf8_len(fp, fn_len, @rem_bytes);
                 fcut = true;
+                @io_trunc = true;
             }
+            if (@rem_bytes >= ftake) { @rem_bytes = @rem_bytes - ftake; }
+            or { @rem_bytes = 0; }
             jw.f_strn(w, "text", fp, ftake);
             if (fcut) { jw.f_bool(w, "truncated", true); }
         }
@@ -2025,10 +2474,13 @@ fun read_one(s: *session.Session, rel_in: str, content: bool, max: usize, lo: i6
             }
             var take: usize = to - from;
             var cut: bool = false;
-            if (take > max) {
-                take = truncate_utf8_len((p::usize + from)::*u8, take, max);
+            if (take > @rem_bytes) {
+                take = truncate_utf8_len((p::usize + from)::*u8, take, @rem_bytes);
                 cut = true;
+                @io_trunc = true;
             }
+            if (@rem_bytes >= take) { @rem_bytes = @rem_bytes - take; }
+            or { @rem_bytes = 0; }
             jw.key(w, "text");
             jw.str_n(w, (p::usize + from)::*u8, take);
             if (cut) {
@@ -2085,6 +2537,8 @@ pub fun read(s: *session.Session, args: *json.Value, w: *jw.Jw) bool {
         }
         vector.push[str](?syms_list, sym_p);
     }
+    var rem_bytes: usize = max;
+    var any_trunc: bool = false;
     val ssf: opt[*json.Value] = json.value_find(args, "symbols");
     if (sel ssf.some) {
         if (json.value_is_bool(ssf.some)) {
@@ -2092,6 +2546,7 @@ pub fun read(s: *session.Session, args: *json.Value, w: *jw.Jw) bool {
         }
         or {
             if (!json.value_is_array(ssf.some)) { ret simple_error(w, "read_bad", "symbols must be a list of symbol names or true"); }
+            if (json.value_count(ssf.some) > 64) { any_trunc = true; }
             var si: usize = 0;
             for (si < json.value_count(ssf.some) && si < 64) {
                 val sg: opt[*json.Value] = json.value_get(ssf.some, si);
@@ -2117,7 +2572,7 @@ pub fun read(s: *session.Session, args: *json.Value, w: *jw.Jw) bool {
             var p: *u8 = nil;
             var pn: usize = 0;
             if (spec.decode_pub(a, one.some, ?p, ?pn)) {
-                read_one(s, p, content, max, lo, hi, sym_p, sym_n, ?syms_list, fold, outline, w);
+                read_one(s, p, content, ?rem_bytes, ?any_trunc, lo, hi, sym_p, sym_n, ?syms_list, fold, outline, w);
                 any = true;
             }
         }
@@ -2125,6 +2580,7 @@ pub fun read(s: *session.Session, args: *json.Value, w: *jw.Jw) bool {
     val many: opt[*json.Value] = json.value_find(args, "paths");
     if (sel many.some) {
         if (json.value_is_array(many.some)) {
+            if (json.value_count(many.some) > 256) { any_trunc = true; }
             var i: usize = 0;
             for (i < json.value_count(many.some) && i < 256) {
                 val g: opt[*json.Value] = json.value_get(many.some, i);
@@ -2133,7 +2589,7 @@ pub fun read(s: *session.Session, args: *json.Value, w: *jw.Jw) bool {
                         var p: *u8 = nil;
                         var pn: usize = 0;
                         if (spec.decode_pub(a, g.some, ?p, ?pn)) {
-                            read_one(s, p, content, max, lo, hi, sym_p, sym_n, ?syms_list, fold, outline, w);
+                            read_one(s, p, content, ?rem_bytes, ?any_trunc, lo, hi, sym_p, sym_n, ?syms_list, fold, outline, w);
                             any = true;
                         }
                     }
@@ -2147,6 +2603,7 @@ pub fun read(s: *session.Session, args: *json.Value, w: *jw.Jw) bool {
         ret simple_error(w, "read_bad", "give path or paths, relative to the workspace root; use \".\" for the root directory");
     }
     jw.arr_end(w);
+    if (any_trunc) { jw.f_bool(w, "truncated", true); }
     jw.obj_end(w);
     ret true;
 }
@@ -2763,10 +3220,9 @@ pub fun project_validate(s: *session.Session, args: *json.Value, w: *jw.Jw) bool
         val cf: opt[*json.Value] = json.value_find(args, "cmd");
         if (sel cf.some) { val_spec = cf.some; }
     }
-    var empty_set: commit.Set = commit.init(a, s.root);
     var ran: bool = false;
     var msg: str = nil;
-    val ok: bool = check.run_project_validation(a, s.root, ?empty_set, val_spec, check.TIMEOUT_MS, ?ran, ?msg);
+    val ok: bool = check.run_project_validation(a, s.root, nil, val_spec, check.TIMEOUT_MS, ?ran, ?msg);
     if (!ran) {
         ret simple_error(w, "check_unconfigured", "no project validation command configured; pass validate/cmd or configure project in .qark/checks.json");
     }
@@ -2869,11 +3325,11 @@ pub fun schema(s: *session.Session, args: *json.Value, w: *jw.Jw) bool {
     jw.obj(w);
     if (schema_match(filter_op, "apply")) {
         jw.key(w, "apply");
-        jw.raw_v(w, "{\"fields\":[\"files\",\"path\",\"glob\",\"text\",\"lines\",\"tmpl\",\"template\",\"json\",\"edits\",\"move\",\"delete\",\"mode\",\"expect\",\"require_expect\",\"idempotency_key\",\"check\",\"contract\",\"scope\",\"rebase\",\"base_text\",\"validate\",\"project_check\",\"timeout_ms\",\"best_effort\",\"stream\",\"dry_run\",\"preview\",\"diff\",\"undo\",\"redo\",\"tag\",\"job\",\"dest\",\"vars\",\"templates\",\"expand\"],\"edit_fields\":[\"symbol\",\"with\",\"body\",\"signature\",\"expect_signature\",\"rename\",\"find\",\"find_re\",\"replace\",\"lines\",\"insert_before\",\"insert_after\",\"auto_indent\",\"append\",\"prepend\",\"ex\",\"keys\",\"within\",\"occurrence\",\"all\",\"count\"],\"contract_fields\":[\"symbol\",\"symbols\",\"methods\",\"lines\",\"preserve_signatures\",\"max_lines_changed\",\"max_changed_lines\",\"forbid_delete\"],\"check_policies\":[\"strict\",\"required\",\"permissive\",\"off\"],\"returns\":[\"txn\",\"tag\",\"dry_run\",\"ready\",\"idempotent_replay\",\"check_policy\",\"validation_complete\",\"checks\",\"checker_diagnostics\",\"created\",\"replaced\",\"unchanged\",\"deleted\",\"files\",\"events\"],\"error_fields\":[\"code\",\"message\",\"file\",\"line\",\"col\",\"mismatch_category\",\"target_lines\",\"actual_line\",\"checker_diagnostics\",\"files\",\"rollback_failed\",\"recovery_required\"]}");
+        jw.raw_v(w, "{\"fields\":[\"files\",\"path\",\"glob\",\"text\",\"lines\",\"tmpl\",\"template\",\"json\",\"edits\",\"move\",\"delete\",\"mode\",\"expect\",\"require_expect\",\"idempotency_key\",\"check\",\"contract\",\"scope\",\"rebase\",\"base_text\",\"validate\",\"project_check\",\"timeout_ms\",\"best_effort\",\"stream\",\"dry_run\",\"preview\",\"diff\",\"undo\",\"redo\",\"tag\",\"job\",\"dest\",\"vars\",\"templates\",\"expand\"],\"edit_fields\":[\"symbol\",\"with\",\"body\",\"signature\",\"expect_signature\",\"rename\",\"find\",\"find_re\",\"replace\",\"lines\",\"insert_before\",\"insert_after\",\"auto_indent\",\"append\",\"prepend\",\"ex\",\"keys\",\"within\",\"occurrence\",\"all\",\"count\"],\"contract_fields\":[\"symbol\",\"symbols\",\"methods\",\"lines\",\"preserve_signatures\",\"max_lines_changed\",\"max_changed_lines\",\"forbid_delete\"],\"check_policies\":[\"strict\",\"required\",\"permissive\",\"off\"],\"returns\":[\"txn\",\"tag\",\"dry_run\",\"ready\",\"replayed\",\"idempotent_replay\",\"check_policy\",\"validation_complete\",\"checks\",\"checker_diagnostics\",\"created\",\"replaced\",\"unchanged\",\"deleted\",\"files\",\"events\"],\"error_fields\":[\"code\",\"message\",\"file\",\"line\",\"col\",\"mismatch_category\",\"target_lines\",\"actual_line\",\"checker_diagnostics\",\"files\",\"rollback_failed\",\"recovery_required\"]}");
     }
     if (schema_match(filter_op, "read")) {
         jw.key(w, "read");
-        jw.raw_v(w, "{\"fields\":[\"path\",\"paths\",\"content\",\"lines\",\"symbol\",\"symbols\",\"fold\",\"outline\",\"max_bytes\"],\"returns\":[\"files\"]}");
+        jw.raw_v(w, "{\"fields\":[\"path\",\"paths\",\"content\",\"lines\",\"symbol\",\"symbols\",\"fold\",\"outline\",\"max_bytes\"],\"returns\":[\"files\",\"truncated\"]}");
     }
     if (schema_match(filter_op, "search")) {
         jw.key(w, "search");
@@ -2885,11 +3341,11 @@ pub fun schema(s: *session.Session, args: *json.Value, w: *jw.Jw) bool {
     }
     if (schema_match(filter_op, "undo")) {
         jw.key(w, "undo");
-        jw.raw_v(w, "{\"fields\":[\"txn\",\"steps\",\"list\",\"redo\",\"dry_run\",\"force\",\"diff\"],\"returns\":[\"undone\",\"dry_run\",\"ready\",\"txn\",\"steps\",\"files\"]}");
+        jw.raw_v(w, "{\"fields\":[\"txn\",\"steps\",\"list\",\"redo\",\"dry_run\",\"force\",\"diff\"],\"returns\":[\"txn\",\"reverted_txn\",\"steps_reverted\",\"dry_run\",\"created\",\"replaced\",\"unchanged\",\"deleted\",\"files\",\"txns\",\"count\"]}");
     }
     if (schema_match(filter_op, "redo")) {
         jw.key(w, "redo");
-        jw.raw_v(w, "{\"fields\":[\"txn\",\"dry_run\",\"force\",\"diff\"],\"returns\":[\"redone\",\"dry_run\",\"ready\",\"txn\",\"files\"]}");
+        jw.raw_v(w, "{\"fields\":[\"txn\",\"steps\",\"dry_run\",\"force\",\"diff\"],\"returns\":[\"txn\",\"redone_txn\",\"steps_redone\",\"dry_run\",\"created\",\"replaced\",\"unchanged\",\"deleted\",\"files\"]}");
     }
     if (schema_match(filter_op, "events")) {
         jw.key(w, "events");
@@ -3095,9 +3551,9 @@ pub fun release_sign(s: *session.Session, args: *json.Value, w: *jw.Jw) bool {
     compute_release_sig(a, ver, key, ?sums_sha[0], ?sig_hex[0], ?key_id[0]);
 
     val sums_full: res[str, A.Error] = pathx.native(a, full_dir, "SHA256SUMS");
-    if (sel sums_full.ok) {
-        filesystem.replace_bytes_atomic(a, sums_full.ok, sums_w.buf, sums_w.len, 420, 493);
-    }
+    if (sel sums_full.err) { ret simple_error(w, "oom", "out of memory"); }
+    val w_sums: err[filesystem.FsError] = filesystem.replace_bytes_atomic(a, sums_full.ok, sums_w.buf, sums_w.len, 420, 493);
+    if (sel w_sums.err) { ret simple_error(w, "io_write", "could not write SHA256SUMS"); }
 
     var rel_w: jw.Jw = jw.init(a);
     jw.obj(?rel_w);
@@ -3113,9 +3569,9 @@ pub fun release_sign(s: *session.Session, args: *json.Value, w: *jw.Jw) bool {
     jw.byte(?rel_w, '\n');
 
     val rel_full: res[str, A.Error] = pathx.native(a, full_dir, "RELEASE.json");
-    if (sel rel_full.ok) {
-        filesystem.replace_bytes_atomic(a, rel_full.ok, rel_w.buf, rel_w.len, 420, 493);
-    }
+    if (sel rel_full.err) { ret simple_error(w, "oom", "out of memory"); }
+    val w_rel: err[filesystem.FsError] = filesystem.replace_bytes_atomic(a, rel_full.ok, rel_w.buf, rel_w.len, 420, 493);
+    if (sel w_rel.err) { ret simple_error(w, "io_write", "could not write RELEASE.json"); }
 
     jw.obj(w);
     jw.f_str(w, "dir", dir_in);

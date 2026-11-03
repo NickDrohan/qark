@@ -690,13 +690,98 @@ fun js_line_has_arrow(p: *u8, end_off: usize, from: usize) bool {
     ret false;
 }
 
+fun js_has_method_open_brace(p: *u8, end_off: usize, paren_at: usize) bool {
+    var i: usize = paren_at;
+    var pdepth: i64 = 0;
+    var matched_close: bool = false;
+    for (i < end_off) {
+        val c: u8 = p[i];
+        if (c == '/' && i + 1 < end_off && p[i + 1] == '/') { brk; }
+        if (c == '"' || c == '\'' || c == '`') {
+            val q: u8 = c;
+            i = i + 1;
+            for (i < end_off && p[i] != q) {
+                if (p[i] == '\\' && i + 1 < end_off) { i = i + 1; }
+                i = i + 1;
+            }
+        }
+        or (c == '(') { pdepth = pdepth + 1; }
+        or (c == ')') {
+            if (pdepth > 0) { pdepth = pdepth - 1; }
+            if (pdepth == 0) {
+                matched_close = true;
+                i = i + 1;
+                brk;
+            }
+        }
+        i = i + 1;
+    }
+    if (!matched_close) {
+        ret js_line_ends_open_brace(p, end_off, paren_at);
+    }
+    for (i < end_off) {
+        val c: u8 = p[i];
+        if (c == '/' && i + 1 < end_off && p[i + 1] == '/') { ret false; }
+        if (c == '{') { ret true; }
+        if (c == ';') { ret false; }
+        i = i + 1;
+    }
+    ret false;
+}
+
 # javascript/typescript: function/class/interface/type/enum declarations, class methods, and const/let/var bindings
 fun scan_js(p: *u8, lines: *vector.Vector[usize], out: *vector.Vector[Sym]) {
     val nl: usize = lines.len / 2;
     var i: usize = 0;
+    var in_block_comment: bool = false;
+    var in_template: bool = false;
     for (i < nl) {
         val off: usize = lines.data[i * 2];
         val n: usize = lines.data[i * 2 + 1];
+        val line_start_in_cmt: bool = in_block_comment || in_template;
+        var cj: usize = 0;
+        for (cj < n) {
+            val cc: u8 = p[off + cj];
+            if (in_block_comment) {
+                if (cj + 1 < n && cc == '*' && p[off + cj + 1] == '/') {
+                    in_block_comment = false;
+                    cj = cj + 2;
+                    cnt;
+                }
+                cj = cj + 1;
+                cnt;
+            }
+            if (in_template) {
+                if (cc == '\\' && cj + 1 < n) { cj = cj + 2; cnt; }
+                if (cc == '`') { in_template = false; }
+                cj = cj + 1;
+                cnt;
+            }
+            if (cj + 1 < n && cc == '/' && p[off + cj + 1] == '/') { brk; }
+            if (cj + 1 < n && cc == '/' && p[off + cj + 1] == '*') {
+                in_block_comment = true;
+                cj = cj + 2;
+                cnt;
+            }
+            if (cc == '`') {
+                in_template = true;
+                cj = cj + 1;
+                cnt;
+            }
+            if (cc == '"' || cc == '\'') {
+                val q: u8 = cc;
+                cj = cj + 1;
+                for (cj < n && p[off + cj] != q) {
+                    if (p[off + cj] == '\\' && cj + 1 < n) { cj = cj + 1; }
+                    cj = cj + 1;
+                }
+            }
+            cj = cj + 1;
+        }
+        if (line_start_in_cmt) {
+            i = i + 1;
+            cnt;
+        }
         var j: usize = 0;
         for (j < n && (p[off + j] == ' ' || p[off + j] == '\t')) { j = j + 1; }
         val ind: i64 = j::i64;
@@ -802,10 +887,10 @@ fun scan_js(p: *u8, lines: *vector.Vector[usize], out: *vector.Vector[Sym]) {
                     }
                     ak = skip_ws_fwd(p, off + n, ak);
                 }
-                if (ak < off + n && p[ak] == '(' && js_line_ends_open_brace(p, off + n, ak)) {
+                if (ak < off + n && p[ak] == '(' && js_has_method_open_brace(p, off + n, ak)) {
                     push_sym(out, p, mk, mwl, "function", (i + 1)::i64, ind);
                 }
-                or (ak < off + n && p[ak] == '=' && js_line_has_arrow(p, off + n, ak) && js_line_ends_open_brace(p, off + n, ak)) {
+                or (ak < off + n && p[ak] == '=' && js_line_has_arrow(p, off + n, ak) && (js_line_ends_open_brace(p, off + n, ak) || js_has_method_open_brace(p, off + n, ak))) {
                     push_sym(out, p, mk, mwl, "function", (i + 1)::i64, ind);
                 }
             }
@@ -1838,10 +1923,10 @@ fun find_word_col(p: *u8, off: usize, n: usize, w: *u8, wn: usize) i64 {
     ret -1;
 }
 
-# find whole-word match on a source line while skipping comments and string literals
-fun find_code_word_col(p: *u8, off: usize, n: usize, w: *u8, wn: usize, hash_cmt: bool, in_block: *bool) i64 {
-    if (wn == 0 || n == 0) { ret -1; }
-    var i: usize = 0;
+# find whole-word match on a source line from start_col while skipping comments and string literals (but scanning inside ${...})
+fun find_code_word_col_from(p: *u8, off: usize, n: usize, start_col: usize, w: *u8, wn: usize, hash_cmt: bool, in_block: *bool) i64 {
+    if (wn == 0 || n == 0 || start_col >= n) { ret -1; }
+    var i: usize = start_col;
     for (i < n) {
         val c: u8 = p[off + i];
         if (@in_block) {
@@ -1860,7 +1945,7 @@ fun find_code_word_col(p: *u8, off: usize, n: usize, w: *u8, wn: usize, hash_cmt
             i = i + 2;
             cnt;
         }
-        if (c == '"' || c == '\'' || c == '`') {
+        if (c == '"' || c == '\'') {
             val q: u8 = c;
             i = i + 1;
             for (i < n && p[off + i] != q) {
@@ -1868,6 +1953,19 @@ fun find_code_word_col(p: *u8, off: usize, n: usize, w: *u8, wn: usize, hash_cmt
                 i = i + 1;
             }
             i = i + 1;
+            cnt;
+        }
+        if (c == '`') {
+            i = i + 1;
+            for (i < n && p[off + i] != '`') {
+                if (p[off + i] == '\\' && i + 1 < n) { i = i + 2; cnt; }
+                if (p[off + i] == '$' && i + 1 < n && p[off + i + 1] == '{') {
+                    i = i + 2;
+                    brk;
+                }
+                i = i + 1;
+            }
+            if (i < n && p[off + i] == '`') { i = i + 1; }
             cnt;
         }
         if (i + wn <= n && (i == 0 || !ident_byte(p[off + i - 1])) && (i + wn == n || !ident_byte(p[off + i + wn]))) {
@@ -1885,6 +1983,10 @@ fun find_code_word_col(p: *u8, off: usize, n: usize, w: *u8, wn: usize, hash_cmt
         i = i + 1;
     }
     ret -1;
+}
+
+fun find_code_word_col(p: *u8, off: usize, n: usize, w: *u8, wn: usize, hash_cmt: bool, in_block: *bool) i64 {
+    ret find_code_word_col_from(p, off, n, 0, w, wn, hash_cmt, in_block);
 }
 
 fun stem_of(a: *A.Allocator, rel: str) str {
@@ -1923,37 +2025,114 @@ fun dir_of(a: *A.Allocator, rel: str) str {
     ret "";
 }
 
+fun strip_ext(a: *A.Allocator, rel: str) str {
+    if (rel == nil) { ret ""; }
+    val n: usize = str_len(rel);
+    var last_slash: usize = 0;
+    var dot: usize = n;
+    var i: usize = 0;
+    for (i < n) {
+        if (rel[i] == '/') { last_slash = i + 1; }
+        i = i + 1;
+    }
+    i = last_slash;
+    for (i < n) {
+        if (rel[i] == '.') { dot = i; }
+        i = i + 1;
+    }
+    if (dot <= last_slash) { ret rel; }
+    val d: res[str, A.Error] = util.dup_n(a, rel, dot);
+    if (sel d.ok) { ret d.ok; }
+    ret rel;
+}
+
+fun resolve_rel_import(a: *A.Allocator, base_dir: str, imp: str) str {
+    val joined: res[str, A.Error] = pathx.join(a, base_dir, imp);
+    if (sel joined.err) { ret ""; }
+    val s: str = joined.ok;
+    val n: usize = str_len(s);
+    var segs: vector.Vector[str] = vector.init[str](a);
+    var i: usize = 0;
+    for (i <= n) {
+        var st: usize = i;
+        for (i < n && s[i] != '/' && s[i] != '\\') { i = i + 1; }
+        val slen: usize = i - st;
+        if (slen == 2 && s[st] == '.' && s[st + 1] == '.') {
+            if (segs.len > 0) { segs.len = segs.len - 1; }
+        }
+        or (slen > 0 && !(slen == 1 && s[st] == '.')) {
+            val d: res[str, A.Error] = util.dup_n(a, (s::usize + st)::*u8, slen);
+            if (sel d.ok) { vector.push[str](?segs, d.ok); }
+        }
+        i = i + 1;
+    }
+    var w: jw.Jw = jw.init(a);
+    var k: usize = 0;
+    for (k < segs.len) {
+        if (k > 0) { jw.byte(?w, '/'); }
+        jw.raw(?w, segs.data[k]);
+        k = k + 1;
+    }
+    ret jw.text(?w);
+}
+
 fun import_matches_target(a: *A.Allocator, importer_rel: str, imp: str, target_path: str, target_stem: str, target_stem_n: usize) bool {
     if (imp == nil || target_path == nil || target_stem_n == 0) { ret false; }
     val imp_n: usize = str_len(imp);
-    if (find_word_col(imp, 0, imp_n, target_stem, target_stem_n) <= 0) { ret false; }
+    val target_no_ext: str = strip_ext(a, target_path);
     val target_dir: str = dir_of(a, target_path);
     val importer_dir: str = dir_of(a, importer_rel);
-    if (imp_n >= 2 && imp[0] == '.' && imp[1] == '/') {
-        ret util.eq(importer_dir, target_dir);
-    }
-    if (target_dir[0] != 0) {
-        val td_n: usize = str_len(target_dir);
-        var has_sep: bool = false;
-        var si: usize = 0;
-        for (si < imp_n) {
-            if (imp[si] == '/' || imp[si] == '.') { has_sep = true; }
-            si = si + 1;
+
+    # 1. Relative path import ("./..." or "../...")
+    if (imp[0] == '.' && (imp_n == 1 || imp[1] == '/' || (imp[1] == '.' && (imp_n == 2 || imp[2] == '/')))) {
+        val resolved: str = resolve_rel_import(a, importer_dir, imp);
+        val res_no_ext: str = strip_ext(a, resolved);
+        if (util.eq(resolved, target_path) || util.eq(res_no_ext, target_no_ext)) {
+            ret true;
         }
-        if (has_sep) {
-            var leaf_dir: str = target_dir;
-            var li: usize = 0;
-            for (li < td_n) {
-                if (target_dir[li] == '/') { leaf_dir = (target_dir::usize + li + 1)::*u8; }
-                li = li + 1;
-            }
-            val ld_n: usize = str_len(leaf_dir);
-            if (ld_n > 0 && find_word_col(imp, 0, imp_n, leaf_dir, ld_n) <= 0 && !util.eq(importer_dir, target_dir)) {
-                ret false;
-            }
+        ret false;
+    }
+
+    # 2. Module or path import without leading "."
+    if (find_word_col(imp, 0, imp_n, target_stem, target_stem_n) <= 0) { ret false; }
+    var norm_w: jw.Jw = jw.init(a);
+    var k: usize = 0;
+    var has_sep: bool = false;
+    for (k < imp_n) {
+        if (imp[k] == '.' || imp[k] == '/') {
+            jw.byte(?norm_w, '/');
+            has_sep = true;
+        }
+        or (imp[k] == ':' && k + 1 < imp_n && imp[k + 1] == ':') {
+            jw.byte(?norm_w, '/');
+            has_sep = true;
+            k = k + 1;
+        }
+        or {
+            jw.byte(?norm_w, imp[k]);
+        }
+        k = k + 1;
+    }
+    val norm_imp: str = jw.text(?norm_w);
+    val norm_n: usize = str_len(norm_imp);
+    val tne_n: usize = str_len(target_no_ext);
+    if (!has_sep) {
+        ret util.eq(norm_imp, target_stem) && (util.eq(importer_dir, target_dir) || target_dir[0] == 0);
+    }
+    if (util.eq(norm_imp, target_no_ext) || util.eq(norm_imp, target_path)) { ret true; }
+    # Check if norm_imp is a path-segment suffix of target_no_ext (e.g. "pkg/m1" in "src/pkg/m1") or target_no_ext is a suffix of norm_imp (e.g. "pkg/m1/legacy_call" importing symbol from "pkg/m1")
+    if (norm_n < tne_n) {
+        val diff_len: usize = tne_n - norm_n;
+        if (target_no_ext[diff_len - 1] == '/' && util.eq((target_no_ext::usize + diff_len)::*u8, norm_imp)) {
+            ret true;
         }
     }
-    ret true;
+    if (norm_n > tne_n) {
+        if (norm_imp[tne_n] == '/' && find_word_col(norm_imp, 0, tne_n, target_no_ext, tne_n) == 1) {
+            ret true;
+        }
+    }
+    ret false;
 }
 
 # build a resolved reference and impact graph for a symbol and/or file path across the workspace
@@ -2040,17 +2219,10 @@ pub fun impact_graph(a: *A.Allocator, root: str, sym_name: *u8, sym_n: usize, ta
                                 for (li < nl) {
                                     val loff: usize = lines.data[li * 2];
                                     val llen: usize = lines.data[li * 2 + 1];
-                                    var col: i64 = -1;
                                     if (util.eq(lang, "python") && py_triple != 0) {
                                         py_triple = py_step_triple(p, loff, llen, py_triple);
                                     }
                                     or {
-                                        col = find_code_word_col(p, loff, llen, sym_name, sym_n, hash_cmt, ?in_blk);
-                                        if (util.eq(lang, "python")) {
-                                            py_triple = py_step_triple(p, loff, llen, 0);
-                                        }
-                                    }
-                                    if (col > 0) {
                                         val ln1: i64 = (li + 1)::i64;
                                         var is_def_line: bool = false;
                                         var enc: i64 = -1;
@@ -2067,39 +2239,51 @@ pub fun impact_graph(a: *A.Allocator, root: str, sym_name: *u8, sym_n: usize, ta
                                             }
                                             si = si + 1;
                                         }
-                                        if (!is_def_line) {
-                                            jw.obj(?refs_w);
-                                            jw.f_str(?refs_w, "path", rel);
-                                            jw.f_str(?refs_w, "sha256", ?sha[0]);
-                                            jw.f_i64(?refs_w, "line", ln1);
-                                            jw.f_i64(?refs_w, "col", col);
-                                            if (enc >= 0) {
-                                                val es: *Sym = ?syms.data[enc::usize];
-                                                jw.f_strn(?refs_w, "symbol", es.name, es.name_n);
-                                                var sw: jw.Jw = jw.init(a);
-                                                jw.raw(?sw, rel);
-                                                jw.raw(?sw, ":");
-                                                jw.bytes(?sw, es.name, es.name_n);
-                                                val sk: str = jw.text(?sw);
-                                                if (!has_str(?aff_syms, sk)) { vector.push[str](?aff_syms, sk); }
+                                        var search_from: usize = 0;
+                                        for (search_from < llen) {
+                                            val col: i64 = find_code_word_col_from(p, loff, llen, search_from, sym_name, sym_n, hash_cmt, ?in_blk);
+                                            if (col <= 0) { brk; }
+                                            search_from = (col - 1)::usize + sym_n;
+                                            if (!is_def_line) {
+                                                jw.obj(?refs_w);
+                                                jw.f_str(?refs_w, "path", rel);
+                                                jw.f_str(?refs_w, "sha256", ?sha[0]);
+                                                jw.f_i64(?refs_w, "line", ln1);
+                                                jw.f_i64(?refs_w, "col", col);
+                                                if (enc >= 0) {
+                                                    val es: *Sym = ?syms.data[enc::usize];
+                                                    jw.f_strn(?refs_w, "symbol", es.name, es.name_n);
+                                                    var sw: jw.Jw = jw.init(a);
+                                                    jw.raw(?sw, rel);
+                                                    jw.raw(?sw, ":");
+                                                    jw.bytes(?sw, es.name, es.name_n);
+                                                    val sk: str = jw.text(?sw);
+                                                    if (!has_str(?aff_syms, sk)) { vector.push[str](?aff_syms, sk); }
+                                                }
+                                                var vn: usize = 0;
+                                                val v: *u8 = view_fold(a, p, loff, llen, false, ?vn);
+                                                jw.f_strn(?refs_w, "text", v, line_cut(v, vn));
+                                                jw.obj_end(?refs_w);
+                                                if (!has_str(?aff_files, rel)) { vector.push[str](?aff_files, rel); }
                                             }
-                                            var vn: usize = 0;
-                                            val v: *u8 = view_fold(a, p, loff, llen, false, ?vn);
-                                            jw.f_strn(?refs_w, "text", v, line_cut(v, vn));
-                                            jw.obj_end(?refs_w);
-                                            if (!has_str(?aff_files, rel)) { vector.push[str](?aff_files, rel); }
+                                        }
+                                        if (util.eq(lang, "python")) {
+                                            py_triple = py_step_triple(p, loff, llen, 0);
                                         }
                                     }
                                     li = li + 1;
                                 }
                             }
                         }
+                        or { walk_err = walk_err + 1; }
                     }
                     or { walk_err = walk_err + 1; }
                 }
+                or { walk_err = walk_err + 1; }
             }
             or { walk_err = walk_err + 1; }
         }
+        or { walk_err = walk_err + 1; }
         fi = fi + 1;
     }
     jw.arr_end(?defs_w);

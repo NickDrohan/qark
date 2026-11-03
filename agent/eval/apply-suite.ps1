@@ -52,7 +52,7 @@ function Q([string]$op, $argsObj) {
 }
 
 $info = Q "session.info" @{}
-Check "session.info is 0.3.0 at the root" ($info.ok -and $info.result.version -eq "0.3.0" -and ($info.result.features -contains "ast_symbol_edits") -and $info.result.root -like "*qark-suite-*") $info
+Check "session.info is 0.3.1 at the root" ($info.ok -and $info.result.version -eq "0.3.1" -and ($info.result.features -contains "ast_symbol_edits") -and $info.result.root -like "*qark-suite-*") $info
 
 $r = Q "apply" @{ path = "notes/a.txt"; text = "alpha`n" }
 Check "single file create" ($r.ok -and $r.result.created -eq 1 -and $r.result.files[0].status -eq "created") $r
@@ -867,8 +867,78 @@ Check "Q23: rebase rejects mismatched base_text with rebase_base_mismatch and un
 $rBadContract = QAdv "apply" @{ path = "reb_check.py"; contract = @{ unknown_rule = 123 }; edits = @(@{ find = "b = 2"; replace = "b = 3" }) }
 Check "Q34: unknown contract key is rejected with contract_bad" ((-not $rBadContract.ok) -and $rBadContract.error.code -eq "contract_bad") $rBadContract
 
+# R2-01/R2-02: WAL committed roll-forward, dry_run non-mutation with pending WAL, and corrupt WAL refusal
+$walTestFile = Join-Path $advRoot "wal_committed.txt"
+[System.IO.File]::WriteAllText($walTestFile, "committed-v2`n", $utf8)
+[System.IO.File]::WriteAllText((Join-Path $advRoot ".qark\undo\deadbeefcafebabe.json"), "{`"txn`":`"deadbeefcafebabe`",`"prev_txn`":`"`",`"files`":[{`"path`":`"wal_committed.txt`",`"status`":`"created`",`"new_sha256`":`"0000`"}]}", $utf8)
+[System.IO.File]::WriteAllText((Join-Path $advRoot ".qark\wal.json"), "{`"txn`":`"deadbeefcafebabe`",`"state`":`"committed`"}", $utf8)
+$rWalDry = QAdv "apply" @{ dry_run = $true; path = "wal_dry_probe.txt"; text = "probe`n" }
+$walStillAfterDry = Test-Path (Join-Path $advRoot ".qark\wal.json")
+$rWalRollForward = QAdv "apply" @{ path = "wal_next.txt"; text = "next`n" }
+$walCommittedKept = ([System.IO.File]::ReadAllText($walTestFile) -eq "committed-v2`n")
+[System.IO.File]::WriteAllText((Join-Path $advRoot ".qark\wal.json"), "{corrupt_wal", $utf8)
+$rWalCorrupt = QAdv "apply" @{ path = "wal_blocked.txt"; text = "blocked`n" }
+$corruptWalPreserved = Test-Path (Join-Path $advRoot ".qark\wal.json")
+Remove-Item -Force (Join-Path $advRoot ".qark\wal.json")
+Check "R2-01/R2-02: dry_run leaves pending WAL untouched, committed WAL rolls forward, and corrupt WAL fails closed with recovery_required" ((-not $rWalDry.ok) -and $rWalDry.error.code -eq "recovery_required" -and $walStillAfterDry -and $rWalRollForward.ok -and $walCommittedKept -and (-not $rWalCorrupt.ok) -and $rWalCorrupt.error.code -eq "recovery_required" -and $corruptWalPreserved) @{ dry = $rWalDry; roll = $rWalRollForward; corrupt = $rWalCorrupt }
+
+# R2-03: idempotency_key replays relative edit before spec.compile
+[void](QAdv "apply" @{ path = "idem_edit.py"; mode = "upsert"; text = "val = 1`n" })
+$idemEditSpec = @{ idempotency_key = "r2-idem-edit-1"; path = "idem_edit.py"; edits = @(@{ find = "val = 1"; replace = "val = 2" }) }
+$rIdemE1 = QAdv "apply" $idemEditSpec
+$rIdemE2 = QAdv "apply" $idemEditSpec
+Check "R2-03: idempotency_key replays relative edit receipt with replayed:true and idempotent_replay:true" ($rIdemE1.ok -and $rIdemE2.ok -and $rIdemE2.result.replayed -eq $true -and $rIdemE2.result.idempotent_replay -eq $true) @{ e1 = $rIdemE1; e2 = $rIdemE2 }
+
+# R2-10: multi-step undo across create -> delete leaves file absent, and redo restores sequence
+$rStepCreate = QAdv "apply" @{ path = "ephemeral.txt"; text = "temp`n" }
+$rStepDelete = QAdv "apply" @{ path = "ephemeral.txt"; delete = $true }
+$rStepUndo2 = QAdv "undo" @{ steps = 2 }
+$ephemeralAbsentAfterUndo2 = -not (Test-Path (Join-Path $advRoot "ephemeral.txt"))
+Check "R2-10: undo steps:2 across create->delete leaves file absent" ($rStepCreate.ok -and $rStepDelete.ok -and $rStepUndo2.ok -and $ephemeralAbsentAfterUndo2) @{ u2 = $rStepUndo2; exists = (-not $ephemeralAbsentAfterUndo2) }
+
+# R2-11: JS rename skips regex literal & shadowed parameter, rejects invalid identifier, and mixed-line body edit preserves signature
+[void](QAdv "apply" @{
+    path = "js/r2_ast.js"
+    mode = "upsert"
+    text = "function target(x) {`n  const re = /target/g;`n  const inner = (target) => target + 1;`n  return target(x - 1) + inner(x);`n}`nfunction mixed(a) { const b = a + 1;`n  return b;`n}`n"
+})
+$rBadIdent = QAdv "apply" @{ path = "js/r2_ast.js"; symbol = "target"; rename = "123invalid" }
+$rGoodAst = QAdv "apply" @{
+    path = "js/r2_ast.js"
+    edits = @(
+        @{ symbol = "target"; rename = "computed" },
+        @{ symbol = "mixed"; body = "return a * 10;" }
+    )
+}
+$r2AstText = [System.IO.File]::ReadAllText((Join-Path $advRoot "js\r2_ast.js"))
+Check "R2-11: JS rename skips regex literal and shadowed param, rejects bad identifier, and handles mixed-line body replacement" ((-not $rBadIdent.ok) -and $rGoodAst.ok -and $r2AstText.Contains("/target/g") -and $r2AstText.Contains("(target) => target + 1") -and $r2AstText.Contains("return computed(x - 1)") -and $r2AstText.Contains("function mixed(a) {") -and $r2AstText.Contains("return a * 10;")) @{ bad = $rBadIdent; good = $rGoodAst; text = $r2AstText }
+
+# R2-12: contract enforcement on delete and conflicting contract keys
+$rConflictingContract = QAdv "apply" @{ path = "reb_check.py"; contract = @{ max_lines_changed = 5; max_changed_lines = 10 }; edits = @(@{ find = "b = 2"; replace = "b = 3" }) }
+$rContractDelete = QAdv "apply" @{ path = "reb_check.py"; delete = $true; contract = @{ forbid_delete = $true } }
+Check "R2-12: conflicting contract aliases fail with contract_bad and forbid_delete blocks file deletion" ((-not $rConflictingContract.ok) -and $rConflictingContract.error.code -eq "contract_bad" -and (-not $rContractDelete.ok) -and $rContractDelete.error.code -eq "contract_violation") @{ conflictKey = $rConflictingContract; delBlock = $rContractDelete }
+
+# R2-15: shared max_bytes in read and multiple refs per line + relative import matching in impact
+$rImpSeed = QAdv "apply" @{
+    files = @(
+        @{ path = "imp/lib.mjs"; mode = "upsert"; lines = @('export function calc(v) {', '  return v + 1;', '}') },
+        @{ path = "imp/use.mjs"; mode = "upsert"; lines = @("import { calc } from './lib.mjs';", 'export function run(x) {', '  const y = calc(x) + calc(x + 1);', '  return `${calc(y)}`;', '}') }
+    )
+}
+$rSharedRead = QAdv "read" @{ paths = @("imp/lib.mjs", "imp/use.mjs"); max_bytes = 25 }
+$rImpactRel = QAdv "impact" @{ symbol = "calc"; path = "imp/lib.mjs" }
+Check "R2-15: read shares max_bytes with truncated:true, and impact finds multiple refs per line, template expr refs, and relative ./ dependents" ($rImpSeed.ok -and $rSharedRead.ok -and $rSharedRead.result.truncated -eq $true -and $rImpactRel.ok -and $rImpactRel.result.complete -eq $true -and $rImpactRel.result.references.Count -ge 4 -and ($rImpactRel.result.dependents -contains "imp/use.mjs")) @{ seed = $rImpSeed; read = $rSharedRead; impact = $rImpactRel }
+
 $wadv.StandardInput.Close()
 [void]$wadv.WaitForExit(5000)
+
+# R2-07: --require-check refuses per-file check:false
+$wreq = Start-Worker @("--headless", "--stdio", "--root", "`"$advRoot`"", "--require-check")
+$wreq.StandardInput.WriteLine((@{ id = 1; op = "apply"; args = @{ files = @(@{ path = "bypass.js"; text = "const x = ;`n"; check = $false }) } } | ConvertTo-Json -Compress -Depth 10))
+$rReqBypass = (Read-Reply $wreq "require-check") | ConvertFrom-Json
+$wreq.StandardInput.Close()
+[void]$wreq.WaitForExit(5000)
+Check "R2-07: --require-check refuses per-file check:false bypass" ((-not $rReqBypass.ok) -and $rReqBypass.error.code -eq "check_unavailable") $rReqBypass
 
 # Q32: Official QarkSession client rejects in-flight requests immediately on unexpected child exit
 $clientTestScript = Join-Path $advRoot "test-client.mjs"

@@ -14,9 +14,9 @@ Each candidate file's **own** module semantics remain strictly isolated from the
 
 | Candidate File | How Qark Validates Syntax |
 | --- | --- |
-| `*.mjs` | Parsed as ES module (`vm.SourceTextModule` when `--experimental-vm-modules` is present, or strict ES module transform + `vm.Script`), catching both syntax errors and duplicate lexical (`let`/`const`) declarations. |
-| `*.cjs` | Parsed as CommonJS (`vm.Script`, with CommonJS wrapper fallback for top-level `return`), rejecting ES module `import`/`export` syntax even inside `"type": "module"` workspaces. |
-| `*.js` | Walks upward from the candidate file's directory to the nearest `package.json`. If `"type": "module"` is set (or top-level `import`/`export` syntax is present), parsed as ES module; otherwise parsed as CommonJS. |
+| `*.mjs` | Checked with `node --check` on an isolated `.mjs` candidate, catching both ES module syntax errors and duplicate lexical (`let`/`const`) declarations. |
+| `*.cjs` | Parsed inside the exact CommonJS wrapper `(function (exports, require, module, __filename, __dirname) { ... })` via `vm.Script`, rejecting ES module `import`/`export` syntax and wrapper parameter redeclarations (`const require = ...`). |
+| `*.js` | Walks upward from the candidate file's directory to the nearest `package.json` (applying in-transaction `package.json` creates/edits/deletions first). Rejects malformed `package.json` files, validates `"type": "module"` as ES module, validates `"type": "commonjs"` as strict CommonJS, and validates untyped `.js` files using the host Node runtime's typeless `.js` rules. |
 
 ### 1.2 Source Invalidity vs. Checker Infrastructure Failure
 
@@ -117,21 +117,35 @@ import { once } from "node:events";
 import readline from "node:readline";
 
 export class QarkSession {
-  constructor(qarkBin, workspaceRoot, options = {}) {
+  constructor(qarkBinOrOptions, workspaceRoot, options = {}) {
+    if (typeof qarkBinOrOptions === "object" && qarkBinOrOptions !== null) {
+      options = qarkBinOrOptions;
+      workspaceRoot = options.root || options.workspaceRoot;
+      qarkBinOrOptions = options.bin || options.qarkBin || "qark";
+    }
+    const qarkBin = qarkBinOrOptions;
     const extraArgs = Array.isArray(options.args) ? options.args : [];
     this.defaultTimeoutMs = options.timeoutMs ?? 30000;
     this.maxStderrBytes = options.maxStderrBytes ?? 8192;
+    this.maxPending = options.maxPending ?? 1024;
     this.stderrBuf = "";
     this.closed = false;
     this.exitError = null;
     this.nextId = 1;
     this.pending = new Map();
+    this._writeChain = Promise.resolve();
 
-    this.proc = spawn(
-      qarkBin,
-      ["--headless", "--stdio", "--root", workspaceRoot, ...extraArgs],
-      { stdio: ["pipe", "pipe", "pipe"] }
-    );
+    const isNodeHost =
+      /(^|[\\/])node(\.exe)?$/i.test(String(qarkBin)) &&
+      extraArgs.length > 0 &&
+      /\.(m|c)?js$/i.test(String(extraArgs[0]));
+    const spawnArgs = isNodeHost
+      ? [extraArgs[0], "--headless", "--stdio", "--root", workspaceRoot, ...extraArgs.slice(1)]
+      : ["--headless", "--stdio", "--root", workspaceRoot, ...extraArgs];
+
+    this.proc = spawn(qarkBin, spawnArgs, { stdio: ["pipe", "pipe", "pipe"] });
+
+    this.proc.stdin.on("error", () => {});
 
     this.proc.stderr.setEncoding("utf8");
     this.proc.stderr.on("data", (chunk) => {
@@ -148,9 +162,21 @@ export class QarkSession {
       try {
         msg = JSON.parse(line);
       } catch (err) {
-        this._failAll(
-          new Error(`Malformed JSON from Qark worker: ${err.message}`)
-        );
+        const parseErr = new Error(`Malformed JSON from Qark worker: ${err.message}`);
+        parseErr.code = "QARK_BAD_JSON";
+        this._failAll(parseErr);
+        return;
+      }
+      if (
+        msg === null ||
+        typeof msg !== "object" ||
+        Array.isArray(msg) ||
+        (typeof msg.id !== "number" && typeof msg.id !== "string") ||
+        typeof msg.ok !== "boolean"
+      ) {
+        const protoErr = new Error("Malformed protocol envelope from Qark worker");
+        protoErr.code = "QARK_BAD_PROTOCOL";
+        this._failAll(protoErr);
         return;
       }
       const entry = this.pending.get(msg.id);
@@ -162,31 +188,41 @@ export class QarkSession {
     });
 
     this.proc.on("error", (err) => {
-      this._failAll(
-        new Error(`Qark worker process error: ${err.message}`)
-      );
+      const procErr = new Error(`Qark worker process error: ${err.message}`);
+      procErr.code = "QARK_PROCESS_ERROR";
+      this._failAll(procErr);
     });
 
     this.proc.on("exit", (code, signal) => {
-      const detail = this.stderrBuf.trim()
-        ? ` (stderr: ${this.stderrBuf.trim()})`
-        : "";
-      this._failAll(
-        new Error(
+      const finishExit = () => {
+        const detail = this.stderrBuf.trim()
+          ? ` (stderr: ${this.stderrBuf.trim()})`
+          : "";
+        const exitErr = new Error(
           `Qark worker exited before replying (code=${code}, signal=${signal})${detail}`
-        )
-      );
+        );
+        exitErr.code = "QARK_PROCESS_EXITED";
+        this._failAll(exitErr);
+      };
+      const t = setTimeout(finishExit, 50);
+      t.unref?.();
+      this.rl.once("close", () => {
+        clearTimeout(t);
+        finishExit();
+      });
     });
 
     this.proc.on("close", (code, signal) => {
-      const detail = this.stderrBuf.trim()
-        ? ` (stderr: ${this.stderrBuf.trim()})`
-        : "";
-      this._failAll(
-        new Error(
+      setImmediate(() => {
+        const detail = this.stderrBuf.trim()
+          ? ` (stderr: ${this.stderrBuf.trim()})`
+          : "";
+        const closeErr = new Error(
           `Qark worker stream closed (code=${code}, signal=${signal})${detail}`
-        )
-      );
+        );
+        closeErr.code = "QARK_PROCESS_EXITED";
+        this._failAll(closeErr);
+      });
     });
   }
 
@@ -204,7 +240,14 @@ export class QarkSession {
 
   async call(op, args = {}, timeoutMs = this.defaultTimeoutMs) {
     if (this.closed || this.exitError) {
-      throw this.exitError || new Error("QarkSession is closed");
+      const closedErr = this.exitError || new Error("QarkSession is closed");
+      if (!closedErr.code) closedErr.code = "QARK_SESSION_CLOSED";
+      throw closedErr;
+    }
+    if (this.pending.size >= this.maxPending) {
+      const queueErr = new Error(`QarkSession pending queue limit (${this.maxPending}) exceeded`);
+      queueErr.code = "QARK_QUEUE_FULL";
+      throw queueErr;
     }
     const id = this.nextId++;
     const payload = JSON.stringify({ id, op, args }) + "\n";
@@ -214,40 +257,56 @@ export class QarkSession {
         timeoutMs > 0
           ? setTimeout(() => {
               this.pending.delete(id);
-              reject(
-                new Error(
-                  `Qark request #${id} (${op}) timed out after ${timeoutMs}ms`
-                )
+              const timeoutErr = new Error(
+                `Qark request #${id} (${op}) timed out after ${timeoutMs}ms`
               );
+              timeoutErr.code = "QARK_TIMEOUT";
+              timeoutErr.outcomeUnknown = true;
+              reject(timeoutErr);
             }, timeoutMs)
           : null;
 
       this.pending.set(id, { resolve, reject, timer });
 
-      try {
-        const flushed = this.proc.stdin.write(payload, "utf8", (writeErr) => {
-          if (writeErr && this.pending.has(id)) {
+      this._writeChain = this._writeChain
+        .then(async () => {
+          if (!this.pending.has(id) || this.closed) return;
+          const flushed = this.proc.stdin.write(payload, "utf8", (writeErr) => {
+            if (writeErr && this.pending.has(id)) {
+              this.pending.delete(id);
+              clearTimeout(timer);
+              const err = new Error(`Failed to write to Qark worker stdin: ${writeErr.message}`);
+              err.code = "QARK_WRITE_ERROR";
+              reject(err);
+            }
+          });
+          if (!flushed && !this.closed && this.proc.exitCode === null) {
+            await Promise.race([
+              once(this.proc.stdin, "drain").catch(() => {}),
+              once(this.proc, "exit").catch(() => {}),
+            ]);
+          }
+        })
+        .catch((err) => {
+          if (this.pending.has(id)) {
             this.pending.delete(id);
             clearTimeout(timer);
-            reject(
-              new Error(`Failed to write to Qark worker stdin: ${writeErr.message}`)
-            );
+            reject(err);
           }
         });
-        if (!flushed) {
-          once(this.proc.stdin, "drain").catch(() => {});
-        }
-      } catch (err) {
-        this.pending.delete(id);
-        clearTimeout(timer);
-        reject(err);
-      }
     });
   }
 
   async close(timeoutMs = 2000) {
     this.closed = true;
-    if (this.proc.exitCode !== null || this.proc.killed) {
+    const closedErr = new Error("QarkSession closed by caller");
+    closedErr.code = "QARK_SESSION_CLOSED";
+    for (const [id, entry] of this.pending.entries()) {
+      this.pending.delete(id);
+      clearTimeout(entry.timer);
+      entry.reject(closedErr);
+    }
+    if (this.proc.exitCode !== null || this.proc.signalCode !== null) {
       this.rl.close();
       return;
     }
@@ -255,17 +314,39 @@ export class QarkSession {
     try {
       this.proc.stdin.end();
     } catch {}
-    let killTimer;
-    const timeoutPromise = new Promise((resolve) => {
-      killTimer = setTimeout(() => {
-        try {
-          this.proc.kill();
-        } catch {}
-        resolve();
-      }, timeoutMs);
-    });
-    await Promise.race([exitPromise, timeoutPromise]);
-    clearTimeout(killTimer);
+
+    const waitMs = Math.max(1, Number(timeoutMs) || 2000);
+    let timer;
+    await Promise.race([
+      exitPromise,
+      new Promise((resolve) => {
+        timer = setTimeout(resolve, waitMs);
+      }),
+    ]);
+    clearTimeout(timer);
+
+    if (this.proc.exitCode === null && this.proc.signalCode === null) {
+      try {
+        this.proc.kill("SIGTERM");
+      } catch {}
+      const graceMs = Math.min(200, Math.max(25, Math.floor(waitMs / 2)));
+      let graceTimer;
+      await Promise.race([
+        exitPromise,
+        new Promise((resolve) => {
+          graceTimer = setTimeout(resolve, graceMs);
+        }),
+      ]);
+      clearTimeout(graceTimer);
+    }
+
+    if (this.proc.exitCode === null && this.proc.signalCode === null) {
+      try {
+        this.proc.kill("SIGKILL");
+      } catch {}
+      await exitPromise;
+    }
+
     this.rl.close();
   }
 }

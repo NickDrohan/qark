@@ -55,7 +55,7 @@ pub val MAX_FILES:       usize = 1024;
 pub val MAX_FILE_BYTES:  usize = 8388608;
 pub val MAX_TOTAL_BYTES: usize = 67108864;
 
-pub val VERSION: str = "0.3.0";
+pub val VERSION: str = "0.3.1";
 
 # why a spec was refused
 # ---
@@ -687,17 +687,7 @@ fun check_contract_one(a: *A.Allocator, rel: str, old_p: *u8, old_n: usize, new_
     if (op == nil) { op = ""; }
     var np: *u8 = new_p;
     if (np == nil) { np = ""; }
-    var check_op: *u8 = op;
-    var check_on: usize = old_n;
-    var check_np: *u8 = np;
-    var check_nn: usize = new_n;
-    if (deleting || moved) {
-        check_op = np;
-        check_on = new_n;
-        check_np = np;
-        check_nn = new_n;
-    }
-    if (!edit.verify_contract(a, rel, check_op, check_on, check_np, check_nn, contract, ?ce)) {
+    if (!edit.verify_contract(a, rel, op, old_n, np, new_n, contract, ?ce)) {
         e.code = ce.code;
         e.msg = ce.msg;
         e.line = ce.line;
@@ -715,7 +705,6 @@ fun parse_file_check(a: *A.Allocator, fv: *json.Value, fi: usize, deleting: bool
     if (cb == -1) {
         if (fstr(a, fv, "check", ?cname, ?cnn) == 1) {
             if (util.eq(cname, "none") || util.eq(cname, "off")) {
-                @io_lang = nil;
                 @out_policy = commit.CP_OFF;
             }
             or (util.eq(cname, "strict")) {
@@ -742,7 +731,6 @@ fun parse_file_check(a: *A.Allocator, fv: *json.Value, fi: usize, deleting: bool
         val present: opt[*json.Value] = json.value_find(fv, "check");
         if (sel present.some) {
             if (cb == 0) {
-                @io_lang = nil;
                 @out_policy = commit.CP_OFF;
             }
             or {
@@ -755,6 +743,40 @@ fun parse_file_check(a: *A.Allocator, fv: *json.Value, fi: usize, deleting: bool
         @out_policy = commit.CP_OFF;
     }
     ret true;
+}
+
+fun hex_nibble_spec(c: u8) i64 {
+    if (c >= '0' && c <= '9') { ret (c - '0')::i64; }
+    if (c >= 'a' && c <= 'f') { ret (c - 'a' + 10)::i64; }
+    if (c >= 'A' && c <= 'F') { ret (c - 'A' + 10)::i64; }
+    ret -1;
+}
+
+fun decode_hex_spec(a: *A.Allocator, hex: *u8, hn: usize, out_p: **u8, out_n: *usize) bool {
+    if (hn % 2 != 0) { ret false; }
+    val blen: usize = hn / 2;
+    val got: res[*u8, A.Error] = A.allocate[u8](a, blen + 1);
+    if (sel got.err) { ret false; }
+    var i: usize = 0;
+    for (i < blen) {
+        val hi: i64 = hex_nibble_spec(hex[i * 2]);
+        val lo: i64 = hex_nibble_spec(hex[i * 2 + 1]);
+        if (hi < 0 || lo < 0) { ret false; }
+        got.ok[i] = ((hi * 16) + lo)::u8;
+        i = i + 1;
+    }
+    got.ok[blen] = 0;
+    @out_p = got.ok;
+    @out_n = blen;
+    ret true;
+}
+
+fun verify_undo_blob_sha(p: *u8, n: usize, target_sha: str) bool {
+    var actual: [65]u8;
+    var src: *u8 = p;
+    if (src == nil) { src = ""; }
+    commit.hash_hex(src, n, ?actual[0]);
+    ret util.eq(?actual[0], target_sha);
 }
 
 fun find_undo_version(a: *A.Allocator, root: str, rel: str, target_sha: str, out_p: **u8, out_n: *usize) bool {
@@ -793,7 +815,12 @@ fun find_undo_version(a: *A.Allocator, root: str, rel: str, target_sha: str, out
                                             if (fstr(a, fg.some, "prev_sha256", ?psha, ?pshan) == 1 && util.eq(psha, target_sha)) {
                                                 val otf: opt[*json.Value] = json.value_find(fg.some, "old_text");
                                                 if (sel otf.some) {
-                                                    if (decode_value(a, otf.some, out_p, out_n)) { ret true; }
+                                                    if (decode_value(a, otf.some, out_p, out_n) && verify_undo_blob_sha(@out_p, @out_n, target_sha)) { ret true; }
+                                                }
+                                                var ohex: *u8 = nil;
+                                                var ohexn: usize = 0;
+                                                if (fstr(a, fg.some, "old_hex", ?ohex, ?ohexn) == 1) {
+                                                    if (decode_hex_spec(a, ohex, ohexn, out_p, out_n) && verify_undo_blob_sha(@out_p, @out_n, target_sha)) { ret true; }
                                                 }
                                             }
                                             var nsha: *u8 = nil;
@@ -801,7 +828,12 @@ fun find_undo_version(a: *A.Allocator, root: str, rel: str, target_sha: str, out
                                             if (fstr(a, fg.some, "sha256", ?nsha, ?nshan) == 1 && util.eq(nsha, target_sha)) {
                                                 val ntf: opt[*json.Value] = json.value_find(fg.some, "new_text");
                                                 if (sel ntf.some) {
-                                                    if (decode_value(a, ntf.some, out_p, out_n)) { ret true; }
+                                                    if (decode_value(a, ntf.some, out_p, out_n) && verify_undo_blob_sha(@out_p, @out_n, target_sha)) { ret true; }
+                                                }
+                                                var nhex: *u8 = nil;
+                                                var nhexn: usize = 0;
+                                                if (fstr(a, fg.some, "new_hex", ?nhex, ?nhexn) == 1) {
+                                                    if (decode_hex_spec(a, nhex, nhexn, out_p, out_n) && verify_undo_blob_sha(@out_p, @out_n, target_sha)) { ret true; }
                                                 }
                                             }
                                         }
@@ -921,6 +953,7 @@ fun compile_one(sp: *Spec, fv: *json.Value, fi: usize, item: *json.Value, k: i64
     var normed: bool = false;
     var mixed: bool = false;
     var moved: bool = false;
+    var moved_rel: str = nil;
     var deleting: bool = false;
 
     val text_f: opt[*json.Value] = json.value_find(fv, "text");
@@ -1141,6 +1174,7 @@ fun compile_one(sp: *Spec, fv: *json.Value, fi: usize, item: *json.Value, k: i64
         if (sel del_added.err) { ret fail(e, "oom", "out of memory", at(a, fi, "move")); }
         commit.set_expect(commit.entry(?sp.set, del_added.ok), ?edit_hash[0]);
         moved = true;
+        moved_rel = mrel.ok;
     }
     or (sel del_f.some) {
         if (!json.value_is_bool(del_f.some) || !json.value_bool(del_f.some)) {
@@ -1236,26 +1270,42 @@ fun compile_one(sp: *Spec, fv: *json.Value, fi: usize, item: *json.Value, k: i64
         val sc_f: opt[*json.Value] = json.value_find(fv, "scope");
         if (sel sc_f.some) { file_c = sc_f.some; }
     }
+    if (file_c != nil) {
+        var ce_syn: edit.Err;
+        if (!edit.validate_contract_syntax(a, file_c, ?ce_syn)) {
+            ret fail(e, ce_syn.code, ce_syn.msg, at(a, fi, "contract"));
+        }
+    }
     if (sp.contract != nil || file_c != nil) {
         var old_cp: *u8 = "";
         var old_cn: usize = 0;
-        if (!deleting && !moved) {
-            val canc: str = commit.check_ancestry(a, sp.root, rel.ok);
-            if (canc != nil) { ret fail(e, canc, "a directory or file in the path is a symbolic link or non-directory", at(a, fi, "path")); }
-            val cfull: res[str, A.Error] = pathx.native(a, sp.root, rel.ok);
-            if (sel cfull.ok) {
-                val ccur: res[vector.Vector[u8], filesystem.FsError] = filesystem.read_bytes(a, cfull.ok);
-                if (sel ccur.ok) {
-                    if (ccur.ok.data != nil) { old_cp = ccur.ok.data; }
-                    old_cn = ccur.ok.len;
-                }
+        val canc: str = commit.check_ancestry(a, sp.root, rel.ok);
+        if (canc != nil) { ret fail(e, canc, "a directory or file in the path is a symbolic link or non-directory", at(a, fi, "path")); }
+        val cfull: res[str, A.Error] = pathx.native(a, sp.root, rel.ok);
+        if (sel cfull.ok) {
+            val ccur: res[vector.Vector[u8], filesystem.FsError] = filesystem.read_bytes(a, cfull.ok);
+            if (sel ccur.ok) {
+                if (ccur.ok.data != nil) { old_cp = ccur.ok.data; }
+                old_cn = ccur.ok.len;
             }
         }
+        var cand_p: *u8 = data;
+        var cand_n: usize = dn;
+        if (deleting || cand_p == nil) {
+            cand_p = "";
+            cand_n = 0;
+        }
         if (sp.contract != nil) {
-            if (!check_contract_one(a, rel.ok, old_cp, old_cn, data, dn, deleting, moved, sp.contract, fi, e)) { ret false; }
+            if (!check_contract_one(a, rel.ok, old_cp, old_cn, cand_p, cand_n, deleting, moved, sp.contract, fi, e)) { ret false; }
+            if (moved && moved_rel != nil) {
+                if (!check_contract_one(a, moved_rel, data, dn, "", 0, true, true, sp.contract, fi, e)) { ret false; }
+            }
         }
         if (file_c != nil) {
-            if (!check_contract_one(a, rel.ok, old_cp, old_cn, data, dn, deleting, moved, file_c, fi, e)) { ret false; }
+            if (!check_contract_one(a, rel.ok, old_cp, old_cn, cand_p, cand_n, deleting, moved, file_c, fi, e)) { ret false; }
+            if (moved && moved_rel != nil) {
+                if (!check_contract_one(a, moved_rel, data, dn, "", 0, true, true, file_c, fi, e)) { ret false; }
+            }
         }
     }
 
@@ -1333,6 +1383,12 @@ fun compile_glob(sp: *Spec, fv: *json.Value, fi: usize, glob_pat: str, e: *Err) 
     or {
         val sc_f: opt[*json.Value] = json.value_find(fv, "scope");
         if (sel sc_f.some) { file_c = sc_f.some; }
+    }
+    if (file_c != nil) {
+        var ce_syn: edit.Err;
+        if (!edit.validate_contract_syntax(a, file_c, ?ce_syn)) {
+            ret fail(e, ce_syn.code, ce_syn.msg, at(a, fi, "contract"));
+        }
     }
     val best_effort: bool = sp.best_effort || fbool(fv, "best_effort") == 1;
     val gpat: str = pathx.strip_root(sp.root, glob_pat);
@@ -1662,9 +1718,25 @@ fun prune_old(sp: *Spec, e: *Err) bool {
                                     if (sel ex.ok) { present = ex.ok; }
                                 }
                                 if (present) {
-                                    if (sp.contract != nil && fbool(sp.contract, "forbid_delete") == 1) {
-                                        e.path = old_rel.ok;
-                                        ret fail(e, "contract_violation", "contract forbids deleting pruned job files", "prune");
+                                    if (sp.contract != nil) {
+                                        if (fbool(sp.contract, "forbid_delete") == 1) {
+                                            e.path = old_rel.ok;
+                                            ret fail(e, "contract_violation", "contract forbids deleting pruned job files", "prune");
+                                        }
+                                        var p_old_p: *u8 = "";
+                                        var p_old_n: usize = 0;
+                                        if (sel old_full.ok) {
+                                            val pcur: res[vector.Vector[u8], filesystem.FsError] = filesystem.read_bytes(a, old_full.ok);
+                                            if (sel pcur.ok) {
+                                                if (pcur.ok.data != nil) { p_old_p = pcur.ok.data; }
+                                                p_old_n = pcur.ok.len;
+                                            }
+                                        }
+                                        if (!check_contract_one(a, old_rel.ok, p_old_p, p_old_n, "", 0, true, false, sp.contract, 0, e)) {
+                                            e.path = old_rel.ok;
+                                            e.field = "prune";
+                                            ret false;
+                                        }
                                     }
                                     val added: res[usize, A.Error] = commit.add(?sp.set, old_rel.ok, nil, 0, commit.MODE_DELETE);
                                     if (sel added.ok) {
@@ -1795,6 +1867,10 @@ pub fun compile(sp: *Spec, a: *A.Allocator, root: str, args: *json.Value, raw: *
     if (!sel top_c.some) { top_c = json.value_find(args, "scope"); }
     if (sel top_c.some) {
         if (!json.value_is_object(top_c.some)) { ret fail(e, "contract_bad", "contract must be an object", "contract"); }
+        var ce_top: edit.Err;
+        if (!edit.validate_contract_syntax(a, top_c.some, ?ce_top)) {
+            ret fail(e, ce_top.code, ce_top.msg, "contract");
+        }
         sp.contract = top_c.some;
     }
 

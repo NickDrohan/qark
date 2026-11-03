@@ -1,8 +1,8 @@
 # Qark
 
-Qark is an atomic, syntax-checked file writer built for agents — one bottleneck every write goes through, so multi-agent work stays consistent. An agent hands Qark a spec; Qark renders every file, refuses unsafe paths, syntax-checks the result, compares against what is on disk with sha256 optimistic concurrency, and publishes **all of the files or none of them**. Every call returns a receipt: per-file status, sha256, line counts, notes, and unified diffs when asked.
+Qark is a syntax-checked, crash-recoverable file writer built for agents — one serialized bottleneck every Qark write goes through, so multi-agent work stays consistent. An agent hands Qark a spec; Qark renders every file, refuses unsafe paths, syntax-checks the result, compares against what is on disk with sha256 optimistic concurrency, and publishes **all of the files or none of them** under a cooperative workspace lock (`.qark/lock`) and two-phase write-ahead log (`.qark/wal.json`). Every call returns a receipt: per-file status, sha256, line counts, notes, and unified diffs when asked.
 
-Sending the same request twice is safe. A conflicting write is refused with a named error, not silently clobbered.
+Full-content writes (`text`, `lines`, `json`, `tmpl`) are idempotent when repeated (`unchanged: same_content`); for relative `edits`, `delete`, or `move` retries across transport timeouts, pass `idempotency_key` so Qark replays the committed receipt (`replayed: true`). A conflicting write is refused with a named error, not silently clobbered.
 
 ## For agents
 

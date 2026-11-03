@@ -19,7 +19,7 @@ function lineCount(text) {
 }
 
 function normKey(p) {
-  const resolved = path. normalize(path.resolve(p));
+  const resolved = path.normalize(path.resolve(p));
   return process.platform === 'win32' ? resolved.toLowerCase() : resolved;
 }
 
@@ -45,36 +45,54 @@ function parseDiag(raw, text, lineOffset) {
   return { ok: false, line, col, msg };
 }
 
-function isWorkspaceEsmFor(relName, wsRoot, pkgMap) {
+function resolvePackageMode(relName, wsRoot, pkgMap) {
   const baseRoot = wsRoot || WORKSPACE_ROOT;
   let dir = path.dirname(path.resolve(baseRoot, relName || 'index.js'));
   for (let depth = 0; depth < 32; depth++) {
     const pkgPath = path.join(dir, 'package.json');
     const key = normKey(pkgPath);
+    let raw = null;
+    let found = false;
     if (pkgMap && pkgMap.has(key)) {
       const ov = pkgMap.get(key);
       if (!ov.deleted) {
-        try {
-          const pkg = JSON.parse(String(ov.text || ''));
-          return Boolean(pkg && pkg.type === 'module');
-        } catch (_) {
-          return false;
-        }
+        raw = String(ov.text || '');
+        found = true;
       }
     } else if (fs.existsSync(pkgPath)) {
       try {
-        const raw = fs.readFileSync(pkgPath, 'utf8');
-        const pkg = JSON.parse(raw);
-        return Boolean(pkg && pkg.type === 'module');
+        raw = fs.readFileSync(pkgPath, 'utf8');
+        found = true;
       } catch (_) {
-        return false;
+        return { mode: 'invalid', msg: 'SyntaxError: Unable to read package.json' };
       }
+    }
+    if (found) {
+      let pkg;
+      try {
+        pkg = JSON.parse(raw);
+      } catch (e) {
+        return { mode: 'invalid', msg: 'SyntaxError: Invalid package.json (' + (e && e.message ? e.message : 'malformed JSON') + ')' };
+      }
+      if (!pkg || typeof pkg !== 'object' || Array.isArray(pkg)) {
+        return { mode: 'invalid', msg: 'SyntaxError: Invalid package.json root' };
+      }
+      if (pkg.type === undefined) {
+        return { mode: 'untyped' };
+      }
+      if (pkg.type === 'module') {
+        return { mode: 'module' };
+      }
+      if (pkg.type === 'commonjs') {
+        return { mode: 'commonjs' };
+      }
+      return { mode: 'invalid', msg: 'SyntaxError: Invalid package.json "type" value' };
     }
     const parent = path.dirname(dir);
     if (!parent || parent === dir) break;
     dir = parent;
   }
-  return false;
+  return { mode: 'untyped' };
 }
 
 function checkModule(name, text) {
@@ -84,6 +102,28 @@ function checkModule(name, text) {
       fs.chmodSync(tmpDir, 0o700);
     } catch (_) {}
     const tmpFile = path.join(tmpDir, 'candidate.mjs');
+    fs.writeFileSync(tmpFile, text, { encoding: 'utf8', mode: 0o600, flag: 'wx' });
+    const r = spawnSync(process.execPath, ['--check', tmpFile], { encoding: 'utf8' });
+    if (r.status === 0) return { ok: true };
+    return parseDiag(r.stderr || r.stdout, text, 0);
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+}
+
+function checkUntypedJS(name, text) {
+  const cjsRes = checkCommonJS(name, text);
+  if (cjsRes.ok) return cjsRes;
+  const esmRes = checkModule(name, text);
+  if (!esmRes.ok) return esmRes;
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'qark-js-'));
+  try {
+    try {
+      fs.chmodSync(tmpDir, 0o700);
+    } catch (_) {}
+    const pkgFile = path.join(tmpDir, 'package.json');
+    fs.writeFileSync(pkgFile, '{}', { encoding: 'utf8', mode: 0o600, flag: 'wx' });
+    const tmpFile = path.join(tmpDir, 'candidate.js');
     fs.writeFileSync(tmpFile, text, { encoding: 'utf8', mode: 0o600, flag: 'wx' });
     const r = spawnSync(process.execPath, ['--check', tmpFile], { encoding: 'utf8' });
     if (r.status === 0) return { ok: true };
@@ -114,10 +154,17 @@ function check(name, source, wsRoot, pkgMap) {
   if (/\.mjs$/i.test(name)) {
     return checkModule(name, text);
   }
-  if (isWorkspaceEsmFor(name, wsRoot, pkgMap)) {
+  const pkgMode = resolvePackageMode(name, wsRoot, pkgMap);
+  if (pkgMode.mode === 'invalid') {
+    return { ok: false, line: 1, col: 1, msg: pkgMode.msg };
+  }
+  if (pkgMode.mode === 'module') {
     return checkModule(name, text);
   }
-  return checkCommonJS(name, text);
+  if (pkgMode.mode === 'commonjs') {
+    return checkCommonJS(name, text);
+  }
+  return checkUntypedJS(name, text);
 }
 
 function buildPkgMap(files, wsRoot) {

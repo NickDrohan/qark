@@ -5,7 +5,7 @@
     "description": "Create, replace, edit, move, or delete one or many files under the workspace root in one checked change set with write-ahead crash recovery. Every file is rendered, contract-checked, and syntax-checked (Python, Node, PowerShell, Bash, JSON, TOML, plus isolated staged project checks) before anything is published; a conflict, contract violation, or failed check writes nothing. Accepts either a multi-file files:[...] array OR top-level single-file shorthand (path + text|lines|tmpl|template|json|edits|move|delete, or flat edit fields). Relative paths and full paths inside the workspace root both work. Returns a receipt with each file's sha256, status, and semantic change preview (added/modified/removed symbols).",
     "annotations": {
       "readOnlyHint": false,
-      "destructiveHint": false,
+      "destructiveHint": true,
       "idempotentHint": false
     },
     "inputSchema": {
@@ -98,7 +98,7 @@
     "description": "Edit an existing file (or glob of files) atomically using flat top-level parameters—no nested files/edits wrapper required. Supports symbol edits (pass symbol + body, signature, rename, or with), exact find/replace, regex find_re/replace (with \\0-\\9 captures), line-range replacement (lines:[first,last] + with), and anchored insertions (insert_before/insert_after + with, auto_indent). Enforces optional scope contracts, 3-way rebasing on stale expect hashes, syntax checking, and returns a receipt with sha256 and semantic symbol diff.",
     "annotations": {
       "readOnlyHint": false,
-      "destructiveHint": false,
+      "destructiveHint": true,
       "idempotentHint": false
     },
     "inputSchema": {
@@ -175,7 +175,7 @@
         "outline": { "type": "boolean", "description": "Include the file's symbol outline: name, kind, line, and end_line for functions, classes, records, and sections." },
         "lines": { "type": "array", "items": { "type": "integer" }, "description": "[first, last], 1-based and inclusive line range." },
         "content": { "type": "boolean", "description": "false returns only sha256, bytes, lines, and optional outline without file text." },
-        "max_bytes": { "type": "integer", "description": "Maximum bytes of text to return per file (default 262144)." },
+        "max_bytes": { "type": "integer", "description": "Maximum total bytes of text to return across the read call (default 262144)." },
         "root": { "type": "string", "description": "Optional workspace root directory path to target." }
       }
     }
@@ -231,7 +231,7 @@
     "description": "Atomically revert one or more applied transactions using persistent snapshots in .qark/undo, redo a previously undone transaction (redo: true), or list the undo history stack (list: true). Verifies each file's sha256 before reverting unless force: true is set.",
     "annotations": {
       "readOnlyHint": false,
-      "destructiveHint": false,
+      "destructiveHint": true,
       "idempotentHint": false
     },
     "inputSchema": {
@@ -253,9 +253,9 @@
     "title": "Validate project, verify job, or inspect capabilities",
     "description": "Run standalone project-wide validation (using validate/cmd or .qark/checks.json), verify a job directory against its manifest.json (dir), read the transaction event journal (events: true), or query Qark's capabilities (capabilities: true) and operation schemas (schema: true).",
     "annotations": {
-      "readOnlyHint": true,
+      "readOnlyHint": false,
       "destructiveHint": false,
-      "idempotentHint": true
+      "idempotentHint": false
     },
     "inputSchema": {
       "type": "object",

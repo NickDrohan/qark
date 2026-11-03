@@ -81,7 +81,9 @@ pub rec Entry {
     mode:           u8;
     has_expect:     bool;
     expect:         [65]u8;
+    must_be_absent: bool;
     exec:           bool;
+    target_perm:    u32;
     existed:        bool;
     old:            *u8;
     old_len:        usize;
@@ -314,6 +316,10 @@ pub fun check_control_dir(a: *A.Allocator, root: str) bool {
     if (sel idir.err) { ret false; }
     val k3: i64 = probe(idir.ok, nil);
     if (k3 == 1 || k3 == 3 || k3 == -1) { ret false; }
+    val cdir: res[str, A.Error] = pathx.native(a, root, ".qark/checkers");
+    if (sel cdir.err) { ret false; }
+    val k4: i64 = probe(cdir.ok, nil);
+    if (k4 == 1 || k4 == 3 || k4 == -1) { ret false; }
     ret true;
 }
 
@@ -323,6 +329,14 @@ fun conflict(e: *Entry, why: str) {
 }
 
 fun decide(e: *Entry) {
+    if (e.must_be_absent) {
+        if (e.existed) {
+            conflict(e, "exists");
+            ret;
+        }
+        e.status = ST_UNCHANGED;
+        ret;
+    }
     if (e.mode == MODE_DELETE) {
         if (!e.existed) {
             conflict(e, "missing");
@@ -494,6 +508,10 @@ fun temp_beside(set: *Set, full: str) res[str, A.Error] {
 }
 
 fun perm_for(e: *Entry) i32 {
+    if (e.target_perm != 0) {
+        val tp: i32 = (e.target_perm & 511)::i32;
+        if (tp != 0) { ret tp; }
+    }
     if (e.exec) { ret 493; }
     if (e.existed) {
         val p: i32 = (e.old_perm & 511)::i32;
