@@ -1109,6 +1109,301 @@ fun indent_block_if_unindented(a: *A.Allocator, ins: *u8, insn: usize, spaces: i
     }
 }
 
+fun is_ident_byte(c: u8) bool {
+    if (c >= 'a' && c <= 'z') { ret true; }
+    if (c >= 'A' && c <= 'Z') { ret true; }
+    if (c >= '0' && c <= '9') { ret true; }
+    if (c == '_' || c == '$') { ret true; }
+    ret false;
+}
+
+fun slice_trim_eq(a: *u8, a0: usize, a1: usize, b: *u8, b0: usize, b1: usize) bool {
+    var s0: usize = a0;
+    var s1: usize = a1;
+    for (s0 < s1 && (a[s0] == ' ' || a[s0] == '\t' || a[s0] == '\r' || a[s0] == '\n')) { s0 = s0 + 1; }
+    for (s1 > s0 && (a[s1 - 1] == ' ' || a[s1 - 1] == '\t' || a[s1 - 1] == '\r' || a[s1 - 1] == '\n')) { s1 = s1 - 1; }
+    var t0: usize = b0;
+    var t1: usize = b1;
+    for (t0 < t1 && (b[t0] == ' ' || b[t0] == '\t' || b[t0] == '\r' || b[t0] == '\n')) { t0 = t0 + 1; }
+    for (t1 > t0 && (b[t1 - 1] == ' ' || b[t1 - 1] == '\t' || b[t1 - 1] == '\r' || b[t1 - 1] == '\n')) { t1 = t1 - 1; }
+    ret slice_eq(a, s0, s1, b, t0, t1);
+}
+
+# Locate the signature/body separator ('{' for brace langs, ':' for python) on [s0, s1)
+# and for single-line definitions locate the end of the body on that span.
+fun find_sym_delim(p: *u8, s0: usize, s1: usize, is_py: bool, open_idx: *usize, close_idx: *usize) bool {
+    var i: usize = s0;
+    var pdepth: i64 = 0;
+    var bdepth: i64 = 0;
+    var found_open: bool = false;
+    var in_str: u8 = 0;
+    for (i < s1) {
+        val c: u8 = p[i];
+        if (in_str != 0) {
+            if (c == '\\' && i + 1 < s1) { i = i + 2; cnt; }
+            if (c == in_str) { in_str = 0; }
+            i = i + 1;
+            cnt;
+        }
+        if (c == '"' || c == '\'' || c == '`') {
+            in_str = c;
+            i = i + 1;
+            cnt;
+        }
+        if (c == '/' && i + 1 < s1 && p[i + 1] == '/') {
+            for (i < s1 && p[i] != '\n') { i = i + 1; }
+            cnt;
+        }
+        if (c == '/' && i + 1 < s1 && p[i + 1] == '*') {
+            i = i + 2;
+            for (i + 1 < s1 && !(p[i] == '*' && p[i + 1] == '/')) { i = i + 1; }
+            if (i + 1 < s1) { i = i + 2; }
+            cnt;
+        }
+        if (is_py && c == '#') {
+            for (i < s1 && p[i] != '\n') { i = i + 1; }
+            cnt;
+        }
+        if (!found_open) {
+            if (c == '(' || c == '[') { pdepth = pdepth + 1; }
+            or (c == ')' || c == ']') { if (pdepth > 0) { pdepth = pdepth - 1; } }
+            or (is_py && c == ':' && pdepth == 0) {
+                if (i + 1 < s1 && p[i + 1] == ':') { i = i + 2; cnt; }
+                @open_idx = i;
+                var le: usize = s1;
+                for (le > i + 1 && (p[le - 1] == '\n' || p[le - 1] == '\r')) { le = le - 1; }
+                @close_idx = le;
+                ret true;
+            }
+            or (!is_py && c == '{' && pdepth == 0) {
+                @open_idx = i;
+                found_open = true;
+                bdepth = 1;
+            }
+        }
+        or {
+            if (c == '{') { bdepth = bdepth + 1; }
+            or (c == '}') {
+                bdepth = bdepth - 1;
+                if (bdepth == 0) {
+                    @close_idx = i;
+                    ret true;
+                }
+            }
+        }
+        i = i + 1;
+    }
+    if (found_open) {
+        @close_idx = s1;
+        ret true;
+    }
+    ret false;
+}
+
+fun is_decl_kw(p: *u8, k0: usize, k1: usize) bool {
+    val len: usize = k1 - k0;
+    if (len == 3) {
+        if (p[k0] == 'l' && p[k0 + 1] == 'e' && p[k0 + 2] == 't') { ret true; }
+        if (p[k0] == 'v' && p[k0 + 1] == 'a' && p[k0 + 2] == 'r') { ret true; }
+        if (p[k0] == 'v' && p[k0 + 1] == 'a' && p[k0 + 2] == 'l') { ret true; }
+    }
+    if (len == 5 && p[k0] == 'c' && p[k0 + 1] == 'o' && p[k0 + 2] == 'n' && p[k0 + 3] == 's' && p[k0 + 4] == 't') {
+        ret true;
+    }
+    ret false;
+}
+
+# Collect code-token occurrences of sym.name in [sa, sb), skipping strings, comments,
+# member accesses (.name), object literal keys ({ name: ... }), other symbols with the
+# same name, and inner blocks that shadow sym.name with let/const/var/val.
+fun collect_symbol_rename_hits(a: *A.Allocator, lang: str, t: *Text, sa: usize, sb: usize, sym: *scan.Sym, has_within: bool, hits: *vector.Vector[usize]) {
+    val is_hash_lang: bool = util.eq(lang, "python") || util.eq(lang, "mach") || util.eq(lang, "ps1") || util.eq(lang, "sh") || util.eq(lang, "toml");
+    var all_syms: vector.Vector[scan.Sym] = vector.init[scan.Sym](a);
+    scan.collect_symbols(a, lang, t.p, t.n, ?all_syms);
+
+    val sym_s0: usize = line_start(t, sym.dec_start::usize);
+    val sym_s1: usize = line_start(t, (sym.end + 1)::usize);
+
+    var shadow_depth: i64 = -1;
+    var bdepth: i64 = 0;
+    var pdepth: i64 = 0;
+    var last_sig: u8 = 0;
+    var prev_kw0: usize = 0;
+    var prev_kw1: usize = 0;
+
+    var i: usize = sa;
+    for (i < sb) {
+        val c: u8 = t.p[i];
+        # Skip strings
+        if (c == '"' || c == '\'') {
+            val q: u8 = c;
+            if (i + 2 < sb && t.p[i + 1] == q && t.p[i + 2] == q) {
+                i = i + 3;
+                for (i + 2 < sb && !(t.p[i] == q && t.p[i + 1] == q && t.p[i + 2] == q)) {
+                    if (t.p[i] == '\\') { i = i + 1; }
+                    i = i + 1;
+                }
+                if (i + 2 < sb) { i = i + 3; }
+                or { i = sb; }
+                last_sig = q;
+                cnt;
+            }
+            i = i + 1;
+            for (i < sb && t.p[i] != q && t.p[i] != '\n') {
+                if (t.p[i] == '\\' && i + 1 < sb) { i = i + 2; cnt; }
+                i = i + 1;
+            }
+            if (i < sb && t.p[i] == q) { i = i + 1; }
+            last_sig = q;
+            cnt;
+        }
+        if (c == '`') {
+            i = i + 1;
+            for (i < sb && t.p[i] != '`') {
+                if (t.p[i] == '\\' && i + 1 < sb) { i = i + 2; cnt; }
+                if (t.p[i] == '$' && i + 1 < sb && t.p[i + 1] == '{') {
+                    # Recurse or scan inside template interpolation? Break out so tokens inside ${...} are scanned:
+                    # Wait: simplest is to find matching '}' of ${...} and recursively collect hits on [i+2, close)!
+                    var td: i64 = 1;
+                    val expr_s: usize = i + 2;
+                    i = i + 2;
+                    for (i < sb && td > 0) {
+                        if (t.p[i] == '\\' && i + 1 < sb) { i = i + 2; cnt; }
+                        if (t.p[i] == '{') { td = td + 1; }
+                        or (t.p[i] == '}') { td = td - 1; if (td == 0) { brk; } }
+                        i = i + 1;
+                    }
+                    val expr_e: usize = i;
+                    collect_symbol_rename_hits(a, lang, t, expr_s, expr_e, sym, has_within, hits);
+                    if (i < sb && t.p[i] == '}') { i = i + 1; }
+                    cnt;
+                }
+                i = i + 1;
+            }
+            if (i < sb && t.p[i] == '`') { i = i + 1; }
+            last_sig = '`';
+            cnt;
+        }
+        # Skip comments
+        if (c == '/' && i + 1 < sb && t.p[i + 1] == '/') {
+            for (i < sb && t.p[i] != '\n') { i = i + 1; }
+            cnt;
+        }
+        if (c == '/' && i + 1 < sb && t.p[i + 1] == '*') {
+            i = i + 2;
+            for (i + 1 < sb && !(t.p[i] == '*' && t.p[i + 1] == '/')) { i = i + 1; }
+            if (i + 1 < sb) { i = i + 2; }
+            cnt;
+        }
+        if (is_hash_lang && c == '#') {
+            for (i < sb && t.p[i] != '\n') { i = i + 1; }
+            cnt;
+        }
+        # Skip JS regex literals
+        if ((util.eq(lang, "js") || util.eq(lang, "ts")) && c == '/') {
+            if (last_sig == 0 || last_sig == '(' || last_sig == ',' || last_sig == '=' || last_sig == ':' || last_sig == '[' || last_sig == '!' || last_sig == '&' || last_sig == '|' || last_sig == '?' || last_sig == '{' || last_sig == '}' || last_sig == ';') {
+                i = i + 1;
+                var in_cc: bool = false;
+                for (i < sb && t.p[i] != '\n') {
+                    if (t.p[i] == '\\' && i + 1 < sb) { i = i + 2; cnt; }
+                    if (t.p[i] == '[') { in_cc = true; }
+                    or (t.p[i] == ']') { in_cc = false; }
+                    or (t.p[i] == '/' && !in_cc) { i = i + 1; brk; }
+                    i = i + 1;
+                }
+                last_sig = '/';
+                cnt;
+            }
+        }
+        if (c == '{') {
+            bdepth = bdepth + 1;
+            last_sig = c;
+            prev_kw0 = 0; prev_kw1 = 0;
+            i = i + 1;
+            cnt;
+        }
+        if (c == '}') {
+            if (shadow_depth >= 0 && bdepth == shadow_depth) {
+                shadow_depth = -1;
+            }
+            if (bdepth > 0) { bdepth = bdepth - 1; }
+            last_sig = c;
+            prev_kw0 = 0; prev_kw1 = 0;
+            i = i + 1;
+            cnt;
+        }
+        if (c == '(' || c == '[') { pdepth = pdepth + 1; last_sig = c; prev_kw0 = 0; prev_kw1 = 0; i = i + 1; cnt; }
+        if (c == ')' || c == ']') { if (pdepth > 0) { pdepth = pdepth - 1; } last_sig = c; prev_kw0 = 0; prev_kw1 = 0; i = i + 1; cnt; }
+
+        if (is_ident_byte(c) && !(c >= '0' && c <= '9')) {
+            val id0: usize = i;
+            for (i < sb && is_ident_byte(t.p[i])) { i = i + 1; }
+            val id1: usize = i;
+            val id_len: usize = id1 - id0;
+            if (id_len == sym.name_n && slice_eq(t.p, id0, id1, sym.name, 0, sym.name_n)) {
+                var skip: bool = false;
+                val is_member: bool = last_sig == '.' || last_sig == ':' || last_sig == '>';
+                # 1. Check if inside a shadowed inner block (applies to bare identifiers, not member accesses like this.render())
+                if (!is_member && shadow_depth >= 0 && bdepth >= shadow_depth) {
+                    skip = true;
+                }
+                # 2. Check if this is a new local variable declaration (let/const/var/val <name>) outside sym's own declaration line
+                val sym_line_s: usize = line_start(t, sym.line::usize);
+                val sym_line_e: usize = line_start(t, (sym.sig_end + 1)::usize);
+                val on_sym_sig: bool = id0 >= sym_line_s && id0 < sym_line_e;
+                if (!skip && !on_sym_sig && is_decl_kw(t.p, prev_kw0, prev_kw1) && last_sig == 'I') {
+                    if (bdepth > 0) { shadow_depth = bdepth; }
+                    skip = true;
+                }
+                # 3. Check if preceded by member access (., ?., ::, ->)
+                if (!skip && is_member) {
+                    if (sym.parent == nil) {
+                        skip = true;
+                    }
+                }
+                # 4. Check if object literal property key ({ name: ... } or , name: ...)
+                if (!skip && (last_sig == '{' || last_sig == ',') && pdepth == 0) {
+                    var k: usize = id1;
+                    for (k < sb && (t.p[k] == ' ' || t.p[k] == '\t')) { k = k + 1; }
+                    if (k < sb && t.p[k] == ':' && !(k + 1 < sb && t.p[k + 1] == ':')) {
+                        skip = true;
+                    }
+                }
+                # 5. Check if inside another symbol with the same short name (e.g. method in another class or separate function)
+                if (!skip && !has_within && !(id0 >= sym_s0 && id0 < sym_s1)) {
+                    var si: usize = 0;
+                    for (si < all_syms.len) {
+                        val os: *scan.Sym = ?all_syms.data[si];
+                        if (os.line != sym.line && os.name_n == sym.name_n && slice_eq(os.name, 0, os.name_n, sym.name, 0, sym.name_n)) {
+                            val os0: usize = line_start(t, os.dec_start::usize);
+                            val os1: usize = line_start(t, (os.end + 1)::usize);
+                            if (id0 >= os0 && id0 < os1) {
+                                skip = true;
+                                brk;
+                            }
+                        }
+                        si = si + 1;
+                    }
+                }
+                if (!skip) {
+                    vector.push[usize](hits, id0);
+                    vector.push[usize](hits, id1);
+                }
+            }
+            prev_kw0 = id0;
+            prev_kw1 = id1;
+            last_sig = 'I';
+            cnt;
+        }
+        if (c != ' ' && c != '\t' && c != '\r' && c != '\n') {
+            last_sig = c;
+            prev_kw0 = 0;
+            prev_kw1 = 0;
+        }
+        i = i + 1;
+    }
+}
+
 fun symbol_edit(a: *A.Allocator, t: *Text, obj: *json.Value, e: *Err) bool {
     var sp: *u8 = nil;
     var spn: usize = 0;
@@ -1127,6 +1422,32 @@ fun symbol_edit(a: *A.Allocator, t: *Text, obj: *json.Value, e: *Err) bool {
         resolve_symbol(a, t, sp, spn, ?dlo, ?dhi, e);
         ret false;
     }
+    val is_py: bool = util.eq(lang, "python");
+    val sig_s0: usize = line_start(t, sym.line::usize);
+    val sig_s1: usize = line_start(t, (sym.sig_end + 1)::usize);
+    var open_idx: usize = 0;
+    var close_idx: usize = 0;
+    val has_delim: bool = find_sym_delim(t.p, sig_s0, sig_s1, is_py, ?open_idx, ?close_idx);
+
+    # Optional precondition: "expect_signature"
+    val exp_sig_f: opt[*json.Value] = json.value_find(obj, "expect_signature");
+    if (sel exp_sig_f.some) {
+        var esp: *u8 = nil;
+        var espn: usize = 0;
+        if (get_str(a, obj, "expect_signature", ?esp, ?espn) != 1 || espn == 0) {
+            ret fail(e, "edit_bad", "expect_signature must be a non-empty string", sym.line);
+        }
+        var sig_match: bool = slice_trim_eq(t.p, sig_s0, sig_s1, esp, 0, espn);
+        if (!sig_match && has_delim) {
+            if (slice_trim_eq(t.p, sig_s0, open_idx, esp, 0, espn) || slice_trim_eq(t.p, sig_s0, open_idx + 1, esp, 0, espn)) {
+                sig_match = true;
+            }
+        }
+        if (!sig_match) {
+            ret fail(e, "signature_mismatch", "symbol signature does not match expect_signature", sym.line);
+        }
+    }
+
     # Mode 1: {"symbol": "name", "rename": "new_name"}
     val ren_f: opt[*json.Value] = json.value_find(obj, "rename");
     if (sel ren_f.some) {
@@ -1135,21 +1456,16 @@ fun symbol_edit(a: *A.Allocator, t: *Text, obj: *json.Value, e: *Err) bool {
         if (get_str(a, obj, "rename", ?rnp, ?rnn) != 1 || rnn == 0) {
             ret fail(e, "edit_bad", "symbol rename must be a non-empty identifier string", 0);
         }
-        var pw: jw.Jw = jw.init(a);
-        jw.raw(?pw, "\\<");
-        jw.bytes(?pw, sym.name, sym.name_n);
-        jw.raw(?pw, "\\>");
-        val pat: str = jw.text(?pw);
-        val patn: usize = str_len(pat);
         var sa: usize = 0;
         var sb: usize = t.n;
         val wf: opt[*json.Value] = json.value_find(obj, "within");
-        if (sel wf.some) {
+        val has_within: bool = sel wf.some;
+        if (has_within) {
             if (!scope(a, t, obj, ?sa, ?sb, e)) { ret false; }
         }
         var hits: vector.Vector[usize] = vector.init[usize](a);
-        val rc: i64 = collect(a, t, sa, sb, pat, patn, true, ?hits);
-        if (rc <= 0 || hits.len == 0) {
+        collect_symbol_rename_hits(a, lang, t, sa, sb, ?sym, has_within, ?hits);
+        if (hits.len == 0) {
             ret fail(e, "edit_not_found", "symbol identifier not found in scope", sym.line);
         }
         var w: jw.Jw = jw.init(a);
@@ -1180,6 +1496,23 @@ fun symbol_edit(a: *A.Allocator, t: *Text, obj: *json.Value, e: *Err) bool {
         if (!with_lines_key(a, t, obj, "body", ?ins, ?insn)) {
             ret fail(e, "edit_bad", "symbol body must be a string or list of strings", sym.line);
         }
+        if (sym.sig_end == sym.end && has_delim && close_idx > open_idx) {
+            var trim_s: usize = 0;
+            var trim_e: usize = insn;
+            for (trim_s < trim_e && (ins[trim_s] == ' ' || ins[trim_s] == '\t' || ins[trim_s] == '\r' || ins[trim_s] == '\n')) { trim_s = trim_s + 1; }
+            for (trim_e > trim_s && (ins[trim_e - 1] == ' ' || ins[trim_e - 1] == '\t' || ins[trim_e - 1] == '\r' || ins[trim_e - 1] == '\n')) { trim_e = trim_e - 1; }
+            var bw: jw.Jw = jw.init(a);
+            if (trim_e > trim_s) {
+                jw.byte(?bw, ' ');
+                jw.bytes(?bw, (ins::usize + trim_s)::*u8, trim_e - trim_s);
+                if (!is_py) { jw.byte(?bw, ' '); }
+            }
+            if (bw.failed) { ret fail(e, "oom", "out of memory", 0); }
+            var bp: *u8 = bw.buf;
+            if (bp == nil) { bp = ""; }
+            if (!splice(a, t, open_idx + 1, close_idx, bp, bw.len)) { ret fail(e, "oom", "out of memory", 0); }
+            ret true;
+        }
         var body_ind: i64 = sym.indent + 4;
         if (sym.sig_end < sym.end) {
             val b_off: usize = line_start(t, (sym.sig_end + 1)::usize);
@@ -1192,7 +1525,7 @@ fun symbol_edit(a: *A.Allocator, t: *Text, obj: *json.Value, e: *Err) bool {
         indent_block_if_unindented(a, ins, insn, body_ind, ?ins, ?insn);
         var from: usize = 0;
         var to: usize = 0;
-        if (util.eq(lang, "python")) {
+        if (is_py) {
             from = line_start(t, (sym.sig_end + 1)::usize);
             to = line_start(t, (sym.end + 1)::usize);
         }
@@ -1225,6 +1558,24 @@ fun symbol_edit(a: *A.Allocator, t: *Text, obj: *json.Value, e: *Err) bool {
         }
         indent_block_if_unindented(a, ins, insn, sym.indent, ?ins, ?insn);
         val from: usize = line_start(t, sym.line::usize);
+        if (has_delim) {
+            var trim_e: usize = insn;
+            for (trim_e > 0 && (ins[trim_e - 1] == '\n' || ins[trim_e - 1] == '\r' || ins[trim_e - 1] == ' ' || ins[trim_e - 1] == '\t')) { trim_e = trim_e - 1; }
+            val delim_ch: u8 = t.p[open_idx];
+            val ends_with_delim: bool = trim_e > 0 && ins[trim_e - 1] == delim_ch;
+            if (sym.sig_end == sym.end || !ends_with_delim) {
+                var sw: jw.Jw = jw.init(a);
+                jw.bytes(?sw, ins, trim_e);
+                var rep_to: usize = open_idx + 1;
+                if (!ends_with_delim) {
+                    if (open_idx > from && t.p[open_idx - 1] == ' ') { jw.byte(?sw, ' '); }
+                    rep_to = open_idx;
+                }
+                if (sw.failed || sw.buf == nil) { ret fail(e, "oom", "out of memory", 0); }
+                if (!splice(a, t, from, rep_to, sw.buf, sw.len)) { ret fail(e, "oom", "out of memory", 0); }
+                ret true;
+            }
+        }
         val to: usize = line_start(t, (sym.sig_end + 1)::usize);
         if (!splice(a, t, from, to, ins, insn)) { ret fail(e, "oom", "out of memory", 0); }
         ret true;
@@ -1469,9 +1820,52 @@ fun slice_eq(a: *u8, a0: usize, a1: usize, b: *u8, b0: usize, b1: usize) bool {
     ret true;
 }
 
+fun key_is(k: str, klen: usize, want: str) bool {
+    val wlen: usize = str_len(want);
+    if (klen != wlen) { ret false; }
+    ret slice_eq(k, 0, klen, want, 0, wlen);
+}
+
+fun line_eq_at(ot: *Text, ol: i64, nt: *Text, nl: i64) bool {
+    val o0: usize = line_start(ot, ol::usize);
+    val o1: usize = line_start(ot, (ol + 1)::usize);
+    val n0: usize = line_start(nt, nl::usize);
+    val n1: usize = line_start(nt, (nl + 1)::usize);
+    ret slice_eq(ot.p, o0, o1, nt.p, n0, n1);
+}
+
 # enforce a method/symbol/line scope contract between old_p[0..old_n) and new_p[0..new_n)
 pub fun verify_contract(a: *A.Allocator, name: str, old_p: *u8, old_n: usize, new_p: *u8, new_n: usize, contract: *json.Value, e: *Err) bool {
-    if (contract == nil || !json.value_is_object(contract)) { ret true; }
+    if (contract == nil) { ret true; }
+    if (!json.value_is_object(contract)) {
+        ret fail(e, "contract_bad", "contract must be an object", 0);
+    }
+    val kcount: usize = json.value_count(contract);
+    var ki: usize = 0;
+    for (ki < kcount) {
+        val kf: opt[str] = json.value_key(contract, ki);
+        val kl: usize = json.value_key_len(contract, ki);
+        if (sel kf.some) {
+            val k: str = kf.some;
+            if (!key_is(k, kl, "lines") && !key_is(k, kl, "symbol") && !key_is(k, kl, "symbols") && !key_is(k, kl, "methods") && !key_is(k, kl, "preserve_signatures") && !key_is(k, kl, "max_lines_changed") && !key_is(k, kl, "max_changed_lines") && !key_is(k, kl, "forbid_delete")) {
+                ret fail(e, "contract_bad", "unknown field in contract", 0);
+            }
+        }
+        ki = ki + 1;
+    }
+    val fd_f: opt[*json.Value] = json.value_find(contract, "forbid_delete");
+    if (sel fd_f.some) {
+        if (!json.value_is_bool(fd_f.some)) {
+            ret fail(e, "contract_bad", "contract.forbid_delete must be a boolean", 0);
+        }
+    }
+    val ps_f: opt[*json.Value] = json.value_find(contract, "preserve_signatures");
+    if (sel ps_f.some) {
+        if (!json.value_is_bool(ps_f.some)) {
+            ret fail(e, "contract_bad", "contract.preserve_signatures must be a boolean", 0);
+        }
+    }
+
     var ot: Text;
     ot.name = name;
     ot.p = old_p;
@@ -1495,57 +1889,73 @@ pub fun verify_contract(a: *A.Allocator, name: str, old_p: *u8, old_n: usize, ne
         val g0: opt[*json.Value] = json.value_get(lf.some, 0);
         val g1: opt[*json.Value] = json.value_get(lf.some, 1);
         if (sel g0.some) {
-            if (json.value_is_number(g0.some)) { lo = json.value_number(g0.some); }
+            if (json.value_is_number(g0.some) && !json.value_is_float(g0.some)) { lo = json.value_number(g0.some); }
         }
         if (sel g1.some) {
-            if (json.value_is_number(g1.some)) { hi = json.value_number(g1.some); }
+            if (json.value_is_number(g1.some) && !json.value_is_float(g1.some)) { hi = json.value_number(g1.some); }
         }
-        if (lo < 1 || hi < lo || hi > ototal) {
+        if (lo < 1 || hi < lo || (ototal > 0 && hi > ototal)) {
             ret fail(e, "contract_bad", "contract.lines is outside the file", 0);
         }
-        val pre_end: usize = line_start(?ot, lo::usize);
-        val suf_start: usize = line_start(?ot, (hi + 1)::usize);
-        val suf_len: usize = old_n - suf_start;
-        if (new_n < pre_end + suf_len) {
-            ret fail(e, "contract_violation", "edits modified lines outside the contracted line range", lo);
+        if (ototal == 0) {
+            if (lo != 1 || ntotal > hi) {
+                ret fail(e, "contract_violation", "edits modified lines outside the contracted line range", lo);
+            }
         }
-        if (!slice_eq(old_p, 0, pre_end, new_p, 0, pre_end)) {
-            ret fail(e, "contract_violation", "edits modified lines before the contracted line range", 1);
-        }
-        if (!slice_eq(old_p, suf_start, old_n, new_p, new_n - suf_len, new_n)) {
-            ret fail(e, "contract_violation", "edits modified lines after the contracted line range", hi + 1);
+        or {
+            val pre_end: usize = line_start(?ot, lo::usize);
+            val suf_start: usize = line_start(?ot, (hi + 1)::usize);
+            val suf_len: usize = old_n - suf_start;
+            if (new_n < pre_end + suf_len) {
+                ret fail(e, "contract_violation", "edits modified lines outside the contracted line range", lo);
+            }
+            if (!slice_eq(old_p, 0, pre_end, new_p, 0, pre_end)) {
+                ret fail(e, "contract_violation", "edits modified lines before the contracted line range", 1);
+            }
+            if (!slice_eq(old_p, suf_start, old_n, new_p, new_n - suf_len, new_n)) {
+                ret fail(e, "contract_violation", "edits modified lines after the contracted line range", hi + 1);
+            }
         }
     }
 
     # 2. Symbol / method scope contract: "symbol": "name" or "symbols": ["a", "b"] or "methods": ["a", "b"]
     var sym_names: vector.Vector[str] = vector.init[str](a);
-    var single_sym: *u8 = nil;
-    var single_n: usize = 0;
-    if (get_str(a, contract, "symbol", ?single_sym, ?single_n) == 1 && single_n > 0) {
+    val sym_f: opt[*json.Value] = json.value_find(contract, "symbol");
+    if (sel sym_f.some) {
+        var single_sym: *u8 = nil;
+        var single_n: usize = 0;
+        if (get_str(a, contract, "symbol", ?single_sym, ?single_n) != 1 || single_n == 0) {
+            ret fail(e, "contract_bad", "contract.symbol must be a non-empty string", 0);
+        }
         vector.push[str](?sym_names, single_sym);
     }
     var arr_f: opt[*json.Value] = json.value_find(contract, "symbols");
     if (!sel arr_f.some) { arr_f = json.value_find(contract, "methods"); }
     if (sel arr_f.some) {
-        if (json.value_is_array(arr_f.some)) {
-            var si: usize = 0;
-            for (si < json.value_count(arr_f.some)) {
-                val elem: opt[*json.Value] = json.value_get(arr_f.some, si);
-                if (sel elem.some) {
-                    if (json.value_is_string(elem.some)) {
-                        var raw_n: usize = 0;
-                        val raw: *u8 = json.value_string(elem.some, ?raw_n);
-                        val got: res[*u8, A.Error] = A.allocate[u8](a, raw_n + 1);
-                        if (sel got.ok) {
-                            val spn: usize = decode_lenient(raw, raw_n, got.ok);
-                            if (spn > 0) {
-                                vector.push[str](?sym_names, got.ok);
-                            }
-                        }
-                    }
-                }
-                si = si + 1;
+        if (!json.value_is_array(arr_f.some) || json.value_count(arr_f.some) == 0) {
+            ret fail(e, "contract_bad", "contract.symbols/methods must be a non-empty list of strings", 0);
+        }
+        var si: usize = 0;
+        for (si < json.value_count(arr_f.some)) {
+            val elem: opt[*json.Value] = json.value_get(arr_f.some, si);
+            if (!sel elem.some) {
+                ret fail(e, "contract_bad", "contract.symbols/methods elements must be non-empty strings", 0);
             }
+            if (sel elem.some) {
+                if (!json.value_is_string(elem.some)) {
+                    ret fail(e, "contract_bad", "contract.symbols/methods elements must be non-empty strings", 0);
+                }
+                var raw_n: usize = 0;
+                val raw: *u8 = json.value_string(elem.some, ?raw_n);
+                val got: res[*u8, A.Error] = A.allocate[u8](a, raw_n + 1);
+                if (sel got.err) { ret fail(e, "oom", "out of memory", 0); }
+                val spn: usize = decode_lenient(raw, raw_n, got.ok);
+                if (spn == 0) {
+                    ret fail(e, "contract_bad", "contract.symbols/methods elements must be non-empty strings", 0);
+                }
+                vector.push[str](?sym_names, got.ok);
+            }
+            si = si + 1;
         }
     }
     if (sym_names.len > 0) {
@@ -1606,55 +2016,125 @@ pub fun verify_contract(a: *A.Allocator, name: str, old_p: *u8, old_n: usize, ne
     }
 
     # 3. Preserve signatures contract: "preserve_signatures": true
-    if (get_bool(contract, "preserve_signatures") && lang != nil) {
+    if (get_bool(contract, "preserve_signatures")) {
+        if (lang == nil) {
+            ret fail(e, "contract_bad", "preserve_signatures requires a supported language file", 0);
+        }
+        val is_py: bool = util.eq(lang, "python");
         var old_syms: vector.Vector[scan.Sym] = vector.init[scan.Sym](a);
+        var new_syms: vector.Vector[scan.Sym] = vector.init[scan.Sym](a);
         scan.collect_symbols(a, lang, old_p, old_n, ?old_syms);
+        scan.collect_symbols(a, lang, new_p, new_n, ?new_syms);
         var oi: usize = 0;
         for (oi < old_syms.len) {
             val os: *scan.Sym = ?old_syms.data[oi];
-            var ns: scan.Sym;
-            if (scan.find_symbol_ext(a, lang, new_p, new_n, os.name, os.name_n, ?ns) != 1) {
+            var found_ns: *scan.Sym = nil;
+            var ni: usize = 0;
+            for (ni < new_syms.len) {
+                val cand: *scan.Sym = ?new_syms.data[ni];
+                if (cand.name_n == os.name_n && slice_eq(cand.name, 0, cand.name_n, os.name, 0, os.name_n)) {
+                    val p_both_nil: bool = os.parent == nil && cand.parent == nil;
+                    val p_match: bool = p_both_nil || (os.parent != nil && cand.parent != nil && os.parent_n == cand.parent_n && slice_eq(os.parent, 0, os.parent_n, cand.parent, 0, cand.parent_n));
+                    if (p_match) {
+                        found_ns = cand;
+                        brk;
+                    }
+                }
+                ni = ni + 1;
+            }
+            if (found_ns == nil) {
                 ret fail(e, "contract_violation", "a symbol was removed or renamed while preserve_signatures is active", os.line);
             }
             val o_s0: usize = line_start(?ot, os.line::usize);
-            val o_s1: usize = line_start(?ot, (os.sig_end + 1)::usize);
-            val n_s0: usize = line_start(?nt, ns.line::usize);
-            val n_s1: usize = line_start(?nt, (ns.sig_end + 1)::usize);
-            if (!slice_eq(old_p, o_s0, o_s1, new_p, n_s0, n_s1)) {
-                ret fail(e, "contract_violation", "a symbol signature was modified while preserve_signatures is active", ns.line);
+            var o_s1: usize = line_start(?ot, (os.sig_end + 1)::usize);
+            var o_open: usize = 0;
+            var o_close: usize = 0;
+            if (find_sym_delim(old_p, o_s0, o_s1, is_py, ?o_open, ?o_close)) {
+                o_s1 = o_open + 1;
+            }
+            val n_s0: usize = line_start(?nt, found_ns.line::usize);
+            var n_s1: usize = line_start(?nt, (found_ns.sig_end + 1)::usize);
+            var n_open: usize = 0;
+            var n_close: usize = 0;
+            if (find_sym_delim(new_p, n_s0, n_s1, is_py, ?n_open, ?n_close)) {
+                n_s1 = n_open + 1;
+            }
+            if (!slice_trim_eq(old_p, o_s0, o_s1, new_p, n_s0, n_s1)) {
+                ret fail(e, "contract_violation", "a symbol signature was modified while preserve_signatures is active", found_ns.line);
             }
             oi = oi + 1;
         }
     }
 
-    # 4. Max lines changed contract: "max_lines_changed": N
-    var max_chg: i64 = 0;
-    if (get_int(contract, "max_lines_changed", ?max_chg) == 1 && max_chg > 0) {
+    # 4. Max lines changed contract: "max_lines_changed": N (or alias "max_changed_lines": N)
+    var max_f: opt[*json.Value] = json.value_find(contract, "max_lines_changed");
+    if (!sel max_f.some) { max_f = json.value_find(contract, "max_changed_lines"); }
+    if (sel max_f.some) {
+        if (!json.value_is_number(max_f.some) || json.value_is_float(max_f.some) || json.value_number(max_f.some) < 0) {
+            ret fail(e, "contract_bad", "contract.max_lines_changed must be a non-negative integer", 0);
+        }
+        val max_chg: i64 = json.value_number(max_f.some);
         var pre_l: i64 = 1;
         for (pre_l <= ototal && pre_l <= ntotal) {
-            val o0: usize = line_start(?ot, pre_l::usize);
-            val o1: usize = line_start(?ot, (pre_l + 1)::usize);
-            val n0: usize = line_start(?nt, pre_l::usize);
-            val n1: usize = line_start(?nt, (pre_l + 1)::usize);
-            if (!slice_eq(old_p, o0, o1, new_p, n0, n1)) { brk; }
+            if (!line_eq_at(?ot, pre_l, ?nt, pre_l)) { brk; }
             pre_l = pre_l + 1;
         }
         var o_suf: i64 = ototal;
         var n_suf: i64 = ntotal;
         for (o_suf >= pre_l && n_suf >= pre_l) {
-            val o0: usize = line_start(?ot, o_suf::usize);
-            val o1: usize = line_start(?ot, (o_suf + 1)::usize);
-            val n0: usize = line_start(?nt, n_suf::usize);
-            val n1: usize = line_start(?nt, (n_suf + 1)::usize);
-            if (!slice_eq(old_p, o0, o1, new_p, n0, n1)) { brk; }
+            if (!line_eq_at(?ot, o_suf, ?nt, n_suf)) { brk; }
             o_suf = o_suf - 1;
             n_suf = n_suf - 1;
         }
-        val old_span: i64 = o_suf - pre_l + 1;
-        val new_span: i64 = n_suf - pre_l + 1;
-        var chg: i64 = old_span;
-        if (new_span > chg) { chg = new_span; }
-        if (chg > max_chg) {
+        var total_chg: i64 = 0;
+        var ol: i64 = pre_l;
+        var nl: i64 = pre_l;
+        for (ol <= o_suf || nl <= n_suf) {
+            if (ol <= o_suf && nl <= n_suf && line_eq_at(?ot, ol, ?nt, nl)) {
+                ol = ol + 1;
+                nl = nl + 1;
+                cnt;
+            }
+            # Find nearest resync point (ol2, nl2) within lookahead window
+            var best_o: i64 = -1;
+            var best_n: i64 = -1;
+            var best_dist: i64 = 1000000;
+            var do_i: i64 = 0;
+            for (do_i <= 64 && ol + do_i <= o_suf + 1) {
+                var dn_i: i64 = 0;
+                for (dn_i <= 64 && nl + dn_i <= n_suf + 1) {
+                    if (do_i + dn_i > 0 && do_i + dn_i < best_dist) {
+                        if (ol + do_i <= o_suf && nl + dn_i <= n_suf && line_eq_at(?ot, ol + do_i, ?nt, nl + dn_i)) {
+                            best_o = ol + do_i;
+                            best_n = nl + dn_i;
+                            best_dist = do_i + dn_i;
+                        }
+                    }
+                    dn_i = dn_i + 1;
+                }
+                do_i = do_i + 1;
+            }
+            if (best_o >= 0 && best_n >= 0) {
+                val ho: i64 = best_o - ol;
+                val hn: i64 = best_n - nl;
+                var hmax: i64 = ho;
+                if (hn > hmax) { hmax = hn; }
+                total_chg = total_chg + hmax;
+                ol = best_o;
+                nl = best_n;
+            }
+            or {
+                var ro: i64 = 0;
+                if (o_suf >= ol) { ro = o_suf - ol + 1; }
+                var rn: i64 = 0;
+                if (n_suf >= nl) { rn = n_suf - nl + 1; }
+                var rmax: i64 = ro;
+                if (rn > rmax) { rmax = rn; }
+                total_chg = total_chg + rmax;
+                brk;
+            }
+        }
+        if (total_chg > max_chg) {
             ret fail(e, "contract_violation", "edits exceeded contract.max_lines_changed", pre_l);
         }
     }

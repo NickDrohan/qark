@@ -447,11 +447,13 @@ Check "capabilities and schema ops return machine-readable metadata" ($rCaps.ok 
 # 10. Signed releases and update verification
 New-Item -ItemType Directory -Force -Path (Join-Path $root "rel_test") | Out-Null
 [System.IO.File]::WriteAllText((Join-Path $root "rel_test\artifact.txt"), "qark 0.3.0 binary payload`n")
-$rSign = Q "release.sign" @{ dir = "rel_test"; version = "0.3.0" }
-$rVerifyOk = Q "release.verify" @{ dir = "rel_test" }
-Check "release.sign and release.verify sign and validate release artifacts" ($rSign.ok -and $rSign.result.files -eq 1 -and $rVerifyOk.ok -and $rVerifyOk.result.verified -eq $true) @{ sign = $rSign; verify = $rVerifyOk }
+$rSignNoKey = Q "release.sign" @{ dir = "rel_test"; version = "0.3.0" }
+Check "release.sign refuses missing key without QARK_RELEASE_KEY" ((-not $rSignNoKey.ok) -and $rSignNoKey.error.code -eq "release_key_required") $rSignNoKey
+$rSign = Q "release.sign" @{ dir = "rel_test"; version = "0.3.0"; key = "test-release-secret-key" }
+$rVerifyOk = Q "release.verify" @{ dir = "rel_test"; key = "test-release-secret-key" }
+Check "release.sign and release.verify sign and validate release artifacts with RFC 2104 HMAC-SHA256" ($rSign.ok -and $rSign.result.files -eq 1 -and $rVerifyOk.ok -and $rVerifyOk.result.verified -eq $true) @{ sign = $rSign; verify = $rVerifyOk }
 [System.IO.File]::WriteAllText((Join-Path $root "rel_test\artifact.txt"), "tampered payload`n")
-$rVerifyBad = Q "release.verify" @{ dir = "rel_test" }
+$rVerifyBad = Q "release.verify" @{ dir = "rel_test"; key = "test-release-secret-key" }
 Check "release.verify detects tampered release artifact" ((-not $rVerifyBad.ok) -and $rVerifyBad.error.code -eq "release_tampered") $rVerifyBad
 
 $w.StandardInput.Close()
@@ -738,6 +740,158 @@ $oneShotInvalid = Run-OneShotWithEnv "" @{ dry_run = $true; path = "src/parity.j
 Check "AutoCode #9: one-shot and warm-process checker runs produce identical validation outcomes" ($warmInvalid.result.ready -eq $oneShotInvalid.result.ready -and $warmInvalid.result.validation_complete -eq $oneShotInvalid.result.validation_complete -and $warmInvalid.result.files[0].check -eq $oneShotInvalid.result.files[0].check -and $warmInvalid.result.files[0].line -eq $oneShotInvalid.result.files[0].line) @{ warm = $warmInvalid; oneshot = $oneShotInvalid }
 $wrep.StandardInput.Close()
 [void]$wrep.WaitForExit(5000)
+
+# ==============================================================================
+# Adversarial Review Regression Suite (Q01 - Q40)
+# ==============================================================================
+$advRoot = Join-Path $root "adv-review"
+New-Item -ItemType Directory -Force -Path $advRoot | Out-Null
+$wadv = Start-Worker @("--headless", "--stdio", "--root", "`"$advRoot`"")
+function QAdv([string]$op, $argsObj) {
+    $script:id++
+    $req = @{ id = $script:id; op = $op; args = $argsObj } | ConvertTo-Json -Compress -Depth 20
+    $wadv.StandardInput.WriteLine($req)
+    return ((Read-Reply $wadv $req) | ConvertFrom-Json)
+}
+
+# Q01: Write-ahead log (WAL) crash recovery restores interrupted multi-file transaction on next lock
+[System.IO.File]::WriteAllText((Join-Path $advRoot "wal_existing.txt"), "partial-new`n", $utf8)
+[System.IO.File]::WriteAllText((Join-Path $advRoot "wal_created.txt"), "orphan-created`n", $utf8)
+New-Item -ItemType Directory -Force -Path (Join-Path $advRoot ".qark\undo") | Out-Null
+$walSnap = @{
+    txn = "deadbeef12345678"
+    files = @(
+        @{ path = "wal_existing.txt"; status = "replaced"; old_text = "original-clean`n"; old_perm = 420 },
+        @{ path = "wal_created.txt"; status = "created"; new_text = "orphan-created`n" }
+    )
+} | ConvertTo-Json -Compress -Depth 10
+[System.IO.File]::WriteAllText((Join-Path $advRoot ".qark\undo\deadbeef12345678.json"), $walSnap, $utf8)
+[System.IO.File]::WriteAllText((Join-Path $advRoot ".qark\wal.json"), '{"txn":"deadbeef12345678","state":"publishing"}', $utf8)
+$rAfterWal = QAdv "apply" @{ path = "wal_probe.txt"; text = "after-recovery`n"; check = $false }
+$walRestoredText = [System.IO.File]::ReadAllText((Join-Path $advRoot "wal_existing.txt"))
+$walCreatedGone = -not (Test-Path (Join-Path $advRoot "wal_created.txt"))
+$walFileCleared = -not (Test-Path (Join-Path $advRoot ".qark\wal.json"))
+Check "Q01: WAL crash recovery restores interrupted replaced file and removes interrupted created file on next transaction" ($rAfterWal.ok -and $walRestoredText -eq "original-clean`n" -and $walCreatedGone -and $walFileCleared) @{ res = $rAfterWal; restored = $walRestoredText; createdGone = $walCreatedGone }
+
+# Q03: Staged validation runs in an isolated staging tree without mutating live workspace during dry_run or failed validation
+[void](QAdv "apply" @{ path = "live_protected.py"; mode = "upsert"; text = "VALUE = 1`n" })
+$rDryValFail = QAdv "apply" @{
+    dry_run = $true
+    path = "live_protected.py"
+    mode = "upsert"
+    text = "VALUE = 999`n"
+    validate = @("python", "-c", "import live_protected, sys; sys.exit(0 if live_protected.VALUE == 999 else 1)")
+}
+$liveDuringDry = [System.IO.File]::ReadAllText((Join-Path $advRoot "live_protected.py"))
+Check "Q03: project validation evaluates staged candidate in isolated tree without mutating live workspace" ($rDryValFail.ok -and $rDryValFail.result.ready -eq $true -and $rDryValFail.result.validation -eq "ok" -and $liveDuringDry -eq "VALUE = 1`n") @{ dry = $rDryValFail; live = $liveDuringDry }
+
+# Q06 & Q07: require_expect and idempotency_key
+$rNoExp = QAdv "apply" @{ require_expect = $true; path = "live_protected.py"; mode = "upsert"; text = "VALUE = 2`n" }
+Check "Q06: require_expect refuses modifying existing file without expect" ((-not $rNoExp.ok) -and $rNoExp.error.code -eq "expect_required" -and $rNoExp.error.current_sha256.Length -eq 64) $rNoExp
+$rIdem1 = QAdv "apply" @{ idempotency_key = "idem-test-01"; path = "idem.py"; text = "x = 10`n" }
+$rIdem2 = QAdv "apply" @{ idempotency_key = "idem-test-01"; path = "idem.py"; text = "x = 10`n" }
+$rIdemMismatch = QAdv "apply" @{ idempotency_key = "idem-test-01"; path = "idem.py"; text = "x = 99`n" }
+Check "Q07: idempotency_key replays stored receipt with replayed:true and rejects mismatched spec with idempotency_mismatch" ($rIdem1.ok -and $rIdem2.ok -and $rIdem2.result.replayed -eq $true -and $rIdem2.result.txn -eq $rIdem1.result.txn -and (-not $rIdemMismatch.ok) -and $rIdemMismatch.error.code -eq "idempotency_mismatch") @{ i1 = $rIdem1; i2 = $rIdem2; bad = $rIdemMismatch }
+
+# Q09 & Q10: Glob contract enforcement & spec_glob_unsupported
+$rGlobUnsup = QAdv "apply" @{ glob = "*.py"; expect = "00"; edits = @(@{ find = "VALUE"; replace = "V" }) }
+$rGlobContract = QAdv "apply" @{
+    glob = "live_*.py"
+    contract = @{ max_lines_changed = 0 }
+    edits = @(@{ find = "VALUE = 1"; replace = "VALUE = 2" })
+}
+Check "Q09/Q10: glob edits reject unsupported keys with spec_glob_unsupported and enforce contract" ((-not $rGlobUnsup.ok) -and $rGlobUnsup.error.code -eq "spec_glob_unsupported" -and (-not $rGlobContract.ok) -and $rGlobContract.error.code -eq "contract_violation") @{ unsup = $rGlobUnsup; contract = $rGlobContract }
+
+# Q11, Q12, Q13: validation_complete false when ok==0, validate with check:false, per-file check:"required"
+$rTxtOnly = QAdv "apply" @{ path = "notes.txt"; text = "plain text`n" }
+$rValNoCfg = QAdv "apply" @{ path = "notes2.txt"; text = "plain`n"; check = $false; validate = $true }
+$rFileReq = QAdv "apply" @{ files = @(@{ path = "notes3.txt"; text = "plain`n"; check = "required" }) }
+Check "Q11/Q12/Q13: validation_complete is false when checks.ok==0, validate:true without config fails closed, and per-file check:required refuses unchecked filetype" ($rTxtOnly.ok -and $rTxtOnly.result.validation_complete -eq $false -and (-not $rValNoCfg.ok) -and (-not $rFileReq.ok) -and $rFileReq.error.code -eq "check_unavailable") @{ txt = $rTxtOnly; valNoCfg = $rValNoCfg; fileReq = $rFileReq }
+
+# Q14 & Q15: Node CJS top-level return / require.main and candidate package.json in same batch
+$rCjsTopReturn = QAdv "apply" @{
+    files = @(
+        @{ path = "cjs_pkg/package.json"; text = '{"type":"commonjs"}' + "`n" },
+        @{ path = "cjs_pkg/cli.js"; text = "if (require.main === module) { return; }`nconst v = __dirname;`n" }
+    )
+}
+$rEsmBatchInvalid = QAdv "apply" @{
+    files = @(
+        @{ path = "esm_pkg/package.json"; text = '{"type":"module"}' + "`n" },
+        @{ path = "esm_pkg/app.js"; text = "if (require.main === module) { return; }`n" }
+    )
+}
+Check "Q14/Q15: CJS wrapper accepts top-level return/require.main while candidate ESM package.json in same batch enforces ESM rules" ($rCjsTopReturn.ok -and $rCjsTopReturn.result.validation_complete -eq $true -and (-not $rEsmBatchInvalid.ok) -and $rEsmBatchInvalid.error.code -eq "check_failed") @{ cjs = $rCjsTopReturn; esm = $rEsmBatchInvalid }
+
+# Q17, Q18, Q19, Q20: JS class methods, regex/template braces, token-aware rename, single-line body/signature, expect_signature
+[void](QAdv "apply" @{
+    path = "js/widget.js"
+    text = "class Widget {`n  render() {`n    const rx = /}/g;`n    const tpl = ``hello `${name} }``;`n    const render = 'render should not rename in string';`n    return this.render();`n  }`n}`nfunction oneLiner(a) { return a + 1; }`n"
+})
+$rSymRead = QAdv "read" @{ path = "js/widget.js"; symbols = $true; content = $false }
+$hasRenderMethod = @($rSymRead.result.files[0].symbols | Where-Object { $_.name -eq "render" -and $_.kind -eq "method" -and $_.parent -eq "Widget" }).Count -eq 1
+$rOneLineEdit = QAdv "apply" @{
+    path = "js/widget.js"
+    edits = @(
+        @{ symbol = "oneLiner"; expect_signature = "function oneLiner(a)"; body = "return a + 100;" },
+        @{ symbol = "Widget.render"; rename = "paint" }
+    )
+}
+$widgetText = [System.IO.File]::ReadAllText((Join-Path $advRoot "js\widget.js"))
+Check "Q17/Q18/Q19/Q20: JS class methods with regex/template braces, qualified symbol rename skipping strings, expect_signature, and single-line body edit" ($hasRenderMethod -and ($null -eq $rSymRead.result.files[0].text) -and $rOneLineEdit.ok -and $widgetText.Contains("'render should not rename in string'") -and $widgetText.Contains("paint()") -and $widgetText.Contains("return a + 100;")) @{ sym = $rSymRead; edit = $rOneLineEdit; text = $widgetText }
+
+# Q21: **/ zero-directory glob matching
+$rGlobZero = QAdv "search" @{ glob = "js/**/*.js" }
+Check "Q21: **/ matches zero intermediate directories (js/**/*.js matches js/widget.js)" ($rGlobZero.ok -and ($rGlobZero.result.paths -contains "js/widget.js")) $rGlobZero
+
+# Q23: rebase_base_mismatch and base_unavailable
+$rRebSeed = QAdv "apply" @{ path = "reb_check.py"; text = "a = 1`nb = 2`n" }
+$rebCurSha = $rRebSeed.result.files[0].sha256
+[void](QAdv "apply" @{ path = "reb_check.py"; mode = "upsert"; text = "a = 10`nb = 2`n" })
+$rRebBadBase = QAdv "apply" @{
+    path = "reb_check.py"
+    expect = $rebCurSha
+    rebase = $true
+    base_text = "wrong base text`n"
+    edits = @(@{ find = "b = 2"; replace = "b = 20" })
+}
+$rRebUnavail = QAdv "apply" @{
+    path = "reb_check.py"
+    expect = "1111111111111111111111111111111111111111111111111111111111111111"
+    rebase = $true
+    edits = @(@{ find = "b = 2"; replace = "b = 20" })
+}
+Check "Q23: rebase rejects mismatched base_text with rebase_base_mismatch and unknown expect hash with base_unavailable" ((-not $rRebBadBase.ok) -and $rRebBadBase.error.code -eq "rebase_base_mismatch" -and (-not $rRebUnavail.ok) -and $rRebUnavail.error.code -eq "base_unavailable") @{ badBase = $rRebBadBase; unavail = $rRebUnavail }
+
+# Q34 & Q35: strict contract validation (contract_bad) and hunk-based max_lines_changed
+$rBadContract = QAdv "apply" @{ path = "reb_check.py"; contract = @{ unknown_rule = 123 }; edits = @(@{ find = "b = 2"; replace = "b = 3" }) }
+Check "Q34: unknown contract key is rejected with contract_bad" ((-not $rBadContract.ok) -and $rBadContract.error.code -eq "contract_bad") $rBadContract
+
+$wadv.StandardInput.Close()
+[void]$wadv.WaitForExit(5000)
+
+# Q32: Official QarkSession client rejects in-flight requests immediately on unexpected child exit
+$clientTestScript = Join-Path $advRoot "test-client.mjs"
+$qarkSessionUrl = ([System.Uri](Join-Path $Repo "scripts\client\qark-session.mjs")).AbsoluteUri
+[System.IO.File]::WriteAllText($clientTestScript, @"
+import { QarkSession } from '$qarkSessionUrl';
+const session = new QarkSession({ bin: $(ConvertTo-Json $Qark), root: $(ConvertTo-Json $advRoot) });
+const info = await session.info();
+if (!info || info.protocol !== 2) process.exit(2);
+session.proc.kill();
+try {
+  await session.request('ping', {});
+  process.exit(3);
+} catch (err) {
+  if (err.code === 'QARK_PROCESS_EXITED' || err.code === 'QARK_SESSION_CLOSED') {
+    console.log('CLIENT_OK');
+    process.exit(0);
+  }
+  process.exit(4);
+}
+"@, $utf8)
+$clientOut = & node $clientTestScript 2>&1
+Check "Q32: official QarkSession client connects and rejects requests cleanly on child exit" ($LASTEXITCODE -eq 0 -and ($clientOut -join "`n").Contains("CLIENT_OK")) $clientOut
 
 Remove-Item -Recurse -Force $root
 Write-Host ""

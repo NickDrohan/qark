@@ -27,7 +27,7 @@ val TOOLS: [_]u8;
 
 val LATEST: str = "2025-06-18";
 
-val INSTRUCTIONS: str = "Qark v0.3.0 is the transactional, AST-aware write and code-intelligence layer for this workspace. Prefer Qark's tools over raw file reads/writes:\n1. qark_read: Read files with sha256, symbol outlines (outline: true), specific AST symbols (symbol / symbols), or compact signature-folded views (fold: true).\n2. qark_edit: Perform surgical single-file or glob edits with flat parameters—AST symbol edits (symbol + body | signature | rename | with), exact find/replace, regex find_re/replace (\\0-\\9 captures), or anchored inserts (insert_before/insert_after + with, auto_indent: true). Supports contract (scope enforcement) and rebase: true (3-way merge on stale expect hashes).\n3. qark_apply: Create, replace, edit, move, or delete one or many files atomically, render Handlebars templates, enforce scope contracts, run syntax and staged project validation, and receive a semantic change preview.\n4. qark_search: Ripgrep-speed literal or regex search returning matches grouped per file with sha256 and enclosing AST symbol (or omit pattern to list workspace files).\n5. qark_impact: Trace a symbol's definitions, references, imports, dependents, affected_files, and affected_symbols before refactoring.\n6. qark_undo: Atomically undo (steps: N) or redo (redo: true) multi-file transactions from .qark/undo, or list history (list: true).\n7. qark_check: Run standalone project validation (validate/cmd), verify job manifests (dir), or inspect capabilities/schemas/events.\nRelative paths and full paths inside the workspace root both work; pass root on any tool call to switch workspaces dynamically.";
+val INSTRUCTIONS: str = "Qark v0.3.0 is the transactional, syntax-checked write and code-intelligence layer for this workspace. Prefer Qark's tools over raw file reads/writes:\n1. qark_read: Read files with sha256, symbol outlines (outline: true), specific symbols (symbol / symbols), or compact signature-folded views (fold: true).\n2. qark_edit: Perform surgical single-file or glob edits with flat parameters—symbol edits (symbol + body | signature | rename | with), exact find/replace, regex find_re/replace (\\0-\\9 captures), or anchored inserts (insert_before/insert_after + with, auto_indent: true). Supports contract (scope enforcement) and rebase: true (3-way merge on stale expect hashes with base_text or undo history).\n3. qark_apply: Create, replace, edit, move, or delete files with write-ahead crash recovery, render Handlebars templates, enforce scope contracts, run syntax and isolated staged project validation, and receive a semantic change preview.\n4. qark_search: Literal or regex search returning matches grouped per file with sha256 and enclosing symbol (or omit pattern to list workspace files).\n5. qark_impact: Trace a symbol's definitions, references, imports, dependents, affected_files, and affected_symbols before refactoring.\n6. qark_undo: Atomically undo (steps: N) or redo (redo: true) multi-file transactions from .qark/undo, or list history (list: true).\n7. qark_check: Run standalone project validation (validate/cmd), verify job manifests (dir), or inspect capabilities/schemas/events.\nRelative paths and full paths inside the workspace root both work; pass root on any tool call to target a different workspace for that call.";
 
 fun known_version(v: str) bool {
     ret util.eq(v, "2024-11-05") || util.eq(v, "2025-03-26") || util.eq(v, "2025-06-18") || util.eq(v, "2025-11-25");
@@ -190,6 +190,7 @@ fun call_tool(s: *session.Session, id: *json.Value, params: *json.Value) res[str
     var inner: jw.Jw = jw.init(?s.ra);
     var ok: bool = false;
     var root_ok: bool = true;
+    var saved_root: str = nil;
     val rf: opt[*json.Value] = json.value_find(args, "root");
     if (sel rf.some) {
         val rstr: str = field_text(?s.ra, args, "root");
@@ -198,9 +199,12 @@ fun call_tool(s: *session.Session, id: *json.Value, params: *json.Value) res[str
             root_ok = false;
         }
         or {
+            val sr: res[str, A.Error] = util.dup(?s.ra, s.root);
+            if (sel sr.ok) { saved_root = sr.ok; }
             val dec_r: str = uri_to_path(?s.ra, rstr);
             if (dec_r == nil || !session.set_root(s, dec_r)) {
-                ok = write.simple_error(?inner, "bad_root", "root is not an existing directory");
+                if (s.lock_root) { ok = write.simple_error(?inner, "root_locked", "workspace root is locked by --lock-root"); }
+                or { ok = write.simple_error(?inner, "bad_root", "root is not an existing directory"); }
                 root_ok = false;
             }
         }
@@ -214,7 +218,13 @@ fun call_tool(s: *session.Session, id: *json.Value, params: *json.Value) res[str
         or (util.eq(name, "qark_check")) { ok = write.project_validate(s, args, ?inner); }
         or (util.eq(name, "qark_templates")) { ok = write.templates(s, args, ?inner); }
         or (util.eq(name, "qark_define_template")) { ok = write.define(s, args, ?inner); }
-        or { ret rpc_error(s, id, -32602, "unknown tool; call tools/list"); }
+        or {
+            if (saved_root != nil) { session.set_root(s, saved_root); }
+            ret rpc_error(s, id, -32602, "unknown tool; call tools/list");
+        }
+    }
+    if (saved_root != nil) {
+        session.set_root(s, saved_root);
     }
     if (inner.failed) { ret rpc_error(s, id, -32603, "out of memory while building the result"); }
     var w: jw.Jw = jw.init(?s.ra);

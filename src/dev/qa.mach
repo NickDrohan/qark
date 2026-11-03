@@ -465,9 +465,12 @@ fun do_search(a: *A.Allocator, qark: *u8, root: *u8, rest: *vector.Vector[*u8]) 
 }
 
 # qa -w dst=src [-w ...] [-m mode]: stage local files into a spec and apply it
-fun do_writes(a: *A.Allocator, qark: *u8, root: *u8, mode: str, wfiles: *vector.Vector[*u8]) i64 {
+fun do_writes(a: *A.Allocator, qark: *u8, root: *u8, mode: str, wfiles: *vector.Vector[*u8], dry: bool, show_diff: bool) i64 {
     var w: jw.Jw = jw.init(a);
-    jw.raw(?w, "{\"files\":[");
+    jw.raw(?w, "{");
+    if (dry) { jw.raw(?w, "\"dry_run\":true,"); }
+    if (show_diff) { jw.raw(?w, "\"diff\":true,"); }
+    jw.raw(?w, "\"files\":[");
     var i: usize = 0;
     for (i < wfiles.len) {
         val pair: str = wfiles.data[i];
@@ -480,6 +483,10 @@ fun do_writes(a: *A.Allocator, qark: *u8, root: *u8, mode: str, wfiles: *vector.
             print.eprintln("qa: -w takes dst=src");
             ret 2;
         }
+        if (eq.some >= 512) {
+            print.eprintln("qa: destination path exceeds 511 bytes");
+            ret 2;
+        }
         var dst: [512]u8;
         var d: usize = 0;
         for (d < eq.some && d + 1 < 512) {
@@ -488,6 +495,10 @@ fun do_writes(a: *A.Allocator, qark: *u8, root: *u8, mode: str, wfiles: *vector.
         }
         dst[d] = 0;
         val src: str = (pair::usize + eq.some + 1)::*u8;
+        if (str_len(src) == 0 || str_len(src) >= 1024) {
+            print.eprintln("qa: source path is empty or too long");
+            ret 2;
+        }
         val text: res[str, filesystem.FsError] = filesystem.read_string(a, src);
         if (sel text.err) {
             print.eprintln("qa: could not read the local file");
@@ -521,13 +532,16 @@ fun do_writes(a: *A.Allocator, qark: *u8, root: *u8, mode: str, wfiles: *vector.
         ret 2;
     }
     filesystem.temp_close(?t);
-    var cargv: [8]*u8;
-    cargv[0] = qark;
-    cargv[1] = "apply";
-    cargv[2] = filesystem.temp_path(?t);
-    cargv[3] = "--root";
-    cargv[4] = root;
-    cargv[5] = nil;
+    var cargv: [10]*u8;
+    var ci: usize = 0;
+    cargv[ci] = qark; ci = ci + 1;
+    cargv[ci] = "apply"; ci = ci + 1;
+    cargv[ci] = filesystem.temp_path(?t); ci = ci + 1;
+    if (dry) { cargv[ci] = "--dry-run"; ci = ci + 1; }
+    if (show_diff) { cargv[ci] = "--diff"; ci = ci + 1; }
+    cargv[ci] = "--root"; ci = ci + 1;
+    cargv[ci] = root; ci = ci + 1;
+    cargv[ci] = nil;
     val code: i64 = run_qark(a, ?cargv[0], nil, 0);
     filesystem.temp_remove(?t);
     ret code;
@@ -563,6 +577,10 @@ fun main(argc: i64, argv: **u8) i64 {
     for (i < argc) {
         val arg: str = argv[i::usize];
         if (util.eq(arg, "--root") && i + 1 < argc) {
+            if (str_len(argv[(i + 1)::usize]) >= 1024) {
+                print.eprintln("qa: --root path exceeds 1023 bytes");
+                ret 2;
+            }
             copy(?root[0], 1024, argv[(i + 1)::usize]);
             i = i + 2;
         }
@@ -729,7 +747,7 @@ fun main(argc: i64, argv: **u8) i64 {
             i = i + 1;
         }
     }
-    if (wfiles.len > 0) { ret do_writes(?a, ?qark[0], ?root[0], mode, ?wfiles); }
+    if (wfiles.len > 0) { ret do_writes(?a, ?qark[0], ?root[0], mode, ?wfiles, dry, show_diff); }
     if (efiles.len > 0) { ret do_edits(?a, ?qark[0], ?root[0], ?efiles, dry, show_diff); }
     if (rest.len == 0) { ret usage(); }
     val cmd: str = rest.data[0];

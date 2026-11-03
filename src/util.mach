@@ -251,6 +251,31 @@ pub fun is_space(c: u8) bool {
     ret false;
 }
 
+pub fun mem_eq(a: *u8, b: *u8, n: usize) bool {
+    if (n == 0) { ret true; }
+    if (a == nil || b == nil) { ret false; }
+    var i: usize = 0;
+    for (i < n) {
+        if (a[i] != b[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+pub fun contains_str(hay: str, needle: str) bool {
+    if (hay == nil || needle == nil) { ret false; }
+    val hn: usize = str_len(hay);
+    val nn: usize = str_len(needle);
+    if (nn == 0) { ret true; }
+    if (nn > hn) { ret false; }
+    var i: usize = 0;
+    for (i + nn <= hn) {
+        if (mem_eq((hay::usize + i)::*u8, needle, nn)) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
 use std.system.capability;
 
 $if (capability.HOSTED) {

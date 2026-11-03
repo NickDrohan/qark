@@ -47,6 +47,16 @@ pub val CK_FAILED:  u8 = 2;
 pub val CK_SKIPPED: u8 = 3;
 pub val CK_ERROR:   u8 = 4;
 
+pub val CP_INHERIT:    u8 = 0;
+pub val CP_STRICT:     u8 = 1;
+pub val CP_REQUIRED:   u8 = 2;
+pub val CP_PERMISSIVE: u8 = 3;
+pub val CP_OFF:        u8 = 4;
+
+pub val RB_NONE:       u8 = 0;
+pub val RB_RESTORED:   u8 = 1;
+pub val RB_FAILED:     u8 = 2;
+
 # one file in a change set
 # ---
 # rel:      canonical relative path, '/' separated
@@ -63,37 +73,40 @@ pub val CK_ERROR:   u8 = 4;
 # notes:    advisory lines for the receipt, such as line-ending normalization
 # edited:   the bytes came through an edits list rather than a full text
 pub rec Entry {
-    rel:        str;
-    full:       str;
-    data:       *u8;
-    len:        usize;
-    sha:        [65]u8;
-    mode:       u8;
-    has_expect: bool;
-    expect:     [65]u8;
-    exec:       bool;
-    existed:    bool;
-    old:        *u8;
-    old_len:    usize;
-    old_sha:    [65]u8;
-    old_perm:   u32;
-    status:     u8;
-    reason:     str;
-    temp:       str;
-    done:       bool;
-    lang:       str;
-    check:      u8;
-    ck_line:    i64;
-    ck_col:     i64;
-    ck_msg:     str;
-    ck_cat:     str;
-    ck_exe:     str;
-    ck_exit:    i64;
-    ck_stderr:  str;
-    notes:      vector.Vector[str];
-    edited:     bool;
-    rebased:    bool;
-    base_sha:   [65]u8;
+    rel:            str;
+    full:           str;
+    data:           *u8;
+    len:            usize;
+    sha:            [65]u8;
+    mode:           u8;
+    has_expect:     bool;
+    expect:         [65]u8;
+    exec:           bool;
+    existed:        bool;
+    old:            *u8;
+    old_len:        usize;
+    old_sha:        [65]u8;
+    old_perm:       u32;
+    status:         u8;
+    reason:         str;
+    temp:           str;
+    done:           bool;
+    rollback_state: u8;
+    lang:           str;
+    check_policy:   u8;
+    custom_check:   bool;
+    check:          u8;
+    ck_line:        i64;
+    ck_col:         i64;
+    ck_msg:         str;
+    ck_cat:         str;
+    ck_exe:         str;
+    ck_exit:        i64;
+    ck_stderr:      str;
+    notes:          vector.Vector[str];
+    edited:         bool;
+    rebased:        bool;
+    base_sha:       [65]u8;
 }
 
 # a change set; every string and buffer it holds comes from `a`
@@ -106,10 +119,12 @@ pub rec Set {
 
 # what publish achieved
 pub rec Outcome {
-    ok:    bool;
-    code:  str;
-    msg:   str;
-    index: i64;
+    ok:                bool;
+    code:              str;
+    msg:               str;
+    index:             i64;
+    rollback_failed:   bool;
+    recovery_required: bool;
 }
 
 # the workspace lock
@@ -125,6 +140,65 @@ pub fun hash_hex(data: *u8, n: usize, out: *u8) {
     if (p == nil) { p = ?empty[0]; }
     sha256.hash(p, n, ?dig[0]);
     util.fmt_hex(out, 65, ?dig[0], 32);
+}
+
+# RFC 2104 HMAC-SHA256 hex digest (64 hex chars + NUL)
+pub fun hmac_sha256_hex(a: *A.Allocator, key: *u8, key_n: usize, msg: *u8, msg_n: usize, out: *u8) bool {
+    var k_block: [64]u8;
+    var i: usize = 0;
+    for (i < 64) {
+        k_block[i] = 0;
+        i = i + 1;
+    }
+    var empty: [1]u8;
+    var kp: *u8 = key;
+    if (kp == nil) { kp = ?empty[0]; }
+    if (key_n > 64) {
+        var kdig: [32]u8;
+        sha256.hash(kp, key_n, ?kdig[0]);
+        i = 0;
+        for (i < 32) {
+            k_block[i] = kdig[i];
+            i = i + 1;
+        }
+    }
+    or {
+        i = 0;
+        for (i < key_n) {
+            k_block[i] = kp[i];
+            i = i + 1;
+        }
+    }
+    val inner_len: usize = 64 + msg_n;
+    val inner_buf: res[*u8, A.Error] = A.allocate[u8](a, inner_len + 1);
+    if (sel inner_buf.err) { ret false; }
+    i = 0;
+    for (i < 64) {
+        inner_buf.ok[i] = k_block[i] ^ 54;
+        i = i + 1;
+    }
+    i = 0;
+    for (i < msg_n) {
+        inner_buf.ok[64 + i] = msg[i];
+        i = i + 1;
+    }
+    var inner_dig: [32]u8;
+    sha256.hash(inner_buf.ok, inner_len, ?inner_dig[0]);
+    var outer_buf: [96]u8;
+    i = 0;
+    for (i < 64) {
+        outer_buf[i] = k_block[i] ^ 92;
+        i = i + 1;
+    }
+    i = 0;
+    for (i < 32) {
+        outer_buf[64 + i] = inner_dig[i];
+        i = i + 1;
+    }
+    var outer_dig: [32]u8;
+    sha256.hash(?outer_buf[0], 96, ?outer_dig[0]);
+    util.fmt_hex(out, 65, ?outer_dig[0], 32);
+    ret true;
 }
 
 pub fun init(a: *A.Allocator, root: str) Set {
@@ -199,14 +273,14 @@ fun probe(p: str, perm: *u32) i64 {
 }
 
 # why an ancestor makes the path unusable, or nil when every ancestor is a real directory or absent
-fun ancestry(set: *Set, rel: str) str {
+pub fun check_ancestry(a: *A.Allocator, root: str, rel: str) str {
     val n: usize = str_len(rel);
     var i: usize = 0;
     for (i < n) {
         if (rel[i] == '/') {
-            val prefix: res[str, A.Error] = util.dup_n(set.a, rel, i);
+            val prefix: res[str, A.Error] = util.dup_n(a, rel, i);
             if (sel prefix.err) { ret "oom"; }
-            val p: res[str, A.Error] = pathx.native(set.a, set.root, prefix.ok);
+            val p: res[str, A.Error] = pathx.native(a, root, prefix.ok);
             if (sel p.err) { ret "oom"; }
             val k: i64 = probe(p.ok, nil);
             if (k == 0) { ret nil; }
@@ -216,7 +290,31 @@ fun ancestry(set: *Set, rel: str) str {
         }
         i = i + 1;
     }
+    val full: res[str, A.Error] = pathx.native(a, root, rel);
+    if (sel full.err) { ret "oom"; }
+    val kf: i64 = probe(full.ok, nil);
+    if (kf == 3) { ret "path_link"; }
     ret nil;
+}
+
+fun ancestry(set: *Set, rel: str) str {
+    ret check_ancestry(set.a, set.root, rel);
+}
+
+pub fun check_control_dir(a: *A.Allocator, root: str) bool {
+    val qdir: res[str, A.Error] = pathx.native(a, root, ".qark");
+    if (sel qdir.err) { ret false; }
+    val k1: i64 = probe(qdir.ok, nil);
+    if (k1 == 1 || k1 == 3 || k1 == -1) { ret false; }
+    val udir: res[str, A.Error] = pathx.native(a, root, ".qark/undo");
+    if (sel udir.err) { ret false; }
+    val k2: i64 = probe(udir.ok, nil);
+    if (k2 == 1 || k2 == 3 || k2 == -1) { ret false; }
+    val idir: res[str, A.Error] = pathx.native(a, root, ".qark/idempotency");
+    if (sel idir.err) { ret false; }
+    val k3: i64 = probe(idir.ok, nil);
+    if (k3 == 1 || k3 == 3 || k3 == -1) { ret false; }
+    ret true;
 }
 
 fun conflict(e: *Entry, why: str) {
@@ -317,12 +415,15 @@ pub fun dirty(set: *Set) bool {
 # take the workspace lock: 0 held, 1 still busy after timeout_ms, 2 failed
 pub fun lock(set: *Set, timeout_ms: i64, out: *Lock) i64 {
     out.held = false;
+    if (!check_control_dir(set.a, set.root)) { ret 2; }
     val dir: res[str, A.Error] = pathx.native(set.a, set.root, ".qark");
     if (sel dir.err) { ret 2; }
-    val made: err[filesystem.FsError] = filesystem.create_dir_all(set.a, dir.ok, 493);
+    val made: err[filesystem.FsError] = filesystem.create_dir_all(set.a, dir.ok, 448);
     if (sel made.err) { ret 2; }
+    if (!check_control_dir(set.a, set.root)) { ret 2; }
     val lp: res[str, A.Error] = pathx.native(set.a, set.root, ".qark/lock");
     if (sel lp.err) { ret 2; }
+    if (probe(lp.ok, nil) == 3) { ret 2; }
     var h: usize = os.INVALID_HANDLE;
     val raw: i64 = os.open(os.working_dir(), lp.ok, os.O_CREAT | os.O_RDWR, 384, ?h);
     if (raw < 0) { ret 2; }
@@ -445,16 +546,20 @@ fun drop_temps(set: *Set) {
     }
 }
 
-fun restore(set: *Set, e: *Entry) {
+fun restore(set: *Set, e: *Entry) bool {
     if (e.status == ST_CREATE) {
-        filesystem.remove_file(e.full);
-        ret;
+        val rm: err[io_error.Error] = filesystem.remove_file(e.full);
+        if (sel rm.err) { ret false; }
+        ret true;
     }
     if (e.status == ST_REPLACE || e.status == ST_DELETE) {
         var perm: i32 = (e.old_perm & 511)::i32;
         if (perm == 0) { perm = 420; }
-        filesystem.replace_bytes_atomic(set.a, e.full, e.old, e.old_len, perm, 493);
+        val r: err[filesystem.FsError] = filesystem.replace_bytes_atomic(set.a, e.full, e.old, e.old_len, perm, 493);
+        if (sel r.err) { ret false; }
+        ret true;
     }
+    ret true;
 }
 
 fun failed(code: str, msg: str, index: usize) Outcome {
@@ -463,6 +568,8 @@ fun failed(code: str, msg: str, index: usize) Outcome {
     out.code = code;
     out.msg = msg;
     out.index = index::i64;
+    out.rollback_failed = false;
+    out.recovery_required = false;
     ret out;
 }
 
@@ -472,6 +579,7 @@ pub fun publish(set: *Set) Outcome {
     for (i < set.items.len) {
         val e: *Entry = ?set.items.data[i];
         e.done = false;
+        e.rollback_state = 0;
         e.temp = nil;
         i = i + 1;
     }
@@ -501,16 +609,29 @@ pub fun publish(set: *Set) Outcome {
             or { e.done = true; }
         }
         if (broke) {
+            var rb_failed: bool = false;
             var j: usize = i;
             for (j > 0) {
                 j = j - 1;
                 val d: *Entry = ?set.items.data[j];
                 if (d.done) {
-                    restore(set, d);
-                    d.done = false;
+                    if (restore(set, d)) {
+                        d.rollback_state = 1;
+                        d.done = false;
+                    }
+                    or {
+                        d.rollback_state = 2;
+                        rb_failed = true;
+                    }
                 }
             }
             drop_temps(set);
+            if (rb_failed) {
+                var out: Outcome = failed("io_commit_rollback_failed", "a file could not be published and rollback of an earlier file in this batch also failed; workspace recovery is required", i);
+                out.rollback_failed = true;
+                out.recovery_required = true;
+                ret out;
+            }
             ret failed("io_commit", "a file could not be published (is it open in another program?); files already published by this call were restored", i);
         }
         i = i + 1;
@@ -518,6 +639,8 @@ pub fun publish(set: *Set) Outcome {
     var ok: Outcome;
     ok.ok = true;
     ok.index = -1;
+    ok.rollback_failed = false;
+    ok.recovery_required = false;
     ret ok;
 }
 
@@ -525,11 +648,12 @@ pub fun publish(set: *Set) Outcome {
 pub fun journal(set: *Set, line: *u8, n: usize) i64 {
     val p: res[str, A.Error] = pathx.native(set.a, set.root, ".qark/journal.ndjson");
     if (sel p.err) { ret -1; }
+    if (probe(p.ok, nil) == 3) { ret -1; }
     var offset: i64 = 0;
     val m: res[filesystem.Metadata, io_error.Error] = filesystem.metadata(p.ok);
     if (sel m.ok) { offset = m.ok.size::i64; }
     var h: usize = os.INVALID_HANDLE;
-    val raw: i64 = os.open(os.working_dir(), p.ok, os.O_CREAT | os.O_WRONLY | os.O_APPEND, 420, ?h);
+    val raw: i64 = os.open(os.working_dir(), p.ok, os.O_CREAT | os.O_WRONLY | os.O_APPEND, 384, ?h);
     if (raw < 0) { ret -1; }
     val ok: bool = write_all(h, line, n);
     os.close(h);

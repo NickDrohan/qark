@@ -171,7 +171,7 @@ fun str_fail(a: *A.Allocator, id: i64, status: i64) res[str, A.Error] {
     ret fail(a, id, "oom", "out of memory");
 }
 
-# one file into jobs/<job>/<path>: exclusive, atomic, and contained under the root
+# one file into jobs/<job>/<path>: routed through write.apply for full validation, undo, and journaling
 fun job_write(s: *session.Session, req: i64, root_rel: str, job_id: str, rel: str, text: str) res[str, A.Error] {
     val a: *A.Allocator = ?s.ra;
     if (text == nil || rel == nil || root_rel == nil || job_id == nil) {
@@ -189,32 +189,37 @@ fun job_write(s: *session.Session, req: i64, root_rel: str, job_id: str, rel: st
     if (sel dir.err) { ret fail(s.a, req, "oom", "out of memory"); }
     val full_rel: res[str, A.Error] = pathx.join(a, dir.ok, crel.ok);
     if (sel full_rel.err) { ret fail(s.a, req, "oom", "out of memory"); }
-    var set: commit.Set = commit.init(a, s.root);
-    val added: res[usize, A.Error] = commit.add(?set, full_rel.ok, text, str_len(text), commit.MODE_CREATE);
-    if (sel added.err) { ret fail(s.a, req, "oom", "out of memory"); }
-    commit.observe(?set);
-    val e: *commit.Entry = commit.entry(?set, 0);
-    if (e.status == commit.ST_CONFLICT) {
-        if (util.eq(e.reason, "exists")) { ret fail(s.a, req, "job_exists", "refusing to overwrite an existing file"); }
-        ret fail(s.a, req, "job_path", commit.reason_message(e.reason));
-    }
-    if (e.status == commit.ST_CREATE) {
-        var held: commit.Lock;
-        if (commit.lock(?set, s.lock_ms, ?held) != 0) { ret fail(s.a, req, "locked", "another qark process held the workspace lock"); }
-        commit.observe(?set);
-        if (e.status == commit.ST_CONFLICT) {
-            commit.unlock(?held);
+    val full_native: res[str, A.Error] = pathx.native(a, s.root, full_rel.ok);
+    if (sel full_native.err) { ret fail(s.a, req, "oom", "out of memory"); }
+
+    var sw: jw.Jw = jw.init(a);
+    jw.obj(?sw);
+    jw.f_str(?sw, "path", full_rel.ok);
+    jw.f_str(?sw, "text", text);
+    jw.f_str(?sw, "mode", "create");
+    jw.obj_end(?sw);
+    if (sw.failed) { ret fail(s.a, req, "oom", "out of memory"); }
+    val parsed: res[json.Value, json.JsonError] = json.parse(sw.buf, sw.len, a);
+    if (sel parsed.err) { ret fail(s.a, req, "oom", "out of memory"); }
+    var doc: json.Value = parsed.ok;
+    var aw: jw.Jw = jw.init(a);
+    val ok: bool = write.apply(s, ?doc, ?aw);
+    val out_txt: str = jw.text(?aw);
+    if (!ok) {
+        if (util.contains_str(out_txt, "\"reason\":\"exists\"")) {
             ret fail(s.a, req, "job_exists", "refusing to overwrite an existing file");
         }
-        val out: commit.Outcome = commit.publish(?set);
-        commit.unlock(?held);
-        if (!out.ok) { ret fail(s.a, req, "job_write", out.msg); }
+        ret reply(s.a, req, false, out_txt);
     }
+    val n: usize = str_len(text);
+    var sha: [65]u8;
+    commit.hash_hex(text, n, ?sha[0]);
     var w: jw.Jw = jw.init(a);
     jw.obj(?w);
-    jw.f_str(?w, "path", e.full);
-    jw.f_str(?w, "sha256", ?e.sha[0]);
-    jw.f_i64(?w, "bytes", e.len::i64);
+    jw.f_str(?w, "path", full_native.ok);
+    jw.f_str(?w, "rel_path", full_rel.ok);
+    jw.f_str(?w, "sha256", ?sha[0]);
+    jw.f_i64(?w, "bytes", n::i64);
     jw.obj_end(?w);
     ret reply(s.a, req, true, jw.text(?w));
 }
@@ -223,18 +228,7 @@ fun write_op(op: str) bool {
     ret util.eq(op, "apply") || util.eq(op, "undo") || util.eq(op, "redo") || util.eq(op, "read") || util.eq(op, "search") || util.eq(op, "impact") || util.eq(op, "events") || util.eq(op, "journal.read") || util.eq(op, "project.validate") || util.eq(op, "capabilities") || util.eq(op, "schema") || util.eq(op, "release.sign") || util.eq(op, "release.verify") || util.eq(op, "template.list") || util.eq(op, "template.define") || util.eq(op, "template.render") || util.eq(op, "job.verify") || util.eq(op, "session.info");
 }
 
-# run one write-layer op into w; true when w holds a result rather than an error
-pub fun run_write(s: *session.Session, op: str, args: *json.Value, w: *jw.Jw) bool {
-    if (json.value_is_object(args)) {
-        val rf: opt[*json.Value] = json.value_find(args, "root");
-        if (sel rf.some) {
-            if (!json.value_is_string(rf.some)) { ret write.simple_error(w, "spec_type", "root must be a directory path string"); }
-            var rp: *u8 = nil;
-            if (decode_string(?s.ra, rf.some, MAX_FIELD, ?rp) == 1 && rp != nil && rp[0] != 0) {
-                if (!session.set_root(s, rp)) { ret write.simple_error(w, "bad_root", "root is not an existing directory"); }
-            }
-        }
-    }
+fun run_write_inner(s: *session.Session, op: str, args: *json.Value, w: *jw.Jw) bool {
     if (util.eq(op, "apply")) { ret write.apply(s, args, w); }
     if (util.eq(op, "undo")) { ret write.undo(s, args, w); }
     if (util.eq(op, "redo")) { ret write.redo(s, args, w); }
@@ -264,6 +258,31 @@ pub fun run_write(s: *session.Session, op: str, args: *json.Value, w: *jw.Jw) bo
         ret write.verify(s, dir, w, ?matched);
     }
     ret write.info(s, w);
+}
+
+# run one write-layer op into w; true when w holds a result rather than an error
+pub fun run_write(s: *session.Session, op: str, args: *json.Value, w: *jw.Jw) bool {
+    var saved_root: str = nil;
+    if (json.value_is_object(args)) {
+        val rf: opt[*json.Value] = json.value_find(args, "root");
+        if (sel rf.some) {
+            if (!json.value_is_string(rf.some)) { ret write.simple_error(w, "spec_type", "root must be a directory path string"); }
+            var rp: *u8 = nil;
+            if (decode_string(?s.ra, rf.some, MAX_FIELD, ?rp) == 1 && rp != nil && rp[0] != 0) {
+                val sr: res[str, A.Error] = util.dup(?s.ra, s.root);
+                if (sel sr.ok) { saved_root = sr.ok; }
+                if (!session.set_root(s, rp)) {
+                    if (s.lock_root) { ret write.simple_error(w, "root_locked", "workspace root is locked by --lock-root"); }
+                    ret write.simple_error(w, "bad_root", "root is not an existing directory");
+                }
+            }
+        }
+    }
+    val ok: bool = run_write_inner(s, op, args, w);
+    if (saved_root != nil) {
+        session.set_root(s, saved_root);
+    }
+    ret ok;
 }
 
 fun handle_obj(s: *session.Session, obj: *json.Value) res[str, A.Error] {

@@ -58,7 +58,7 @@ See `qa --help` and `agent/README.md`.
 | `src/` | the whole tool: spec compiler, edit engine, checkers, commit/journal, ndjson + MCP servers, editor ops |
 | `agent/skill/SKILL.md` | the agent contract — give this file to an agent and it can use Qark |
 | `agent/reference/ops.txt` | `qark --dump ops` — the operation reference |
-| `agent/eval/` | the PowerShell eval suite (151 deterministic checks) and model benches |
+| `agent/eval/` | the PowerShell eval suite (164 deterministic checks) and model benches |
 | `agent/README.md` | how to train/score an agent on Qark |
 | `docs/autocode-integration.md` | editor/orchestrator integration guide, fail-closed checker contract, and reference Node.js client |
 | `templates/`, `scripts/` | builtin templates, language checkers (`check.cjs`, `check.py`, `check.ps1`), MCP tool schema |

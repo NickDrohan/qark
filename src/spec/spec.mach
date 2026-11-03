@@ -126,6 +126,7 @@ pub rec Spec {
     warns:        vector.Vector[str];
     pcache:       tmpl.Cache;
     rebase:       bool;
+    best_effort:  bool;
     contract:     *json.Value;
 }
 
@@ -648,29 +649,112 @@ fun key_warns(sp: *Spec, obj: *json.Value, allowed: *str, n_allowed: usize, pref
 
 # warn about misspelled or unexpected top-level spec keys
 fun top_key_warns(sp: *Spec, args: *json.Value) {
-    val allowed: [55]str = [55]str{"files", "path", "glob", "text", "lines", "tmpl", "template", "json", "edits", "move", "delete", "mode", "expect", "check", "each", "with", "executable", "job", "dest", "dry_run", "prune", "durable", "diff", "tag", "run", "vars", "templates", "expand", "contract", "rebase", "base_text", "validate", "stream", "impact", "semantic", "preview", "symbol", "body", "signature", "rename", "find", "find_re", "replace", "insert_before", "insert_after", "auto_indent", "append", "prepend", "ex", "keys", "within", "occurrence", "all", "count", "root"};
-    key_warns(sp, args, ?allowed[0], 55, "spec", ?sp.warns);
+    val allowed: [62]str = [62]str{"files", "path", "glob", "text", "lines", "tmpl", "template", "json", "edits", "move", "delete", "mode", "expect", "check", "each", "with", "executable", "job", "dest", "dry_run", "prune", "durable", "diff", "tag", "run", "vars", "templates", "expand", "contract", "scope", "rebase", "base_text", "validate", "project_check", "require_expect", "idempotency_key", "best_effort", "expect_signature", "stream", "impact", "semantic", "preview", "symbol", "body", "signature", "rename", "find", "find_re", "replace", "insert_before", "insert_after", "auto_indent", "append", "prepend", "ex", "keys", "within", "occurrence", "all", "count", "root", "timeout_ms"};
+    key_warns(sp, args, ?allowed[0], 62, "spec", ?sp.warns);
 }
 
 # warn about misspelled or unexpected keys on a file entry and on each of its edits
 fun file_key_warns(sp: *Spec, fv: *json.Value, rel: str, out: *vector.Vector[str]) {
-    val fkeys: [37]str = [37]str{"path", "glob", "text", "lines", "tmpl", "template", "json", "edits", "move", "delete", "mode", "expect", "check", "each", "with", "executable", "contract", "rebase", "base_text", "symbol", "body", "signature", "rename", "find", "find_re", "replace", "insert_before", "insert_after", "auto_indent", "append", "prepend", "ex", "keys", "within", "occurrence", "all", "count"};
-    key_warns(sp, fv, ?fkeys[0], 37, rel, out);
+    val fkeys: [60]str = [60]str{"path", "glob", "text", "lines", "tmpl", "template", "json", "edits", "move", "delete", "mode", "expect", "check", "each", "with", "executable", "contract", "scope", "rebase", "base_text", "best_effort", "expect_signature", "symbol", "body", "signature", "rename", "find", "find_re", "replace", "insert_before", "insert_after", "auto_indent", "append", "prepend", "ex", "keys", "within", "occurrence", "all", "count", "dry_run", "diff", "preview", "stream", "validate", "project_check", "require_expect", "idempotency_key", "tag", "durable", "root", "timeout_ms", "vars", "templates", "job", "dest", "prune", "run", "expand", "semantic"};
+    key_warns(sp, fv, ?fkeys[0], 60, rel, out);
     val ef: opt[*json.Value] = json.value_find(fv, "edits");
     if (sel ef.some) {
-        val ekeys: [20]str = [20]str{"find", "find_re", "replace", "lines", "with", "insert_before", "insert_after", "append", "prepend", "ex", "keys", "occurrence", "all", "count", "within", "symbol", "auto_indent", "body", "signature", "rename"};
+        val ekeys: [21]str = [21]str{"find", "find_re", "replace", "lines", "with", "insert_before", "insert_after", "append", "prepend", "ex", "keys", "occurrence", "all", "count", "within", "symbol", "auto_indent", "body", "signature", "rename", "expect_signature"};
         if (json.value_is_array(ef.some)) {
             var i: usize = 0;
             for (i < json.value_count(ef.some)) {
                 val g: opt[*json.Value] = json.value_get(ef.some, i);
-                if (sel g.some) { key_warns(sp, g.some, ?ekeys[0], 20, rel, out); }
+                if (sel g.some) { key_warns(sp, g.some, ?ekeys[0], 21, rel, out); }
                 i = i + 1;
             }
         }
         or (json.value_is_object(ef.some)) {
-            key_warns(sp, ef.some, ?ekeys[0], 20, rel, out);
+            key_warns(sp, ef.some, ?ekeys[0], 21, rel, out);
         }
     }
+}
+
+fun check_contract_one(a: *A.Allocator, rel: str, old_p: *u8, old_n: usize, new_p: *u8, new_n: usize, deleting: bool, moved: bool, contract: *json.Value, fi: usize, e: *Err) bool {
+    if (contract == nil) { ret true; }
+    if (!json.value_is_object(contract)) {
+        ret fail(e, "contract_bad", "contract must be an object", at(a, fi, "contract"));
+    }
+    if ((deleting || moved) && fbool(contract, "forbid_delete") == 1) {
+        ret fail(e, "contract_violation", "contract forbids deleting or moving files", at(a, fi, "contract"));
+    }
+    var ce: edit.Err;
+    var op: *u8 = old_p;
+    if (op == nil) { op = ""; }
+    var np: *u8 = new_p;
+    if (np == nil) { np = ""; }
+    var check_op: *u8 = op;
+    var check_on: usize = old_n;
+    var check_np: *u8 = np;
+    var check_nn: usize = new_n;
+    if (deleting || moved) {
+        check_op = np;
+        check_on = new_n;
+        check_np = np;
+        check_nn = new_n;
+    }
+    if (!edit.verify_contract(a, rel, check_op, check_on, check_np, check_nn, contract, ?ce)) {
+        e.code = ce.code;
+        e.msg = ce.msg;
+        e.line = ce.line;
+        e.field = at(a, fi, "contract");
+        ret false;
+    }
+    ret true;
+}
+
+fun parse_file_check(a: *A.Allocator, fv: *json.Value, fi: usize, deleting: bool, io_lang: *str, out_policy: *u8, e: *Err) bool {
+    @out_policy = commit.CP_INHERIT;
+    var cname: *u8 = nil;
+    var cnn: usize = 0;
+    val cb: i64 = fbool(fv, "check");
+    if (cb == -1) {
+        if (fstr(a, fv, "check", ?cname, ?cnn) == 1) {
+            if (util.eq(cname, "none") || util.eq(cname, "off")) {
+                @io_lang = nil;
+                @out_policy = commit.CP_OFF;
+            }
+            or (util.eq(cname, "strict")) {
+                @out_policy = commit.CP_STRICT;
+            }
+            or (util.eq(cname, "required")) {
+                @out_policy = commit.CP_REQUIRED;
+            }
+            or (util.eq(cname, "permissive")) {
+                @out_policy = commit.CP_PERMISSIVE;
+            }
+            or {
+                val canon_name: str = checker_name(cname);
+                if (canon_name == nil) {
+                    ret fail(e, "spec_check", "check must be true, false, strict, required, permissive, off, none, python, node, powershell, bash, json, or toml", at(a, fi, "check"));
+                }
+                @io_lang = canon_name;
+                @out_policy = commit.CP_REQUIRED;
+            }
+        }
+        or { ret fail(e, "spec_type", "check must be a boolean, policy, or checker name", at(a, fi, "check")); }
+    }
+    or {
+        val present: opt[*json.Value] = json.value_find(fv, "check");
+        if (sel present.some) {
+            if (cb == 0) {
+                @io_lang = nil;
+                @out_policy = commit.CP_OFF;
+            }
+            or {
+                @out_policy = commit.CP_STRICT;
+            }
+        }
+    }
+    if (deleting) {
+        @io_lang = nil;
+        @out_policy = commit.CP_OFF;
+    }
+    ret true;
 }
 
 fun find_undo_version(a: *A.Allocator, root: str, rel: str, target_sha: str, out_p: **u8, out_n: *usize) bool {
@@ -857,6 +941,11 @@ fun compile_one(sp: *Spec, fv: *json.Value, fi: usize, item: *json.Value, k: i64
         }
     }
     or (edits_val != nil) {
+        val anc: str = commit.check_ancestry(a, sp.root, rel.ok);
+        if (anc != nil) {
+            if (util.eq(anc, "oom")) { ret fail(e, "oom", "out of memory", at(a, fi, "path")); }
+            ret fail(e, anc, "a directory or file in the path is a symbolic link or non-directory", at(a, fi, "path"));
+        }
         val full: res[str, A.Error] = pathx.native(a, sp.root, rel.ok);
         if (sel full.err) { ret fail(e, "oom", "out of memory", at(a, fi, "edits")); }
         val cur: res[vector.Vector[u8], filesystem.FsError] = filesystem.read_bytes(a, full.ok);
@@ -868,53 +957,61 @@ fun compile_one(sp: *Spec, fv: *json.Value, fi: usize, item: *json.Value, k: i64
         commit.hash_hex(cp, cn, ?edit_hash[0]);
         var given_expect: *u8 = nil;
         var gn: usize = 0;
+        val has_exp: bool = fstr(a, fv, "expect", ?given_expect, ?gn) == 1;
         val do_rebase: bool = sp.rebase || fbool(fv, "rebase") == 1;
+        var base_p: *u8 = nil;
+        var base_n: usize = 0;
+        val has_base_text: bool = fstr(a, fv, "base_text", ?base_p, ?base_n) == 1;
+        if (has_base_text && has_exp) {
+            var b_sha: [65]u8;
+            var bsrc_chk: *u8 = base_p;
+            if (bsrc_chk == nil) { bsrc_chk = ""; }
+            commit.hash_hex(bsrc_chk, base_n, ?b_sha[0]);
+            if (!util.eq(?b_sha[0], given_expect)) {
+                ret fail(e, "rebase_base_mismatch", "base_text sha256 does not match expect", at(a, fi, "base_text"));
+            }
+        }
         var rebased_edits: bool = false;
-        if (fstr(a, fv, "expect", ?given_expect, ?gn) == 1 && !util.eq(given_expect, ?edit_hash[0])) {
+        if (has_exp && !util.eq(given_expect, ?edit_hash[0])) {
             if (!do_rebase) {
                 e.code = "stale";
                 e.msg = cat3(a, "the file changed since expect was read; its sha256 is now ", ?edit_hash[0], "");
                 e.field = at(a, fi, "expect");
                 ret false;
             }
-            var base_p: *u8 = nil;
-            var base_n: usize = 0;
-            var have_base: bool = false;
-            if (fstr(a, fv, "base_text", ?base_p, ?base_n) == 1) { have_base = true; }
-            or { have_base = find_undo_version(a, sp.root, rel.ok, given_expect, ?base_p, ?base_n); }
-            if (have_base) {
-                var ee0: edit.Err;
-                var prop_p: *u8 = nil;
-                var prop_n: usize = 0;
-                var bsrc: *u8 = base_p;
-                if (bsrc == nil) { bsrc = ""; }
-                if (!edit.apply(a, rel.ok, bsrc, base_n, edits_val, ?prop_p, ?prop_n, ?ee0, ?normed, ?mixed)) {
-                    e.code = ee0.code;
-                    e.msg = ee0.msg;
-                    e.line = ee0.line;
-                    e.col = ee0.col;
-                    e.cat = ee0.cat;
-                    e.scope_lo = ee0.scope_lo;
-                    e.scope_hi = ee0.scope_hi;
-                    e.actual = ee0.actual;
-                    e.field = at(a, fi, "edits");
-                    ret false;
-                }
-                var csrc: *u8 = cp;
-                if (csrc == nil) { csrc = ""; }
-                var conf_l: i64 = 0;
-                if (!diff.merge3(a, bsrc, base_n, csrc, cn, prop_p, prop_n, ?data, ?dn, ?conf_l)) {
-                    e.code = "rebase_conflict";
-                    e.msg = "three-way rebase conflict: edits overlap with concurrent changes on disk";
-                    e.line = conf_l;
-                    e.field = at(a, fi, "edits");
-                    ret false;
-                }
-                rebased_edits = true;
+            var have_base: bool = has_base_text;
+            if (!have_base) { have_base = find_undo_version(a, sp.root, rel.ok, given_expect, ?base_p, ?base_n); }
+            if (!have_base) {
+                ret fail(e, "base_unavailable", "cannot rebase: base version for expect sha256 is not in undo history and base_text was not provided", at(a, fi, "rebase"));
             }
-            or {
-                rebased_edits = false;
+            var ee0: edit.Err;
+            var prop_p: *u8 = nil;
+            var prop_n: usize = 0;
+            var bsrc: *u8 = base_p;
+            if (bsrc == nil) { bsrc = ""; }
+            if (!edit.apply(a, rel.ok, bsrc, base_n, edits_val, ?prop_p, ?prop_n, ?ee0, ?normed, ?mixed)) {
+                e.code = ee0.code;
+                e.msg = ee0.msg;
+                e.line = ee0.line;
+                e.col = ee0.col;
+                e.cat = ee0.cat;
+                e.scope_lo = ee0.scope_lo;
+                e.scope_hi = ee0.scope_hi;
+                e.actual = ee0.actual;
+                e.field = at(a, fi, "edits");
+                ret false;
             }
+            var csrc: *u8 = cp;
+            if (csrc == nil) { csrc = ""; }
+            var conf_l: i64 = 0;
+            if (!diff.merge3(a, bsrc, base_n, csrc, cn, prop_p, prop_n, ?data, ?dn, ?conf_l)) {
+                e.code = "rebase_conflict";
+                e.msg = "three-way rebase conflict: edits overlap with concurrent changes on disk";
+                e.line = conf_l;
+                e.field = at(a, fi, "edits");
+                ret false;
+            }
+            rebased_edits = true;
         }
         if (!rebased_edits) {
             var ee: edit.Err;
@@ -938,9 +1035,6 @@ fun compile_one(sp: *Spec, fv: *json.Value, fi: usize, item: *json.Value, k: i64
                 jw.raw(?w, "]");
                 e.field = w.buf;
                 ret false;
-            }
-            if (given_expect != nil && !util.eq(given_expect, ?edit_hash[0]) && do_rebase) {
-                rebased_edits = true;
             }
         }
         mode = commit.MODE_REPLACE;
@@ -1021,6 +1115,11 @@ fun compile_one(sp: *Spec, fv: *json.Value, fi: usize, item: *json.Value, k: i64
             ret fail(e, "duplicate_path", "the move source is also written by this spec", at(a, fi, "move"));
         }
         vector.push[str](?sp.folded, mfolded.ok);
+        val manc: str = commit.check_ancestry(a, sp.root, mrel.ok);
+        if (manc != nil) {
+            if (util.eq(manc, "oom")) { ret fail(e, "oom", "out of memory", at(a, fi, "move")); }
+            ret fail(e, manc, "a directory or file in the move source path is a symbolic link or non-directory", at(a, fi, "move"));
+        }
         val mfull: res[str, A.Error] = pathx.native(a, sp.root, mrel.ok);
         if (sel mfull.err) { ret fail(e, "oom", "out of memory", at(a, fi, "move")); }
         val cur: res[vector.Vector[u8], filesystem.FsError] = filesystem.read_bytes(a, mfull.ok);
@@ -1065,6 +1164,20 @@ fun compile_one(sp: *Spec, fv: *json.Value, fi: usize, item: *json.Value, k: i64
     val xs: i64 = fstr(a, fv, "expect", ?xp, ?xn);
     if (xs == -1) { ret fail(e, "spec_type", "expect must be a sha256 hex string", at(a, fi, "expect")); }
 
+    # Validate base_text against expect even when not rebasing
+    var bt_p: *u8 = nil;
+    var bt_n: usize = 0;
+    val has_bt: bool = fstr(a, fv, "base_text", ?bt_p, ?bt_n) == 1;
+    if (has_bt && xs == 1) {
+        var bt_sha: [65]u8;
+        var btsrc: *u8 = bt_p;
+        if (btsrc == nil) { btsrc = ""; }
+        commit.hash_hex(btsrc, bt_n, ?bt_sha[0]);
+        if (!util.eq(?bt_sha[0], xp)) {
+            ret fail(e, "rebase_base_mismatch", "base_text sha256 does not match expect", at(a, fi, "base_text"));
+        }
+    }
+
     # Three-way proposal rebasing for full-file replace/upsert when expect is stale and rebase is true
     var file_rebased: bool = false;
     val want_rebase: bool = sp.rebase || fbool(fv, "rebase") == 1;
@@ -1072,6 +1185,8 @@ fun compile_one(sp: *Spec, fv: *json.Value, fi: usize, item: *json.Value, k: i64
         file_rebased = true;
     }
     if (!edited && !moved && !deleting && xs == 1 && want_rebase) {
+        val ranc: str = commit.check_ancestry(a, sp.root, rel.ok);
+        if (ranc != nil) { ret fail(e, ranc, "a directory or file in the path is a symbolic link or non-directory", at(a, fi, "path")); }
         val rfull: res[str, A.Error] = pathx.native(a, sp.root, rel.ok);
         if (sel rfull.ok) {
             val rcur: res[vector.Vector[u8], filesystem.FsError] = filesystem.read_bytes(a, rfull.ok);
@@ -1079,68 +1194,68 @@ fun compile_one(sp: *Spec, fv: *json.Value, fi: usize, item: *json.Value, k: i64
                 var disk_sha: [65]u8;
                 commit.hash_hex(rcur.ok.data, rcur.ok.len, ?disk_sha[0]);
                 if (!util.eq(xp, ?disk_sha[0])) {
-                    var base_p: *u8 = nil;
-                    var base_n: usize = 0;
-                    var have_base: bool = false;
-                    if (fstr(a, fv, "base_text", ?base_p, ?base_n) == 1) { have_base = true; }
-                    or { have_base = find_undo_version(a, sp.root, rel.ok, xp, ?base_p, ?base_n); }
-                    if (have_base) {
-                        var bsrc: *u8 = base_p;
-                        if (bsrc == nil) { bsrc = ""; }
-                        var csrc: *u8 = rcur.ok.data;
-                        if (csrc == nil) { csrc = ""; }
-                        var conf_l: i64 = 0;
-                        var m_p: *u8 = nil;
-                        var m_n: usize = 0;
-                        if (!diff.merge3(a, bsrc, base_n, csrc, rcur.ok.len, data, dn, ?m_p, ?m_n, ?conf_l)) {
-                            e.code = "rebase_conflict";
-                            e.msg = "three-way rebase conflict: proposal overlaps with concurrent changes on disk";
-                            e.line = conf_l;
-                            e.field = at(a, fi, "rebase");
-                            ret false;
-                        }
-                        data = m_p;
-                        dn = m_n;
-                        var ci: usize = 0;
-                        for (ci < 65) {
-                            edit_hash[ci] = disk_sha[ci];
-                            ci = ci + 1;
-                        }
-                        file_rebased = true;
+                    var base_p: *u8 = bt_p;
+                    var base_n: usize = bt_n;
+                    var have_base: bool = has_bt;
+                    if (!have_base) { have_base = find_undo_version(a, sp.root, rel.ok, xp, ?base_p, ?base_n); }
+                    if (!have_base) {
+                        ret fail(e, "base_unavailable", "cannot rebase: base version for expect sha256 is not in undo history and base_text was not provided", at(a, fi, "rebase"));
                     }
+                    var bsrc: *u8 = base_p;
+                    if (bsrc == nil) { bsrc = ""; }
+                    var csrc: *u8 = rcur.ok.data;
+                    if (csrc == nil) { csrc = ""; }
+                    var conf_l: i64 = 0;
+                    var m_p: *u8 = nil;
+                    var m_n: usize = 0;
+                    if (!diff.merge3(a, bsrc, base_n, csrc, rcur.ok.len, data, dn, ?m_p, ?m_n, ?conf_l)) {
+                        e.code = "rebase_conflict";
+                        e.msg = "three-way rebase conflict: proposal overlaps with concurrent changes on disk";
+                        e.line = conf_l;
+                        e.field = at(a, fi, "rebase");
+                        ret false;
+                    }
+                    data = m_p;
+                    dn = m_n;
+                    var ci: usize = 0;
+                    for (ci < 65) {
+                        edit_hash[ci] = disk_sha[ci];
+                        ci = ci + 1;
+                    }
+                    file_rebased = true;
                 }
             }
         }
     }
 
-    # Enforce method/symbol/line scope contracts if present on spec or file entry
-    var contract: *json.Value = sp.contract;
+    # Enforce method/symbol/line scope contracts if present on spec or file entry (intersecting both)
+    var file_c: *json.Value = nil;
     val fc_f: opt[*json.Value] = json.value_find(fv, "contract");
-    if (sel fc_f.some) { contract = fc_f.some; }
-    if (contract != nil) {
-        if (!json.value_is_object(contract)) {
-            ret fail(e, "contract_bad", "contract must be an object", at(a, fi, "contract"));
-        }
-        if (deleting && fbool(contract, "forbid_delete") == 1) {
-            ret fail(e, "contract_violation", "contract forbids deleting files", at(a, fi, "delete"));
-        }
+    if (sel fc_f.some) { file_c = fc_f.some; }
+    or {
+        val sc_f: opt[*json.Value] = json.value_find(fv, "scope");
+        if (sel sc_f.some) { file_c = sc_f.some; }
+    }
+    if (sp.contract != nil || file_c != nil) {
+        var old_cp: *u8 = "";
+        var old_cn: usize = 0;
         if (!deleting && !moved) {
+            val canc: str = commit.check_ancestry(a, sp.root, rel.ok);
+            if (canc != nil) { ret fail(e, canc, "a directory or file in the path is a symbolic link or non-directory", at(a, fi, "path")); }
             val cfull: res[str, A.Error] = pathx.native(a, sp.root, rel.ok);
             if (sel cfull.ok) {
                 val ccur: res[vector.Vector[u8], filesystem.FsError] = filesystem.read_bytes(a, cfull.ok);
                 if (sel ccur.ok) {
-                    var ce: edit.Err;
-                    var op: *u8 = ccur.ok.data;
-                    if (op == nil) { op = ""; }
-                    if (!edit.verify_contract(a, rel.ok, op, ccur.ok.len, data, dn, contract, ?ce)) {
-                        e.code = ce.code;
-                        e.msg = ce.msg;
-                        e.line = ce.line;
-                        e.field = at(a, fi, "contract");
-                        ret false;
-                    }
+                    if (ccur.ok.data != nil) { old_cp = ccur.ok.data; }
+                    old_cn = ccur.ok.len;
                 }
             }
+        }
+        if (sp.contract != nil) {
+            if (!check_contract_one(a, rel.ok, old_cp, old_cn, data, dn, deleting, moved, sp.contract, fi, e)) { ret false; }
+        }
+        if (file_c != nil) {
+            if (!check_contract_one(a, rel.ok, old_cp, old_cn, data, dn, deleting, moved, file_c, fi, e)) { ret false; }
         }
     }
 
@@ -1169,32 +1284,10 @@ fun compile_one(sp: *Spec, fv: *json.Value, fi: usize, item: *json.Value, k: i64
         commit.note(ent, "three-way rebased onto current file from base expect sha256");
     }
 
-    var cname: *u8 = nil;
-    var cnn: usize = 0;
-    val cb: i64 = fbool(fv, "check");
-    if (cb == -1) {
-        if (fstr(a, fv, "check", ?cname, ?cnn) == 1) {
-            if (util.eq(cname, "none") || util.eq(cname, "off")) {
-                lang = nil;
-            }
-            or (!util.eq(cname, "strict") && !util.eq(cname, "required") && !util.eq(cname, "permissive")) {
-                val canon_name: str = checker_name(cname);
-                if (canon_name == nil) {
-                    ret fail(e, "spec_check", "check must be true, false, strict, required, permissive, none, python, node, powershell, bash, json, or toml", at(a, fi, "check"));
-                }
-                lang = canon_name;
-            }
-        }
-        or { ret fail(e, "spec_type", "check must be a boolean, policy, or checker name", at(a, fi, "check")); }
-    }
-    or {
-        val present: opt[*json.Value] = json.value_find(fv, "check");
-        if (sel present.some) {
-            if (cb == 0) { lang = nil; }
-        }
-    }
-    if (deleting) { lang = nil; }
+    var f_policy: u8 = commit.CP_INHERIT;
+    if (!parse_file_check(a, fv, fi, deleting, ?lang, ?f_policy, e)) { ret false; }
     ent.lang = lang;
+    ent.check_policy = f_policy;
     ent.exec = fbool(fv, "executable") == 1 || (dn >= 2 && data[0] == '#' && data[1] == '!');
     ent.edited = edited;
     if (normed) { commit.note(ent, "line endings normalized to match the file's; the find text applied as given"); }
@@ -1215,6 +1308,15 @@ fun same_bytes(a: *u8, b: *u8, n: usize) bool {
 
 fun compile_glob(sp: *Spec, fv: *json.Value, fi: usize, glob_pat: str, e: *Err) bool {
     val a: *A.Allocator = sp.a;
+    val bad_keys: [7]str = [7]str{"expect", "rebase", "base_text", "move", "delete", "path", "each"};
+    var bki: usize = 0;
+    for (bki < 7) {
+        val bf: opt[*json.Value] = json.value_find(fv, bad_keys[bki]);
+        if (sel bf.some) {
+            ret fail(e, "spec_glob_unsupported", "glob entries do not support expect, rebase, base_text, move, delete, path, or each", at(a, fi, bad_keys[bki]));
+        }
+        bki = bki + 1;
+    }
     var edits_v: *json.Value = nil;
     val edits_f: opt[*json.Value] = json.value_find(fv, "edits");
     if (sel edits_f.some) { edits_v = edits_f.some; }
@@ -1225,9 +1327,27 @@ fun compile_glob(sp: *Spec, fv: *json.Value, fi: usize, glob_pat: str, e: *Err) 
     if (count_sources(fv) != 1) {
         ret fail(e, "spec_content", "a glob entry takes only edits as its source", at(a, fi, "glob"));
     }
+    var file_c: *json.Value = nil;
+    val fc_f: opt[*json.Value] = json.value_find(fv, "contract");
+    if (sel fc_f.some) { file_c = fc_f.some; }
+    or {
+        val sc_f: opt[*json.Value] = json.value_find(fv, "scope");
+        if (sel sc_f.some) { file_c = sc_f.some; }
+    }
+    val best_effort: bool = sp.best_effort || fbool(fv, "best_effort") == 1;
     val gpat: str = pathx.strip_root(sp.root, glob_pat);
     var paths: vector.Vector[str] = vector.init[str](a);
-    scan.glob_files(a, sp.root, gpat, ?paths);
+    var walk_trunc: bool = false;
+    var walk_errs: i64 = 0;
+    scan.glob_files_ext(a, sp.root, gpat, 16384, ?paths, ?walk_trunc, ?walk_errs);
+    if (!best_effort) {
+        if (walk_trunc) {
+            ret fail(e, "glob_truncated", "glob walk exceeded file limit; narrow the glob pattern or set best_effort: true", at(a, fi, "glob"));
+        }
+        if (walk_errs > 0) {
+            ret fail(e, "glob_io_error", "glob walk encountered unreadable directories; fix permissions or set best_effort: true", at(a, fi, "glob"));
+        }
+    }
     if (paths.len == 0) {
         ret fail(e, "edit_not_found", "no workspace files matched glob", at(a, fi, "glob"));
     }
@@ -1235,9 +1355,26 @@ fun compile_glob(sp: *Spec, fv: *json.Value, fi: usize, glob_pat: str, e: *Err) 
     var pi: usize = 0;
     for (pi < paths.len) {
         val cand_rel: str = paths.data[pi];
+        val canc: str = commit.check_ancestry(a, sp.root, cand_rel);
+        if (canc != nil) {
+            if (!best_effort) {
+                e.path = cand_rel;
+                ret fail(e, canc, "a directory or file in the glob match is a symbolic link or non-directory", at(a, fi, "glob"));
+            }
+            pi = pi + 1;
+            cnt;
+        }
         val full: res[str, A.Error] = pathx.native(a, sp.root, cand_rel);
         if (sel full.err) { ret fail(e, "oom", "out of memory", at(a, fi, "glob")); }
         val cur: res[vector.Vector[u8], filesystem.FsError] = filesystem.read_bytes(a, full.ok);
+        if (sel cur.err) {
+            if (!best_effort) {
+                e.path = cand_rel;
+                ret fail(e, "edit_missing", "a file matched by glob could not be read", at(a, fi, "glob"));
+            }
+            pi = pi + 1;
+            cnt;
+        }
         if (sel cur.ok) {
             val cp: *u8 = cur.ok.data;
             val cn: usize = cur.ok.len;
@@ -1250,6 +1387,18 @@ fun compile_glob(sp: *Spec, fv: *json.Value, fi: usize, glob_pat: str, e: *Err) 
             var mixed: bool = false;
             if (edit.apply(a, cand_rel, src, cn, edits_v, ?data, ?dn, ?ee, ?normed, ?mixed)) {
                 if (dn != cn || !same_bytes(src, data, dn)) {
+                    if (sp.contract != nil) {
+                        if (!check_contract_one(a, cand_rel, src, cn, data, dn, false, false, sp.contract, fi, e)) {
+                            e.path = cand_rel;
+                            ret false;
+                        }
+                    }
+                    if (file_c != nil) {
+                        if (!check_contract_one(a, cand_rel, src, cn, data, dn, false, false, file_c, fi, e)) {
+                            e.path = cand_rel;
+                            ret false;
+                        }
+                    }
                     val folded: res[str, A.Error] = pathx.folded(a, cand_rel);
                     if (sel folded.err) { ret fail(e, "oom", "out of memory", at(a, fi, "glob")); }
                     if (seen_path(sp, folded.ok)) {
@@ -1264,17 +1413,20 @@ fun compile_glob(sp: *Spec, fv: *json.Value, fi: usize, glob_pat: str, e: *Err) 
                     sp.total = sp.total + dn;
                     if (sp.total > MAX_TOTAL_BYTES) { ret fail(e, "too_large", "the change set is larger than 64 MiB", at(a, fi, "glob")); }
                     if (commit.count(?sp.set) >= MAX_FILES) { ret fail(e, "too_many_files", "a change set holds at most 1024 files", at(a, fi, "glob")); }
+                    var glang: str = lang_of(cand_rel);
+                    var g_policy: u8 = commit.CP_INHERIT;
+                    if (!parse_file_check(a, fv, fi, false, ?glang, ?g_policy, e)) {
+                        e.path = cand_rel;
+                        ret false;
+                    }
                     val added: res[usize, A.Error] = commit.add(?sp.set, cand_rel, data, dn, commit.MODE_REPLACE);
                     if (sel added.err) { ret fail(e, "oom", "out of memory", at(a, fi, "glob")); }
                     val ent: *commit.Entry = commit.entry(?sp.set, added.ok);
                     var edit_hash: [65]u8;
                     commit.hash_hex(cp, cn, ?edit_hash[0]);
                     commit.set_expect(ent, ?edit_hash[0]);
-                    ent.lang = lang_of(cand_rel);
-                    val chk_f: opt[*json.Value] = json.value_find(fv, "check");
-                    if (sel chk_f.some) {
-                        if (fbool(fv, "check") == 0) { ent.lang = nil; }
-                    }
+                    ent.lang = glang;
+                    ent.check_policy = g_policy;
                     ent.edited = true;
                     if (normed) { commit.note(ent, "line endings normalized to match the file's; the find text applied as given"); }
                     if (mixed) { commit.note(ent, "the file has mixed line endings; find text matched byte-exact with no normalization"); }
@@ -1283,7 +1435,7 @@ fun compile_glob(sp: *Spec, fv: *json.Value, fi: usize, glob_pat: str, e: *Err) 
                     matched_files = matched_files + 1;
                 }
             }
-            or (!util.eq(ee.code, "edit_not_found")) {
+            or (!util.eq(ee.code, "edit_not_found") || (ee.index > 0 && !best_effort)) {
                 e.path = cand_rel;
                 e.code = ee.code;
                 e.msg = ee.msg;
@@ -1510,6 +1662,10 @@ fun prune_old(sp: *Spec, e: *Err) bool {
                                     if (sel ex.ok) { present = ex.ok; }
                                 }
                                 if (present) {
+                                    if (sp.contract != nil && fbool(sp.contract, "forbid_delete") == 1) {
+                                        e.path = old_rel.ok;
+                                        ret fail(e, "contract_violation", "contract forbids deleting pruned job files", "prune");
+                                    }
                                     val added: res[usize, A.Error] = commit.add(?sp.set, old_rel.ok, nil, 0, commit.MODE_DELETE);
                                     if (sel added.ok) {
                                         if (fstr(a, g.some, "sha256", ?hp, ?hn) == 1) { commit.set_expect(commit.entry(?sp.set, added.ok), hp); }
@@ -1633,8 +1789,10 @@ pub fun compile(sp: *Spec, a: *A.Allocator, root: str, args: *json.Value, raw: *
     if (difff == -1) { ret fail(e, "spec_type", "diff must be a boolean", "diff"); }
     sp.diff = difff == 1;
     sp.rebase = fbool(args, "rebase") == 1;
+    sp.best_effort = fbool(args, "best_effort") == 1;
     sp.contract = nil;
-    val top_c: opt[*json.Value] = json.value_find(args, "contract");
+    var top_c: opt[*json.Value] = json.value_find(args, "contract");
+    if (!sel top_c.some) { top_c = json.value_find(args, "scope"); }
     if (sel top_c.some) {
         if (!json.value_is_object(top_c.some)) { ret fail(e, "contract_bad", "contract must be an object", "contract"); }
         sp.contract = top_c.some;
@@ -1652,7 +1810,8 @@ pub fun compile(sp: *Spec, a: *A.Allocator, root: str, args: *json.Value, raw: *
             if (cs == 1 && util.eq(cp, "required")) { sp.check = CHECK_REQUIRED; }
             or (cs == 1 && util.eq(cp, "strict")) { sp.check = CHECK_ON; }
             or (cs == 1 && util.eq(cp, "permissive")) { sp.check = CHECK_PERMISSIVE; }
-            or { ret fail(e, "spec_type", "check must be true, false, \"strict\", \"required\", or \"permissive\"", "check"); }
+            or (cs == 1 && (util.eq(cp, "off") || util.eq(cp, "none"))) { sp.check = CHECK_OFF; }
+            or { ret fail(e, "spec_type", "check must be true, false, \"strict\", \"required\", \"permissive\", or \"off\"", "check"); }
         }
     }
     var tp: *u8 = nil;

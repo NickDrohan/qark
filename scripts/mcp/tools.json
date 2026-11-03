@@ -2,7 +2,12 @@
   {
     "name": "qark_apply",
     "title": "Write or edit files atomically",
-    "description": "Create, replace, edit, move, or delete one or many files under the workspace root in one atomic change set. Every file is rendered, contract-checked, and syntax-checked (Python, Node, PowerShell, Bash, JSON, TOML, plus staged project checks) before anything is written; a conflict, contract violation, or failed check writes nothing. Accepts either a multi-file files:[...] array OR top-level single-file shorthand (path + text|lines|tmpl|template|json|edits|move|delete, or flat edit fields). Relative paths and full paths inside the workspace root both work. Returns a receipt with each file's sha256, status, and AST semantic change preview (added/modified/removed symbols).",
+    "description": "Create, replace, edit, move, or delete one or many files under the workspace root in one checked change set with write-ahead crash recovery. Every file is rendered, contract-checked, and syntax-checked (Python, Node, PowerShell, Bash, JSON, TOML, plus isolated staged project checks) before anything is published; a conflict, contract violation, or failed check writes nothing. Accepts either a multi-file files:[...] array OR top-level single-file shorthand (path + text|lines|tmpl|template|json|edits|move|delete, or flat edit fields). Relative paths and full paths inside the workspace root both work. Returns a receipt with each file's sha256, status, and semantic change preview (added/modified/removed symbols).",
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "idempotentHint": false
+    },
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -70,10 +75,16 @@
         "dry_run": { "type": "boolean", "description": "Render, check, and compute semantic diff, report what would happen, write nothing." },
         "preview": { "type": "boolean", "description": "Include each file's rendered text in the receipt." },
         "diff": { "type": "boolean", "description": "Include a unified diff of each changed file in the receipt." },
-        "check": { "description": "true/\"strict\" (default: fail closed on syntax error or checker crash), \"required\" (also reject skipped/missing runtimes), \"permissive\" (allow checker crashes as skipped with validation_complete: false), or false/\"off\"." },
-        "contract": { "type": "object", "description": "Enforced scope contract across all files: {symbol?, symbols?, methods?, lines?, preserve_signatures?, max_lines_changed?, forbid_delete?}." },
+        "check": { "description": "true/\"strict\" (default: fail closed on syntax error or checker crash), \"required\" (also reject skipped/missing runtimes or unchecked files), \"permissive\" (allow checker crashes as skipped with validation_complete: false), or false/\"off\"." },
+        "contract": { "type": "object", "description": "Enforced scope contract across all files: {symbol?, symbols?, methods?, lines?, preserve_signatures?, max_lines_changed?, max_changed_lines?, forbid_delete?}." },
+        "scope": { "type": "object", "description": "Alias for contract: enforced scope contract across all files." },
         "rebase": { "type": "boolean", "description": "Enable 3-way proposal rebasing when expect hashes are stale against non-overlapping concurrent edits." },
-        "validate": { "description": "Project validation command (array of argv strings or {cmd: [...]}) staged and executed before commit; non-zero exit rolls back." },
+        "require_expect": { "type": "boolean", "description": "Require an explicit expect sha256 on every existing file modification or deletion." },
+        "idempotency_key": { "type": "string", "description": "Client-supplied request idempotency key; replays the committed receipt if the identical spec is retried, or rejects mismatched specs." },
+        "validate": { "description": "Project validation command (array of argv strings or {cmd: [...], timeout_ms?: 30000}) staged in an isolated tree and executed before commit; non-zero exit blocks publication." },
+        "project_check": { "description": "Alias for validate: project validation command staged and executed before commit." },
+        "timeout_ms": { "type": "integer", "description": "Checker and validation timeout in milliseconds (default 20000)." },
+        "best_effort": { "type": "boolean", "description": "For glob edits: allow partial matches when some matched files do not contain the edit target." },
         "stream": { "type": "boolean", "description": "Include per-phase transaction timing and status events in receipt.events." },
         "expand": { "type": "string", "description": "Shorthand @template pipe-table blocks." },
         "tag": { "type": "string", "description": "Tag recorded in .qark/journal.ndjson and .qark/undo." },
@@ -83,17 +94,23 @@
   },
   {
     "name": "qark_edit",
-    "title": "Surgical AST symbol or text edit",
-    "description": "Edit an existing file (or glob of files) atomically using flat top-level parameters—no nested files/edits wrapper required. Supports AST-aware symbol edits (pass symbol + body, signature, rename, or with), exact find/replace, regex find_re/replace (with \\0-\\9 captures), line-range replacement (lines:[first,last] + with), and anchored insertions (insert_before/insert_after + with, auto_indent). Enforces optional scope contracts, 3-way rebasing on stale expect hashes, syntax checking, and returns a receipt with sha256 and semantic symbol diff.",
+    "title": "Surgical symbol or text edit",
+    "description": "Edit an existing file (or glob of files) atomically using flat top-level parameters—no nested files/edits wrapper required. Supports symbol edits (pass symbol + body, signature, rename, or with), exact find/replace, regex find_re/replace (with \\0-\\9 captures), line-range replacement (lines:[first,last] + with), and anchored insertions (insert_before/insert_after + with, auto_indent). Enforces optional scope contracts, 3-way rebasing on stale expect hashes, syntax checking, and returns a receipt with sha256 and semantic symbol diff.",
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "idempotentHint": false
+    },
     "inputSchema": {
       "type": "object",
       "properties": {
         "path": { "type": "string", "description": "File path to edit (relative to workspace root, or full path inside root)." },
         "glob": { "type": "string", "description": "Apply this edit across all matching workspace files (e.g. src/**/*.py) in one atomic commit." },
-        "symbol": { "type": "string", "description": "AST symbol name (e.g. 'compute' or 'Service.run'). Combine with body, signature, rename, or with—or combine with find/find_re to scope the search to this symbol." },
+        "symbol": { "type": "string", "description": "Symbol name (e.g. 'compute', 'Service.run', or 'function:compute'). Combine with body, signature, rename, or with—or combine with find/find_re to scope the search to this symbol." },
         "body": { "description": "Replace only the named symbol's body (string or array of line strings), automatically preserving its declaration signature, indentation, and closing brace." },
-        "signature": { "type": "string", "description": "Replace only the named symbol's declaration/signature line(s) while keeping its body intact." },
-        "rename": { "type": "string", "description": "Rename the symbol declaration and all word-bounded identifier occurrences in scope." },
+        "signature": { "type": "string", "description": "Replace only the named symbol's declaration/signature header while keeping its body intact." },
+        "expect_signature": { "type": "string", "description": "Precondition: expected current declaration signature of the target symbol before editing." },
+        "rename": { "type": "string", "description": "Rename the symbol declaration and all code-token identifier occurrences in scope (ignoring strings and comments)." },
         "with": { "description": "Replacement text (string or array of line strings) when replacing a full symbol, a [first,last] line range, or inserting with insert_before/insert_after." },
         "find": { "type": "string", "description": "Exact text to find in the file (or within the scoped symbol/range)." },
         "find_re": { "type": "string", "description": "Qark regex (. [] () | * + ? {} ^ $ \\< \\> \\d \\w \\s) to find; replacement may use \\0-\\9 captures." },
@@ -115,12 +132,21 @@
         },
         "contract": {
           "type": "object",
-          "description": "Enforced scope contract: {symbol?: string, symbols?: string[], methods?: string[], lines?: [first, last], preserve_signatures?: boolean, max_lines_changed?: integer, forbid_delete?: boolean}."
+          "description": "Enforced scope contract: {symbol?: string, symbols?: string[], methods?: string[], lines?: [first, last], preserve_signatures?: boolean, max_lines_changed?: integer, max_changed_lines?: integer, forbid_delete?: boolean}."
+        },
+        "scope": {
+          "type": "object",
+          "description": "Alias for contract: enforced scope contract."
         },
         "expect": { "type": "string", "description": "Expected sha256 of the file before editing." },
+        "require_expect": { "type": "boolean", "description": "Require an explicit expect sha256 on every existing file modification." },
+        "idempotency_key": { "type": "string", "description": "Client-supplied request idempotency key." },
         "rebase": { "type": "boolean", "description": "If true and expect is stale, 3-way merge the edit onto the current file using .qark/undo history or base_text." },
-        "base_text": { "type": "string", "description": "Optional explicit base text when rebase is true." },
-        "validate": { "description": "Project validation command (array of argv strings or {cmd: [...]}) to run before committing." },
+        "base_text": { "type": "string", "description": "Optional explicit base text when rebase is true (must match expect sha256)." },
+        "validate": { "description": "Project validation command (array of argv strings or {cmd: [...], timeout_ms?: 30000}) staged in an isolated tree before committing." },
+        "project_check": { "description": "Alias for validate: project validation command staged before committing." },
+        "timeout_ms": { "type": "integer", "description": "Checker and validation timeout in milliseconds (default 20000)." },
+        "best_effort": { "type": "boolean", "description": "For glob edits: allow partial matches when some matched files do not contain the edit target." },
         "diff": { "type": "boolean", "description": "Include unified diff in the receipt." },
         "dry_run": { "type": "boolean", "description": "Preview the edit, syntax check, and semantic diff without writing to disk." },
         "check": { "description": "true/\"strict\" (default: fail closed on syntax error or checker crash), \"required\", \"permissive\", false, or a checker name." },
@@ -132,7 +158,12 @@
   {
     "name": "qark_read",
     "title": "Read files, symbols, outlines, or folded views",
-    "description": "Read files under the workspace root with their sha256, byte count, and line count. A directory path lists its entries (\".\" is the root). Pass symbol or symbols to read only specific functions/classes/methods by AST span, outline: true to list all symbols in a file without reading its body, or fold: true to get a compact signature-folded view of the file (with optional symbols expanded).",
+    "description": "Read files under the workspace root with their sha256, byte count, and line count. A directory path lists its entries (\".\" is the root). Pass symbol or symbols to read only specific functions/classes/methods by span, outline: true to list all symbols in a file without reading its body, or fold: true to get a compact signature-folded view of the file (with optional symbols expanded).",
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true
+    },
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -152,7 +183,12 @@
   {
     "name": "qark_search",
     "title": "Search workspace or list files",
-    "description": "Search the workspace like ripgrep: pattern is literal text, or set regex: true for the Qark regex dialect (. [] () | * + ? {} ^ $ \\< \\> \\d \\w \\s). Matches are grouped per file with that file's sha256, line/col, matched text, and enclosing AST symbol name. Omit pattern to list matching file paths. Skips .git, .qark, node_modules, and build directories unless all: true.",
+    "description": "Search the workspace: pattern is literal text, or set regex: true for the Qark regex dialect (. [] () | * + ? {} ^ $ \\< \\> \\d \\w \\s). Matches are grouped per file with that file's sha256, line/col, matched text, and enclosing symbol name. Omit pattern to list matching file paths. Skips .git, .qark, node_modules, and build directories unless all: true.",
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true
+    },
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -172,7 +208,12 @@
   {
     "name": "qark_impact",
     "title": "Symbol reference & impact graph",
-    "description": "Trace a symbol across the workspace to build its resolved reference and impact graph before refactoring or changing a signature. Returns definitions (file, kind, line, end_line), references (file, line, col, text, and enclosing symbol), imports, dependents, affected_files, and affected_symbols.",
+    "description": "Trace a symbol across the workspace to build its lexical reference and impact graph before refactoring or changing a signature. Returns analysis_mode ('lexical'), complete, definitions (file, kind, line, end_line), references (file, line, col, text, and enclosing symbol), imports, dependents, affected_files, and affected_symbols.",
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true
+    },
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -188,6 +229,11 @@
     "name": "qark_undo",
     "title": "Persistent multi-file undo & redo",
     "description": "Atomically revert one or more applied transactions using persistent snapshots in .qark/undo, redo a previously undone transaction (redo: true), or list the undo history stack (list: true). Verifies each file's sha256 before reverting unless force: true is set.",
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "idempotentHint": false
+    },
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -206,6 +252,11 @@
     "name": "qark_check",
     "title": "Validate project, verify job, or inspect capabilities",
     "description": "Run standalone project-wide validation (using validate/cmd or .qark/checks.json), verify a job directory against its manifest.json (dir), read the transaction event journal (events: true), or query Qark's capabilities (capabilities: true) and operation schemas (schema: true).",
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true
+    },
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -225,6 +276,11 @@
     "name": "qark_templates",
     "title": "List or inspect templates",
     "description": "List the templates qark_apply can name (session, workspace .qark/templates, and builtin), each with its language, description, and the variables it reads. Pass name to get one template's full text.",
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true
+    },
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -237,6 +293,11 @@
     "name": "qark_define_template",
     "title": "Define a reusable template",
     "description": "Keep a named template for later qark_apply calls in this session, so many files can share it. Set persist: true to save it under .qark/templates for future sessions.",
+    "annotations": {
+      "readOnlyHint": false,
+      "destructiveHint": false,
+      "idempotentHint": true
+    },
     "inputSchema": {
       "type": "object",
       "properties": {

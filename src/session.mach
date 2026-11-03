@@ -26,6 +26,7 @@ use ev: qark.vm.eval;
 use h: qark.vm.heap;
 use load: qark.vm.load;
 use v: qark.vm.value;
+use util: qark.util;
 
 # a running qark session
 # ---
@@ -36,19 +37,21 @@ use v: qark.vm.value;
 # tpls:    templates defined with template.define, owned by a
 # lock_ms: how long a commit waits for another qark writing the same root
 pub rec Session {
-    a:       *A.Allocator;
-    eng:     eng.Engine;
-    vm:      v.Vm;
-    jobs:    i64;
-    root:    str;
-    arena:   arena.Arena;
-    ra:      A.Allocator;
-    tools:   check.Tools;
-    tpls:    vector.Vector[spec.Tpl];
-    lock_ms: i64;
-    applies: i64;
-    written: i64;
-    force_dry: bool;
+    a:             *A.Allocator;
+    eng:           eng.Engine;
+    vm:            v.Vm;
+    jobs:          i64;
+    root:          str;
+    arena:         arena.Arena;
+    ra:            A.Allocator;
+    tools:         check.Tools;
+    tpls:          vector.Vector[spec.Tpl];
+    lock_ms:       i64;
+    applies:       i64;
+    written:       i64;
+    force_dry:     bool;
+    lock_root:     bool;
+    require_check: bool;
 }
 
 fun api_cur(ctx: *u8) i64 {
@@ -159,6 +162,11 @@ pub fun set_root(s: *Session, root: str) bool {
     if (sel cleaned.err) { ret false; }
     val is_dir: res[bool, io_error.Error] = filesystem.is_dir(cleaned.ok);
     if (!(sel is_dir.ok && is_dir.ok)) { ret false; }
+    val changed: bool = s.root == nil || !util.eq(s.root, cleaned.ok);
+    if (s.lock_root && changed) { ret false; }
+    if (changed) {
+        check.shutdown(?s.tools);
+    }
     s.root = cleaned.ok;
     ret true;
 }

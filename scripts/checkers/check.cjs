@@ -12,11 +12,15 @@ const path = require('path');
 const { spawnSync } = require('child_process');
 
 const WORKSPACE_ROOT = path.resolve(__dirname, '../..');
-let seq = 0;
 
 function lineCount(text) {
   const n = text.split('\n').length;
   return text.endsWith('\n') ? n - 1 : n;
+}
+
+function normKey(p) {
+  const resolved = path. normalize(path.resolve(p));
+  return process.platform === 'win32' ? resolved.toLowerCase() : resolved;
 }
 
 function parseDiag(raw, text, lineOffset) {
@@ -41,74 +45,110 @@ function parseDiag(raw, text, lineOffset) {
   return { ok: false, line, col, msg };
 }
 
-function isWorkspaceEsmFor(relName) {
-  try {
-    let dir = path.dirname(path.resolve(WORKSPACE_ROOT, relName || 'index.js'));
-    for (let depth = 0; depth < 32; depth++) {
-      const pkgPath = path.join(dir, 'package.json');
-      if (fs.existsSync(pkgPath)) {
+function isWorkspaceEsmFor(relName, wsRoot, pkgMap) {
+  const baseRoot = wsRoot || WORKSPACE_ROOT;
+  let dir = path.dirname(path.resolve(baseRoot, relName || 'index.js'));
+  for (let depth = 0; depth < 32; depth++) {
+    const pkgPath = path.join(dir, 'package.json');
+    const key = normKey(pkgPath);
+    if (pkgMap && pkgMap.has(key)) {
+      const ov = pkgMap.get(key);
+      if (!ov.deleted) {
+        try {
+          const pkg = JSON.parse(String(ov.text || ''));
+          return Boolean(pkg && pkg.type === 'module');
+        } catch (_) {
+          return false;
+        }
+      }
+    } else if (fs.existsSync(pkgPath)) {
+      try {
         const raw = fs.readFileSync(pkgPath, 'utf8');
         const pkg = JSON.parse(raw);
         return Boolean(pkg && pkg.type === 'module');
+      } catch (_) {
+        return false;
       }
-      const parent = path.dirname(dir);
-      if (!parent || parent === dir) break;
-      dir = parent;
     }
-  } catch (_) {
-    // ignore unreadable or malformed package.json during package boundary walk
+    const parent = path.dirname(dir);
+    if (!parent || parent === dir) break;
+    dir = parent;
   }
   return false;
 }
 
-function checkModule(name, text, index) {
-  seq += 1;
-  const tmp = path.join(os.tmpdir(), 'qark-check-' + process.pid + '-' + index + '-' + seq + '.mjs');
-  fs.writeFileSync(tmp, text);
+function checkModule(name, text) {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'qark-esm-'));
   try {
-    const r = spawnSync(process.execPath, ['--check', tmp], { encoding: 'utf8' });
+    try {
+      fs.chmodSync(tmpDir, 0o700);
+    } catch (_) {}
+    const tmpFile = path.join(tmpDir, 'candidate.mjs');
+    fs.writeFileSync(tmpFile, text, { encoding: 'utf8', mode: 0o600, flag: 'wx' });
+    const r = spawnSync(process.execPath, ['--check', tmpFile], { encoding: 'utf8' });
     if (r.status === 0) return { ok: true };
     return parseDiag(r.stderr || r.stdout, text, 0);
   } finally {
-    fs.rmSync(tmp, { force: true });
+    fs.rmSync(tmpDir, { recursive: true, force: true });
   }
 }
 
 function checkCommonJS(name, text) {
   try {
-    new vm.Script(text, { filename: name });
+    new vm.Script(
+      '(function (exports, require, module, __filename, __dirname) {\n' + text + '\n});',
+      { filename: name }
+    );
     return { ok: true };
   } catch (e) {
-    if (/Illegal return/.test(String(e && e.message))) {
-      try {
-        new vm.Script('(function (exports, require, module, __filename, __dirname) {\n' + text + '\n})', { filename: name });
-        return { ok: true };
-      } catch (e2) {
-        return parseDiag(e2 && e2.stack, text, -1);
-      }
-    }
-    return parseDiag(e && e.stack, text, 0);
+    return parseDiag(e && e.stack, text, -1);
   }
 }
 
-function check(name, source, index) {
-  let text = source;
+function check(name, source, wsRoot, pkgMap) {
+  let text = String(source || '');
   if (text.startsWith('#!')) text = '//' + text.slice(2);
   if (/\.cjs$/i.test(name)) {
     return checkCommonJS(name, text);
   }
   if (/\.mjs$/i.test(name)) {
-    return checkModule(name, text, index);
+    return checkModule(name, text);
   }
-  if (isWorkspaceEsmFor(name) || /^\s*(import\s*[\w{*'"]|export\s)/m.test(text)) {
-    return checkModule(name, text, index);
+  if (isWorkspaceEsmFor(name, wsRoot, pkgMap)) {
+    return checkModule(name, text);
   }
   return checkCommonJS(name, text);
 }
 
+function buildPkgMap(files, wsRoot) {
+  const map = new Map();
+  if (!Array.isArray(files) || files.length === 0) return map;
+  const first = files[0];
+  if (first && Array.isArray(first.packages)) {
+    for (const p of first.packages) {
+      if (p && typeof p.name === 'string') {
+        const full = path.resolve(wsRoot, p.name);
+        map.set(normKey(full), { deleted: Boolean(p.deleted), text: p.text || '' });
+      }
+    }
+  }
+  for (const f of files) {
+    if (f && typeof f.name === 'string' && /(^|[\\/])package\.json$/i.test(f.name)) {
+      const full = path.resolve(wsRoot, f.name);
+      map.set(normKey(full), { deleted: Boolean(f.deleted), text: f.text || '' });
+    }
+  }
+  return map;
+}
+
 function answer(raw) {
   const files = JSON.parse(raw);
-  return JSON.stringify(files.map((f, i) => check(f.name, f.text, i)));
+  const wsRoot =
+    Array.isArray(files) && files.length > 0 && files[0] && typeof files[0].root === 'string' && files[0].root
+      ? path.resolve(files[0].root)
+      : WORKSPACE_ROOT;
+  const pkgMap = buildPkgMap(files, wsRoot);
+  return JSON.stringify(files.map((f) => check(f.name, f.text, wsRoot, pkgMap)));
 }
 
 const serveAt = process.argv.indexOf('--serve');

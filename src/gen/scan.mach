@@ -39,16 +39,18 @@ val LINE_MAX: usize = 512;
 val FILE_MAX: usize = 512;
 
 pub rec Opts {
-    pat:       str;
-    patn:      usize;
-    is_re:     bool;
-    icase:     bool;
-    glob:      str;
-    path:      str;
-    ctx:       i64;
-    max:       i64;
-    max_files: i64;
-    all:       bool;
+    pat:            str;
+    patn:           usize;
+    is_re:          bool;
+    icase:          bool;
+    glob:           str;
+    path:           str;
+    ctx:            i64;
+    max:            i64;
+    max_files:      i64;
+    all:            bool;
+    walk_truncated: bool;
+    walk_errors:    i64;
 }
 
 fun skipped(name: str) bool {
@@ -75,6 +77,7 @@ fun gm(g: *u8, gn: usize, gi: usize, t: *u8, tn: usize, ti: usize) bool {
             val two: bool = i + 1 < gn && g[i + 1] == '*';
             i = i + 1;
             if (two) { i = i + 1; }
+            if (two && i < gn && g[i] == '/' && gm(g, gn, i + 1, t, tn, j)) { ret true; }
             var k: usize = j;
             for {
                 if (gm(g, gn, i, t, tn, k)) { ret true; }
@@ -122,11 +125,17 @@ fun glob_ok(glob: str, rel: str) bool {
 
 # append every matching file's rel path beneath dir_rel, depth-bounded
 fun walk(a: *A.Allocator, root: str, dir_rel: str, o: *Opts, out: *vector.Vector[str], depth: i64) {
-    if (depth > 64 || out.len >= o.max_files::usize) { ret; }
+    if (depth > 64 || out.len >= o.max_files::usize) {
+        o.walk_truncated = true;
+        ret;
+    }
     var full: str = root;
     if (dir_rel != nil && dir_rel[0] != 0) {
         val j: res[str, A.Error] = pathx.native(a, root, dir_rel);
-        if (sel j.err) { ret; }
+        if (sel j.err) {
+            o.walk_errors = o.walk_errors + 1;
+            ret;
+        }
         full = j.ok;
         if (depth == 0) {
             val m0: res[filesystem.Metadata, io_error.Error] = filesystem.metadata_link(full);
@@ -139,7 +148,10 @@ fun walk(a: *A.Allocator, root: str, dir_rel: str, o: *Opts, out: *vector.Vector
         }
     }
     val names: res[vector.Vector[str], filesystem.FsError] = filesystem.read_dir(a, full);
-    if (sel names.err) { ret; }
+    if (sel names.err) {
+        o.walk_errors = o.walk_errors + 1;
+        ret;
+    }
     var i: usize = 0;
     for (i < names.ok.len && out.len < o.max_files::usize) {
         val name: str = names.ok.data[i];
@@ -159,8 +171,12 @@ fun walk(a: *A.Allocator, root: str, dir_rel: str, o: *Opts, out: *vector.Vector
                     if (glob_ok(o.glob, rel)) { vector.push[str](out, rel); }
                 }
             }
+            or { o.walk_errors = o.walk_errors + 1; }
         }
         i = i + 1;
+    }
+    if (i < names.ok.len && out.len >= o.max_files::usize) {
+        o.walk_truncated = true;
     }
 }
 
@@ -368,6 +384,8 @@ fun grep_file(a: *A.Allocator, root: str, rel: str, o: *Opts, prog: *re.Prog, w:
 # ---
 # returns false when the regex fails to compile; the caller reports it
 pub fun run(a: *A.Allocator, root: str, o: *Opts, w: *jw.Jw) bool {
+    o.walk_truncated = false;
+    o.walk_errors = 0;
     var files: vector.Vector[str] = vector.init[str](a);
     walk(a, root, o.path, o, ?files, 0);
     sort_rels(?files);
@@ -381,7 +399,8 @@ pub fun run(a: *A.Allocator, root: str, o: *Opts, w: *jw.Jw) bool {
             i = i + 1;
         }
         jw.arr_end(w);
-        if (files.len >= o.max_files::usize) { jw.f_bool(w, "truncated", true); }
+        if (o.walk_truncated || files.len >= o.max_files::usize) { jw.f_bool(w, "truncated", true); }
+        if (o.walk_errors > 0) { jw.f_i64(w, "skipped", o.walk_errors); }
         jw.f_i64(w, "scanned", files.len::i64);
         jw.obj_end(w);
         ret true;
@@ -401,8 +420,8 @@ pub fun run(a: *A.Allocator, root: str, o: *Opts, w: *jw.Jw) bool {
     jw.arr(w);
     var budget: i64 = o.max;
     var scanned: i64 = 0;
-    var skipped_n: i64 = 0;
-    var truncated: bool = files.len >= o.max_files::usize;
+    var skipped_n: i64 = o.walk_errors;
+    var truncated: bool = o.walk_truncated || files.len >= o.max_files::usize;
     var i: usize = 0;
     for (i < files.len && budget > 0) {
         val r: i64 = grep_file(a, root, files.data[i], o, ?progv, w, ?budget);
@@ -425,6 +444,8 @@ pub fun run(a: *A.Allocator, root: str, o: *Opts, w: *jw.Jw) bool {
 pub rec Sym {
     name:      *u8;
     name_n:    usize;
+    parent:    *u8;
+    parent_n:  usize;
     kind:      str;
     line:      i64;
     end:       i64;
@@ -439,6 +460,8 @@ fun push_sym(out: *vector.Vector[Sym], p: *u8, name_at: usize, name_n: usize, ki
     var s: Sym;
     s.name = (p::usize + name_at)::*u8;
     s.name_n = name_n;
+    s.parent = nil;
+    s.parent_n = 0;
     s.kind = kind;
     s.line = line;
     s.end = -1;
@@ -611,7 +634,63 @@ fun scan_mach(p: *u8, lines: *vector.Vector[usize], out: *vector.Vector[Sym]) {
     }
 }
 
-# javascript/typescript: function/class/interface/type/enum declarations and const/let/var bindings
+fun is_js_ctrl_kw(p: *u8, n: usize, k: usize, wl: usize) bool {
+    val WORDS: [28]str = [28]str{
+        "if", "for", "while", "switch", "catch", "with", "do", "else",
+        "try", "finally", "return", "throw", "new", "delete", "typeof", "void",
+        "yield", "await", "super", "import", "export", "case", "default", "break",
+        "continue", "var", "let", "const"
+    };
+    var i: usize = 0;
+    for (i < 28) {
+        if (kw(p, k + wl, k, WORDS[i]) == wl) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+fun js_line_ends_open_brace(p: *u8, end_off: usize, from: usize) bool {
+    var i: usize = from;
+    var last: u8 = 0;
+    for (i < end_off) {
+        val c: u8 = p[i];
+        if (c == '/' && i + 1 < end_off && p[i + 1] == '/') { brk; }
+        if (c == '"' || c == '\'' || c == '`') {
+            val q: u8 = c;
+            i = i + 1;
+            for (i < end_off && p[i] != q) {
+                if (p[i] == '\\' && i + 1 < end_off) { i = i + 1; }
+                i = i + 1;
+            }
+        }
+        or (c != ' ' && c != '\t' && c != '\r' && c != '\n') {
+            last = c;
+        }
+        i = i + 1;
+    }
+    ret last == '{';
+}
+
+fun js_line_has_arrow(p: *u8, end_off: usize, from: usize) bool {
+    var i: usize = from;
+    for (i + 1 < end_off) {
+        val c: u8 = p[i];
+        if (c == '/' && p[i + 1] == '/') { ret false; }
+        if (c == '"' || c == '\'' || c == '`') {
+            val q: u8 = c;
+            i = i + 1;
+            for (i < end_off && p[i] != q) {
+                if (p[i] == '\\' && i + 1 < end_off) { i = i + 1; }
+                i = i + 1;
+            }
+        }
+        or (c == '=' && p[i + 1] == '>') { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
+# javascript/typescript: function/class/interface/type/enum declarations, class methods, and const/let/var bindings
 fun scan_js(p: *u8, lines: *vector.Vector[usize], out: *vector.Vector[Sym]) {
     val nl: usize = lines.len / 2;
     var i: usize = 0;
@@ -628,6 +707,8 @@ fun scan_js(p: *u8, lines: *vector.Vector[usize], out: *vector.Vector[Sym]) {
             val dn: usize = kw(p, off + n, k, "default");
             if (dn > 0) { k = skip_ws_fwd(p, off + n, k + dn); }
         }
+        val abs_n: usize = kw(p, off + n, k, "abstract");
+        if (abs_n > 0) { k = skip_ws_fwd(p, off + n, k + abs_n); }
         kn = kw(p, off + n, k, "async");
         if (kn > 0) { k = skip_ws_fwd(p, off + n, k + kn); }
         var kind: str = nil;
@@ -666,8 +747,9 @@ fun scan_js(p: *u8, lines: *vector.Vector[usize], out: *vector.Vector[Sym]) {
                             if (kn == 0) { kn = kw(p, off + n, k, "let"); }
                             if (kn == 0) { kn = kw(p, off + n, k, "var"); }
                             if (kn > 0) {
-                                kind = "variable";
                                 k = skip_ws_fwd(p, off + n, k + kn);
+                                if (js_line_has_arrow(p, off + n, k)) { kind = "function"; }
+                                or { kind = "variable"; }
                             }
                         }
                     }
@@ -677,6 +759,56 @@ fun scan_js(p: *u8, lines: *vector.Vector[usize], out: *vector.Vector[Sym]) {
         if (kind != nil) {
             val wl: usize = word_len(p, off + n, k);
             if (wl > 0) { push_sym(out, p, k, wl, kind, (i + 1)::i64, ind); }
+        }
+        or (ind > 0) {
+            var mk: usize = off + j;
+            var progressed: bool = true;
+            for (progressed) {
+                progressed = false;
+                val MODS: [9]str = [9]str{"public", "private", "protected", "readonly", "override", "abstract", "static", "async", "get"};
+                var mi: usize = 0;
+                for (mi < 9) {
+                    val mn: usize = kw(p, off + n, mk, MODS[mi]);
+                    if (mn > 0) {
+                        val after_mod: usize = skip_ws_fwd(p, off + n, mk + mn);
+                        if (after_mod < off + n && p[after_mod] != '(' && p[after_mod] != '<' && p[after_mod] != '=') {
+                            mk = after_mod;
+                            progressed = true;
+                        }
+                    }
+                    mi = mi + 1;
+                }
+                val sn: usize = kw(p, off + n, mk, "set");
+                if (sn > 0) {
+                    val after_set: usize = skip_ws_fwd(p, off + n, mk + sn);
+                    if (after_set < off + n && p[after_set] != '(' && p[after_set] != '<' && p[after_set] != '=') {
+                        mk = after_set;
+                        progressed = true;
+                    }
+                }
+            }
+            if (mk < off + n && p[mk] == '*') { mk = skip_ws_fwd(p, off + n, mk + 1); }
+            if (mk < off + n && p[mk] == '#') { mk = mk + 1; }
+            val mwl: usize = word_len(p, off + n, mk);
+            if (mwl > 0 && !is_js_ctrl_kw(p, off + n, mk, mwl)) {
+                var ak: usize = skip_ws_fwd(p, off + n, mk + mwl);
+                if (ak < off + n && p[ak] == '<') {
+                    var gdepth: i64 = 1;
+                    ak = ak + 1;
+                    for (ak < off + n && gdepth > 0) {
+                        if (p[ak] == '<') { gdepth = gdepth + 1; }
+                        or (p[ak] == '>') { gdepth = gdepth - 1; }
+                        ak = ak + 1;
+                    }
+                    ak = skip_ws_fwd(p, off + n, ak);
+                }
+                if (ak < off + n && p[ak] == '(' && js_line_ends_open_brace(p, off + n, ak)) {
+                    push_sym(out, p, mk, mwl, "function", (i + 1)::i64, ind);
+                }
+                or (ak < off + n && p[ak] == '=' && js_line_has_arrow(p, off + n, ak) && js_line_ends_open_brace(p, off + n, ak)) {
+                    push_sym(out, p, mk, mwl, "function", (i + 1)::i64, ind);
+                }
+            }
         }
         i = i + 1;
     }
@@ -986,6 +1118,48 @@ fun refine_python_sym(p: *u8, lines: *vector.Vector[usize], s: *Sym, max_end: i6
     s.end = end;
 }
 
+fun skip_js_regex(p: *u8, off: usize, n: usize, start_j: usize) usize {
+    var k: usize = start_j + 1;
+    var in_class: bool = false;
+    for (k < n) {
+        val rc: u8 = p[off + k];
+        if (rc == '\n' || rc == '\r') { ret 0; }
+        if (rc == '\\') {
+            if (k + 1 >= n) { ret 0; }
+            k = k + 2;
+            cnt;
+        }
+        if (rc == '[') { in_class = true; }
+        or (rc == ']') { in_class = false; }
+        or (rc == '/' && !in_class) { ret k; }
+        k = k + 1;
+    }
+    ret 0;
+}
+
+fun can_start_regex(p: *u8, off: usize, j: usize, prev_tok: u8) bool {
+    if (prev_tok == 0) { ret true; }
+    if (!ident_byte(prev_tok) && prev_tok != ')' && prev_tok != ']' && prev_tok != '"' && prev_tok != '\'' && prev_tok != '`') {
+        ret true;
+    }
+    if (ident_byte(prev_tok)) {
+        var ws: usize = j;
+        for (ws > 0 && (p[off + ws - 1] == ' ' || p[off + ws - 1] == '\t')) { ws = ws - 1; }
+        var st: usize = ws;
+        for (st > 0 && ident_byte(p[off + st - 1])) { st = st - 1; }
+        val wn: usize = ws - st;
+        if (wn > 0) {
+            val KW_RE: [10]str = [10]str{"return", "case", "throw", "typeof", "void", "delete", "in", "of", "yield", "await"};
+            var ki: usize = 0;
+            for (ki < 10) {
+                if (kw(p, off + ws, off + st, KW_RE[ki]) == wn) { ret true; }
+                ki = ki + 1;
+            }
+        }
+    }
+    ret false;
+}
+
 fun refine_brace_sym(p: *u8, lines: *vector.Vector[usize], s: *Sym, max_end: i64, hash_comment: bool) {
     var d: i64 = s.line;
     for (d > 1 && line_is_decorator(p, lines, d - 1, s.indent)) { d = d - 1; }
@@ -993,6 +1167,8 @@ fun refine_brace_sym(p: *u8, lines: *vector.Vector[usize], s: *Sym, max_end: i64
     var bdepth: i64 = 0;
     var saw_open: bool = false;
     var in_block_comment: bool = false;
+    var in_template: bool = false;
+    var tmpl_expr_depth: i64 = 0;
     var ln: i64 = s.line;
     var end: i64 = max_end;
     var sig: i64 = s.line;
@@ -1002,6 +1178,7 @@ fun refine_brace_sym(p: *u8, lines: *vector.Vector[usize], s: *Sym, max_end: i64
         val n: usize = lines.data[idx * 2 + 1];
         var j: usize = 0;
         var saw_semi: bool = false;
+        var prev_tok: u8 = 0;
         for (j < n) {
             val c: u8 = p[off + j];
             if (in_block_comment) {
@@ -1013,6 +1190,24 @@ fun refine_brace_sym(p: *u8, lines: *vector.Vector[usize], s: *Sym, max_end: i64
                 j = j + 1;
                 cnt;
             }
+            if (in_template && tmpl_expr_depth == 0) {
+                if (c == '\\' && j + 1 < n) {
+                    j = j + 2;
+                    cnt;
+                }
+                if (c == '$' && j + 1 < n && p[off + j + 1] == '{') {
+                    tmpl_expr_depth = 1;
+                    prev_tok = '{';
+                    j = j + 2;
+                    cnt;
+                }
+                if (c == '`') {
+                    in_template = false;
+                    prev_tok = '`';
+                }
+                j = j + 1;
+                cnt;
+            }
             if (hash_comment && c == '#') { brk; }
             if (!hash_comment && j + 1 < n && c == '/' && p[off + j + 1] == '/') { brk; }
             if (!hash_comment && j + 1 < n && c == '/' && p[off + j + 1] == '*') {
@@ -1020,32 +1215,62 @@ fun refine_brace_sym(p: *u8, lines: *vector.Vector[usize], s: *Sym, max_end: i64
                 j = j + 2;
                 cnt;
             }
-            if (c == '"' || c == '\'' || c == '`') {
+            if (!hash_comment && c == '/' && can_start_regex(p, off, j, prev_tok)) {
+                val rend: usize = skip_js_regex(p, off, n, j);
+                if (rend > j) {
+                    j = rend + 1;
+                    prev_tok = '/';
+                    cnt;
+                }
+            }
+            if (c == '`') {
+                in_template = true;
+                j = j + 1;
+                cnt;
+            }
+            if (c == '"' || c == '\'') {
                 val q: u8 = c;
                 j = j + 1;
                 for (j < n && p[off + j] != q) {
                     if (p[off + j] == '\\' && j + 1 < n) { j = j + 1; }
                     j = j + 1;
                 }
+                prev_tok = q;
             }
             or (c == '{') {
-                if (!saw_open) {
-                    saw_open = true;
-                    sig = ln;
+                if (tmpl_expr_depth > 0) {
+                    tmpl_expr_depth = tmpl_expr_depth + 1;
                 }
-                bdepth = bdepth + 1;
+                or {
+                    if (!saw_open) {
+                        saw_open = true;
+                        sig = ln;
+                    }
+                    bdepth = bdepth + 1;
+                }
+                prev_tok = '{';
             }
             or (c == '}') {
-                if (bdepth > 0) { bdepth = bdepth - 1; }
-                if (saw_open && bdepth == 0) {
-                    end = ln;
-                    s.sig_end = sig;
-                    s.end = end;
-                    ret;
+                if (tmpl_expr_depth > 0) {
+                    tmpl_expr_depth = tmpl_expr_depth - 1;
                 }
+                or {
+                    if (bdepth > 0) { bdepth = bdepth - 1; }
+                    if (saw_open && bdepth == 0) {
+                        end = ln;
+                        s.sig_end = sig;
+                        s.end = end;
+                        ret;
+                    }
+                }
+                prev_tok = '}';
             }
             or (c == ';' && !saw_open) {
                 saw_semi = true;
+                prev_tok = ';';
+            }
+            or (c != ' ' && c != '\t' && c != '\r' && c != '\n') {
+                prev_tok = c;
             }
             j = j + 1;
         }
@@ -1102,6 +1327,20 @@ pub fun collect_symbols(a: *A.Allocator, lang: str, p: *u8, n: usize, syms: *vec
         or (!is_toml) {
             refine_brace_sym(p, ?lines, ?syms.data[i], end, hash_cmt);
         }
+        if (syms.data[i].indent > 0 && i > 0) {
+            var pi: usize = i;
+            for (pi > 0) {
+                pi = pi - 1;
+                if (syms.data[pi].indent < syms.data[i].indent && syms.data[pi].line < syms.data[i].line && syms.data[pi].end >= syms.data[i].line) {
+                    syms.data[i].parent = syms.data[pi].name;
+                    syms.data[i].parent_n = syms.data[pi].name_n;
+                    if (util.eq(syms.data[i].kind, "function") && util.eq(syms.data[pi].kind, "class")) {
+                        syms.data[i].kind = "method";
+                    }
+                    brk;
+                }
+            }
+        }
         i = i + 1;
     }
 }
@@ -1116,17 +1355,48 @@ fun sym_name_eq(s: *Sym, name: *u8, n: usize) bool {
     ret true;
 }
 
+fun kind_matches_prefix(sym_kind: str, pref: *u8, pn: usize) bool {
+    if (pn == 0 || sym_kind == nil) { ret true; }
+    val skn: usize = str_len(sym_kind);
+    if (bytes_eq(sym_kind, skn, pref, pn)) { ret true; }
+    if (bytes_eq("function", 8, pref, pn) || bytes_eq("method", 6, pref, pn) || bytes_eq("fn", 2, pref, pn) || bytes_eq("fun", 3, pref, pn) || bytes_eq("def", 3, pref, pn)) {
+        ret util.eq(sym_kind, "function") || util.eq(sym_kind, "method") || util.eq(sym_kind, "fun") || util.eq(sym_kind, "fn");
+    }
+    if (bytes_eq("class", 5, pref, pn) || bytes_eq("struct", 6, pref, pn) || bytes_eq("rec", 3, pref, pn)) {
+        ret util.eq(sym_kind, "class") || util.eq(sym_kind, "struct") || util.eq(sym_kind, "rec");
+    }
+    ret false;
+}
+
 # 1 found uniquely, 0 not found, 2 ambiguous
 pub fun find_symbol_ext(a: *A.Allocator, lang: str, p: *u8, n: usize, sym_name: *u8, sym_n: usize, out_sym: *Sym) i64 {
     if (lang == nil || sym_name == nil || sym_n == 0) { ret 0; }
     var syms: vector.Vector[Sym] = vector.init[Sym](a);
     collect_symbols(a, lang, p, n, ?syms);
     if (syms.len == 0) { ret 0; }
-    var dot: usize = sym_n;
+    var sname: *u8 = sym_name;
+    var sn: usize = sym_n;
+    var want_kind: *u8 = nil;
+    var want_kind_n: usize = 0;
+    if (!util.eq(lang, "toml")) {
+        var ci: usize = 0;
+        for (ci < sn) {
+            if (sname[ci] == ':') {
+                want_kind = sname;
+                want_kind_n = ci;
+                sname = (sname::usize + ci + 1)::*u8;
+                sn = sn - ci - 1;
+                brk;
+            }
+            ci = ci + 1;
+        }
+    }
+    if (sn == 0) { ret 0; }
+    var dot: usize = sn;
     if (!util.eq(lang, "toml")) {
         var d: usize = 0;
-        for (d < sym_n) {
-            if (sym_name[d] == '.') {
+        for (d < sn) {
+            if (sname[d] == '.') {
                 dot = d;
                 brk;
             }
@@ -1135,13 +1405,13 @@ pub fun find_symbol_ext(a: *A.Allocator, lang: str, p: *u8, n: usize, sym_name: 
     }
     var min_line: i64 = 1;
     var max_line: i64 = 2147483647;
-    var target: *u8 = sym_name;
-    var target_n: usize = sym_n;
-    if (dot < sym_n) {
+    var target: *u8 = sname;
+    var target_n: usize = sn;
+    if (dot < sn) {
         var found_parent: bool = false;
         var pi: usize = 0;
         for (pi < syms.len) {
-            if (sym_name_eq(?syms.data[pi], sym_name, dot)) {
+            if (sym_name_eq(?syms.data[pi], sname, dot)) {
                 min_line = syms.data[pi].line;
                 max_line = syms.data[pi].end;
                 found_parent = true;
@@ -1150,14 +1420,14 @@ pub fun find_symbol_ext(a: *A.Allocator, lang: str, p: *u8, n: usize, sym_name: 
             pi = pi + 1;
         }
         if (!found_parent) { ret 0; }
-        target = (sym_name::usize + dot + 1)::*u8;
-        target_n = sym_n - dot - 1;
+        target = (sname::usize + dot + 1)::*u8;
+        target_n = sn - dot - 1;
     }
     var hits: i64 = 0;
     var i: usize = 0;
     for (i < syms.len) {
         val s: *Sym = ?syms.data[i];
-        if (s.line >= min_line && s.line <= max_line && sym_name_eq(s, target, target_n)) {
+        if (s.line >= min_line && s.line <= max_line && sym_name_eq(s, target, target_n) && kind_matches_prefix(s.kind, want_kind, want_kind_n)) {
             if (hits == 0) {
                 @out_sym = @s;
             }
@@ -1215,6 +1485,9 @@ pub fun outline(a: *A.Allocator, lang: str, p: *u8, n: usize, w: *jw.Jw) {
         jw.f_i64(w, "end", syms.data[i].end);
         jw.f_str(w, "kind", syms.data[i].kind);
         jw.f_strn(w, "name", syms.data[i].name, syms.data[i].name_n);
+        if (syms.data[i].parent != nil && syms.data[i].parent_n > 0) {
+            jw.f_strn(w, "parent", syms.data[i].parent, syms.data[i].parent_n);
+        }
         jw.f_i64(w, "indent", syms.data[i].indent);
         jw.obj_end(w);
         i = i + 1;
@@ -1222,8 +1495,7 @@ pub fun outline(a: *A.Allocator, lang: str, p: *u8, n: usize, w: *jw.Jw) {
     jw.arr_end(w);
 }
 
-# collect workspace-relative paths matching a glob pattern
-pub fun glob_files(a: *A.Allocator, root: str, glob: str, out: *vector.Vector[str]) {
+pub fun glob_files_ext(a: *A.Allocator, root: str, glob: str, max_files: i64, out: *vector.Vector[str], truncated: *bool, errors: *i64) {
     var o: Opts;
     o.pat = nil;
     o.patn = 0;
@@ -1233,15 +1505,25 @@ pub fun glob_files(a: *A.Allocator, root: str, glob: str, out: *vector.Vector[st
     o.path = nil;
     o.ctx = 0;
     o.max = 0;
-    o.max_files = 1024;
+    o.max_files = max_files;
+    if (o.max_files <= 0) { o.max_files = 16384; }
     o.all = false;
+    o.walk_truncated = false;
+    o.walk_errors = 0;
     walk(a, root, nil, ?o, out, 0);
     sort_rels(out);
+    if (truncated != nil) { @truncated = o.walk_truncated; }
+    if (errors != nil) { @errors = o.walk_errors; }
+}
+
+# collect workspace-relative paths matching a glob pattern
+pub fun glob_files(a: *A.Allocator, root: str, glob: str, out: *vector.Vector[str]) {
+    glob_files_ext(a, root, glob, 16384, out, nil, nil);
 }
 
 fun is_foldable_kind(k: str) bool {
     if (k == nil) { ret false; }
-    ret util.eq(k, "function") || util.eq(k, "fun") || util.eq(k, "pub fun") || util.eq(k, "def") || util.eq(k, "fn") || util.eq(k, "pub fn") || util.eq(k, "func");
+    ret util.eq(k, "function") || util.eq(k, "method") || util.eq(k, "fun") || util.eq(k, "pub fun") || util.eq(k, "def") || util.eq(k, "fn") || util.eq(k, "pub fn") || util.eq(k, "func");
 }
 
 # build a signature-folded view of the file, keeping full bodies for any symbols in keep_syms
@@ -1481,29 +1763,53 @@ fun extract_imports(a: *A.Allocator, p: *u8, lines: *vector.Vector[usize], out: 
         val n: usize = lines.data[i * 2 + 1];
         var j: usize = 0;
         for (j < n && (p[off + j] == ' ' || p[off + j] == '\t')) { j = j + 1; }
-        val k: usize = off + j;
+        var k: usize = off + j;
+        val exp_n: usize = kw(p, off + n, k, "export");
+        if (exp_n > 0) { k = skip_ws_fwd(p, off + n, k + exp_n); }
         var kn: usize = kw(p, off + n, k, "import");
         if (kn == 0) { kn = kw(p, off + n, k, "from"); }
         if (kn == 0) { kn = kw(p, off + n, k, "use"); }
         if (kn > 0) {
-            var st: usize = skip_ws_fwd(p, off + n, k + kn);
-            var en: usize = st;
-            for (en < off + n && p[en] != ' ' && p[en] != '\t' && p[en] != ';' && p[en] != '\r' && p[en] != '\n' && p[en] != ':') {
-                en = en + 1;
+            var q_st: usize = 0;
+            var q_en: usize = 0;
+            var qi: usize = k + kn;
+            for (qi < off + n) {
+                if (p[qi] == '"' || p[qi] == '\'') {
+                    val qc: u8 = p[qi];
+                    q_st = qi + 1;
+                    qi = qi + 1;
+                    for (qi < off + n && p[qi] != qc) { qi = qi + 1; }
+                    q_en = qi;
+                    brk;
+                }
+                qi = qi + 1;
             }
-            if (en == off + n || p[en] == ':') {
-                if (en < off + n && p[en] == ':') {
-                    st = skip_ws_fwd(p, off + n, en + 1);
-                    en = st;
-                    for (en < off + n && p[en] != ' ' && p[en] != '\t' && p[en] != ';' && p[en] != '\r' && p[en] != '\n') {
-                        en = en + 1;
-                    }
+            if (q_en > q_st) {
+                val dup_q: res[str, A.Error] = util.dup_n(a, (p::usize + q_st)::*u8, q_en - q_st);
+                if (sel dup_q.ok) {
+                    if (!has_str(out, dup_q.ok)) { vector.push[str](out, dup_q.ok); }
                 }
             }
-            if (en > st) {
-                val dup: res[str, A.Error] = util.dup_n(a, (p::usize + st)::*u8, en - st);
-                if (sel dup.ok) {
-                    if (!has_str(out, dup.ok)) { vector.push[str](out, dup.ok); }
+            or {
+                var st: usize = skip_ws_fwd(p, off + n, k + kn);
+                var en: usize = st;
+                for (en < off + n && p[en] != ' ' && p[en] != '\t' && p[en] != ';' && p[en] != '\r' && p[en] != '\n' && p[en] != ':') {
+                    en = en + 1;
+                }
+                if (en == off + n || p[en] == ':') {
+                    if (en < off + n && p[en] == ':') {
+                        st = skip_ws_fwd(p, off + n, en + 1);
+                        en = st;
+                        for (en < off + n && p[en] != ' ' && p[en] != '\t' && p[en] != ';' && p[en] != '\r' && p[en] != '\n') {
+                            en = en + 1;
+                        }
+                    }
+                }
+                if (en > st) {
+                    val dup: res[str, A.Error] = util.dup_n(a, (p::usize + st)::*u8, en - st);
+                    if (sel dup.ok) {
+                        if (!has_str(out, dup.ok)) { vector.push[str](out, dup.ok); }
+                    }
                 }
             }
         }
@@ -1516,6 +1822,55 @@ fun find_word_col(p: *u8, off: usize, n: usize, w: *u8, wn: usize) i64 {
     var i: usize = 0;
     for (i + wn <= n) {
         if ((i == 0 || !ident_byte(p[off + i - 1])) && (i + wn == n || !ident_byte(p[off + i + wn]))) {
+            var ok: bool = true;
+            var j: usize = 0;
+            for (j < wn) {
+                if (p[off + i + j] != w[j]) {
+                    ok = false;
+                    brk;
+                }
+                j = j + 1;
+            }
+            if (ok) { ret (i + 1)::i64; }
+        }
+        i = i + 1;
+    }
+    ret -1;
+}
+
+# find whole-word match on a source line while skipping comments and string literals
+fun find_code_word_col(p: *u8, off: usize, n: usize, w: *u8, wn: usize, hash_cmt: bool, in_block: *bool) i64 {
+    if (wn == 0 || n == 0) { ret -1; }
+    var i: usize = 0;
+    for (i < n) {
+        val c: u8 = p[off + i];
+        if (@in_block) {
+            if (i + 1 < n && c == '*' && p[off + i + 1] == '/') {
+                @in_block = false;
+                i = i + 2;
+                cnt;
+            }
+            i = i + 1;
+            cnt;
+        }
+        if (hash_cmt && c == '#') { ret -1; }
+        if (!hash_cmt && i + 1 < n && c == '/' && p[off + i + 1] == '/') { ret -1; }
+        if (!hash_cmt && i + 1 < n && c == '/' && p[off + i + 1] == '*') {
+            @in_block = true;
+            i = i + 2;
+            cnt;
+        }
+        if (c == '"' || c == '\'' || c == '`') {
+            val q: u8 = c;
+            i = i + 1;
+            for (i < n && p[off + i] != q) {
+                if (p[off + i] == '\\' && i + 1 < n) { i = i + 1; }
+                i = i + 1;
+            }
+            i = i + 1;
+            cnt;
+        }
+        if (i + wn <= n && (i == 0 || !ident_byte(p[off + i - 1])) && (i + wn == n || !ident_byte(p[off + i + wn]))) {
             var ok: bool = true;
             var j: usize = 0;
             for (j < wn) {
@@ -1553,10 +1908,60 @@ fun stem_of(a: *A.Allocator, rel: str) str {
     ret rel;
 }
 
+fun dir_of(a: *A.Allocator, rel: str) str {
+    if (rel == nil) { ret ""; }
+    val n: usize = str_len(rel);
+    var last_slash: usize = n;
+    var i: usize = 0;
+    for (i < n) {
+        if (rel[i] == '/') { last_slash = i; }
+        i = i + 1;
+    }
+    if (last_slash == n) { ret ""; }
+    val d: res[str, A.Error] = util.dup_n(a, rel, last_slash);
+    if (sel d.ok) { ret d.ok; }
+    ret "";
+}
+
+fun import_matches_target(a: *A.Allocator, importer_rel: str, imp: str, target_path: str, target_stem: str, target_stem_n: usize) bool {
+    if (imp == nil || target_path == nil || target_stem_n == 0) { ret false; }
+    val imp_n: usize = str_len(imp);
+    if (find_word_col(imp, 0, imp_n, target_stem, target_stem_n) <= 0) { ret false; }
+    val target_dir: str = dir_of(a, target_path);
+    val importer_dir: str = dir_of(a, importer_rel);
+    if (imp_n >= 2 && imp[0] == '.' && imp[1] == '/') {
+        ret util.eq(importer_dir, target_dir);
+    }
+    if (target_dir[0] != 0) {
+        val td_n: usize = str_len(target_dir);
+        var has_sep: bool = false;
+        var si: usize = 0;
+        for (si < imp_n) {
+            if (imp[si] == '/' || imp[si] == '.') { has_sep = true; }
+            si = si + 1;
+        }
+        if (has_sep) {
+            var leaf_dir: str = target_dir;
+            var li: usize = 0;
+            for (li < td_n) {
+                if (target_dir[li] == '/') { leaf_dir = (target_dir::usize + li + 1)::*u8; }
+                li = li + 1;
+            }
+            val ld_n: usize = str_len(leaf_dir);
+            if (ld_n > 0 && find_word_col(imp, 0, imp_n, leaf_dir, ld_n) <= 0 && !util.eq(importer_dir, target_dir)) {
+                ret false;
+            }
+        }
+    }
+    ret true;
+}
+
 # build a resolved reference and impact graph for a symbol and/or file path across the workspace
 pub fun impact_graph(a: *A.Allocator, root: str, sym_name: *u8, sym_n: usize, target_path: str, glob: str, w: *jw.Jw) bool {
     var files: vector.Vector[str] = vector.init[str](a);
-    glob_files(a, root, glob, ?files);
+    var walk_trunc: bool = false;
+    var walk_err: i64 = 0;
+    glob_files_ext(a, root, glob, 16384, ?files, ?walk_trunc, ?walk_err);
     var defs_w: jw.Jw = jw.init(a);
     var refs_w: jw.Jw = jw.init(a);
     var imps_w: jw.Jw = jw.init(a);
@@ -1587,6 +1992,7 @@ pub fun impact_graph(a: *A.Allocator, root: str, sym_name: *u8, sym_n: usize, ta
                             var lines: vector.Vector[usize] = vector.init[usize](a);
                             split_lines(p, n, ?lines);
                             val lang: str = outline_lang(rel);
+                            val hash_cmt: bool = util.eq(lang, "python") || util.eq(lang, "mach") || util.eq(lang, "powershell") || util.eq(lang, "bash") || util.eq(lang, "toml");
                             var syms: vector.Vector[Sym] = vector.init[Sym](a);
                             if (lang != nil && n > 0) { collect_symbols(a, lang, p, n, ?syms); }
                             var file_imps: vector.Vector[str] = vector.init[str](a);
@@ -1602,7 +2008,7 @@ pub fun impact_graph(a: *A.Allocator, root: str, sym_name: *u8, sym_n: usize, ta
                                 var ii: usize = 0;
                                 for (ii < file_imps.len) {
                                     val imp: str = file_imps.data[ii];
-                                    if (find_word_col(imp, 0, str_len(imp), target_stem, target_stem_n) > 0) {
+                                    if (import_matches_target(a, rel, imp, target_path, target_stem, target_stem_n)) {
                                         jw.str_v(?deps_w, rel);
                                         if (!has_str(?aff_files, rel)) { vector.push[str](?aff_files, rel); }
                                         brk;
@@ -1629,10 +2035,21 @@ pub fun impact_graph(a: *A.Allocator, root: str, sym_name: *u8, sym_n: usize, ta
                                 }
                                 val nl: usize = lines.len / 2;
                                 var li: usize = 0;
+                                var in_blk: bool = false;
+                                var py_triple: u8 = 0;
                                 for (li < nl) {
                                     val loff: usize = lines.data[li * 2];
                                     val llen: usize = lines.data[li * 2 + 1];
-                                    val col: i64 = find_word_col(p, loff, llen, sym_name, sym_n);
+                                    var col: i64 = -1;
+                                    if (util.eq(lang, "python") && py_triple != 0) {
+                                        py_triple = py_step_triple(p, loff, llen, py_triple);
+                                    }
+                                    or {
+                                        col = find_code_word_col(p, loff, llen, sym_name, sym_n, hash_cmt, ?in_blk);
+                                        if (util.eq(lang, "python")) {
+                                            py_triple = py_step_triple(p, loff, llen, 0);
+                                        }
+                                    }
                                     if (col > 0) {
                                         val ln1: i64 = (li + 1)::i64;
                                         var is_def_line: bool = false;
@@ -1678,8 +2095,10 @@ pub fun impact_graph(a: *A.Allocator, root: str, sym_name: *u8, sym_n: usize, ta
                             }
                         }
                     }
+                    or { walk_err = walk_err + 1; }
                 }
             }
+            or { walk_err = walk_err + 1; }
         }
         fi = fi + 1;
     }
@@ -1690,6 +2109,10 @@ pub fun impact_graph(a: *A.Allocator, root: str, sym_name: *u8, sym_n: usize, ta
     jw.obj(w);
     if (sym_name != nil && sym_n > 0) { jw.f_strn(w, "symbol", sym_name, sym_n); }
     if (target_path != nil) { jw.f_str(w, "path", target_path); }
+    jw.f_str(w, "analysis_mode", "lexical_heuristic");
+    jw.f_bool(w, "complete", !walk_trunc && walk_err == 0);
+    jw.f_bool(w, "truncated", walk_trunc);
+    if (walk_err > 0) { jw.f_i64(w, "skipped", walk_err); }
     jw.key(w, "definitions");
     jw.raw_v(w, jw.text(?defs_w));
     jw.key(w, "references");
@@ -1734,6 +2157,8 @@ $if (capability.HOSTED) {
         if (!glob_match("?.py", 4, "x.py", 4)) { ret 6; }
         if (glob_match("?.py", 4, "xy.py", 5)) { ret 7; }
         if (!glob_match("*", 1, "c.py", 4)) { ret 8; }
+        if (!glob_match("src/**/*.py", 11, "src/a.py", 8)) { ret 9; }
+        if (!glob_match("**/*.py", 7, "a.py", 4)) { ret 10; }
         ret 0;
     }
 }

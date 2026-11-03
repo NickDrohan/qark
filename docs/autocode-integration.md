@@ -113,38 +113,160 @@ Below is a complete, zero-dependency Node.js reference client demonstrating capa
 
 ```js
 import { spawn } from "node:child_process";
+import { once } from "node:events";
 import readline from "node:readline";
 
 export class QarkSession {
-  constructor(qarkBin, workspaceRoot) {
-    this.proc = spawn(qarkBin, ["--headless", "--stdio", "--root", workspaceRoot], {
-      stdio: ["pipe", "pipe", "pipe"],
-    });
-    this.rl = readline.createInterface({ input: this.proc.stdout });
+  constructor(qarkBin, workspaceRoot, options = {}) {
+    const extraArgs = Array.isArray(options.args) ? options.args : [];
+    this.defaultTimeoutMs = options.timeoutMs ?? 30000;
+    this.maxStderrBytes = options.maxStderrBytes ?? 8192;
+    this.stderrBuf = "";
+    this.closed = false;
+    this.exitError = null;
     this.nextId = 1;
     this.pending = new Map();
 
+    this.proc = spawn(
+      qarkBin,
+      ["--headless", "--stdio", "--root", workspaceRoot, ...extraArgs],
+      { stdio: ["pipe", "pipe", "pipe"] }
+    );
+
+    this.proc.stderr.setEncoding("utf8");
+    this.proc.stderr.on("data", (chunk) => {
+      this.stderrBuf += chunk;
+      if (this.stderrBuf.length > this.maxStderrBytes) {
+        this.stderrBuf = this.stderrBuf.slice(-this.maxStderrBytes);
+      }
+    });
+
+    this.rl = readline.createInterface({ input: this.proc.stdout });
     this.rl.on("line", (line) => {
       if (!line.trim()) return;
-      const msg = JSON.parse(line);
-      const waiter = this.pending.get(msg.id);
-      if (waiter) {
+      let msg;
+      try {
+        msg = JSON.parse(line);
+      } catch (err) {
+        this._failAll(
+          new Error(`Malformed JSON from Qark worker: ${err.message}`)
+        );
+        return;
+      }
+      const entry = this.pending.get(msg.id);
+      if (entry) {
         this.pending.delete(msg.id);
-        waiter(msg);
+        clearTimeout(entry.timer);
+        entry.resolve(msg);
+      }
+    });
+
+    this.proc.on("error", (err) => {
+      this._failAll(
+        new Error(`Qark worker process error: ${err.message}`)
+      );
+    });
+
+    this.proc.on("exit", (code, signal) => {
+      const detail = this.stderrBuf.trim()
+        ? ` (stderr: ${this.stderrBuf.trim()})`
+        : "";
+      this._failAll(
+        new Error(
+          `Qark worker exited before replying (code=${code}, signal=${signal})${detail}`
+        )
+      );
+    });
+
+    this.proc.on("close", (code, signal) => {
+      const detail = this.stderrBuf.trim()
+        ? ` (stderr: ${this.stderrBuf.trim()})`
+        : "";
+      this._failAll(
+        new Error(
+          `Qark worker stream closed (code=${code}, signal=${signal})${detail}`
+        )
+      );
+    });
+  }
+
+  _failAll(err) {
+    if (!this.exitError) {
+      this.exitError = err;
+    }
+    this.closed = true;
+    for (const [id, entry] of this.pending.entries()) {
+      this.pending.delete(id);
+      clearTimeout(entry.timer);
+      entry.reject(this.exitError);
+    }
+  }
+
+  async call(op, args = {}, timeoutMs = this.defaultTimeoutMs) {
+    if (this.closed || this.exitError) {
+      throw this.exitError || new Error("QarkSession is closed");
+    }
+    const id = this.nextId++;
+    const payload = JSON.stringify({ id, op, args }) + "\n";
+
+    return new Promise((resolve, reject) => {
+      const timer =
+        timeoutMs > 0
+          ? setTimeout(() => {
+              this.pending.delete(id);
+              reject(
+                new Error(
+                  `Qark request #${id} (${op}) timed out after ${timeoutMs}ms`
+                )
+              );
+            }, timeoutMs)
+          : null;
+
+      this.pending.set(id, { resolve, reject, timer });
+
+      try {
+        const flushed = this.proc.stdin.write(payload, "utf8", (writeErr) => {
+          if (writeErr && this.pending.has(id)) {
+            this.pending.delete(id);
+            clearTimeout(timer);
+            reject(
+              new Error(`Failed to write to Qark worker stdin: ${writeErr.message}`)
+            );
+          }
+        });
+        if (!flushed) {
+          once(this.proc.stdin, "drain").catch(() => {});
+        }
+      } catch (err) {
+        this.pending.delete(id);
+        clearTimeout(timer);
+        reject(err);
       }
     });
   }
 
-  async call(op, args = {}) {
-    const id = this.nextId++;
-    const payload = JSON.stringify({ id, op, args }) + "\n";
-    const replyPromise = new Promise((resolve) => this.pending.set(id, resolve));
-    this.proc.stdin.write(payload, "utf8");
-    return replyPromise;
-  }
-
-  close() {
-    this.proc.stdin.end();
+  async close(timeoutMs = 2000) {
+    this.closed = true;
+    if (this.proc.exitCode !== null || this.proc.killed) {
+      this.rl.close();
+      return;
+    }
+    const exitPromise = once(this.proc, "exit").catch(() => {});
+    try {
+      this.proc.stdin.end();
+    } catch {}
+    let killTimer;
+    const timeoutPromise = new Promise((resolve) => {
+      killTimer = setTimeout(() => {
+        try {
+          this.proc.kill();
+        } catch {}
+        resolve();
+      }, timeoutMs);
+    });
+    await Promise.race([exitPromise, timeoutPromise]);
+    clearTimeout(killTimer);
+    this.rl.close();
   }
 }
 

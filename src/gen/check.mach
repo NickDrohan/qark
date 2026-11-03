@@ -9,6 +9,7 @@ use std.collections.vector;
 use std.data.json;
 use toml: std.data.toml;
 use std.filesystem;
+use io_error: std.io.error;
 use std.process.env;
 use std.process.exec;
 use std.types.bool.bool;
@@ -331,7 +332,15 @@ fun first_line(a: *A.Allocator, s: str) str {
 }
 
 fun pending(e: *commit.Entry) bool {
-    ret e.status == commit.ST_CREATE || e.status == commit.ST_REPLACE;
+    ret (e.status == commit.ST_CREATE || e.status == commit.ST_REPLACE) && e.check_policy != commit.CP_OFF;
+}
+
+fun is_pkg_json(rel: str) bool {
+    if (rel == nil) { ret false; }
+    if (util.eq(rel, "package.json")) { ret true; }
+    val n: usize = str_len(rel);
+    if (n > 13 && util.eq((rel::usize + n - 13)::*u8, "/package.json")) { ret true; }
+    ret false;
 }
 
 fun warm_index(lang: str) usize {
@@ -421,6 +430,28 @@ fun prepare(a: *A.Allocator, keep: *A.Allocator, root: str, set: *commit.Set, to
             jw.f_str(?w, "name", e.rel);
             jw.key(?w, "text");
             jw.str_n(?w, e.data, e.len);
+            if (i == 0 && util.eq(r.lang, "node")) {
+                jw.f_str(?w, "root", root);
+                jw.key(?w, "packages");
+                jw.arr(?w);
+                var pi: usize = 0;
+                for (pi < commit.count(set)) {
+                    val pe: *commit.Entry = commit.entry(set, pi);
+                    if (is_pkg_json(pe.rel)) {
+                        jw.obj(?w);
+                        jw.f_str(?w, "name", pe.rel);
+                        val del: bool = pe.mode == commit.MODE_DELETE || pe.status == commit.ST_DELETE;
+                        jw.f_bool(?w, "deleted", del);
+                        if (!del && pe.data != nil) {
+                            jw.key(?w, "text");
+                            jw.str_n(?w, pe.data, pe.len);
+                        }
+                        jw.obj_end(?w);
+                    }
+                    pi = pi + 1;
+                }
+                jw.arr_end(?w);
+            }
             jw.obj_end(?w);
             i = i + 1;
         }
@@ -605,14 +636,16 @@ fun finish_run(a: *A.Allocator, set: *commit.Set, r: *Run) {
         var i: usize = 0;
         for (i < r.items.len) {
             val e: *commit.Entry = commit.entry(set, r.items.data[i]);
-            e.check = code;
-            if (code == commit.CK_FAILED) {
-                if (r.external) { e.ck_cat = "project_check"; }
-                or { e.ck_cat = "syntax_error"; }
+            if (code == commit.CK_FAILED || (e.check != commit.CK_FAILED && e.check != commit.CK_ERROR)) {
+                e.check = code;
+                if (code == commit.CK_FAILED) {
+                    if (r.external) { e.ck_cat = "project_check"; }
+                    or { e.ck_cat = "syntax_error"; }
+                }
+                e.ck_line = line;
+                e.ck_col = col;
+                e.ck_msg = msg;
             }
-            e.ck_line = line;
-            e.ck_col = col;
-            e.ck_msg = msg;
             i = i + 1;
         }
         ret;
@@ -739,56 +772,115 @@ fun same_cmd(r: *Run, argv: **u8, argc: usize) bool {
     ret true;
 }
 
-# put the previous bytes back. n is how many entries of the change set were staged.
-fun unplace_staged(a: *A.Allocator, set: *commit.Set, n: usize) {
-    var i: usize = 0;
-    var lim: usize = n;
-    if (lim > commit.count(set)) { lim = commit.count(set); }
-    for (i < lim) {
-        val e: *commit.Entry = commit.entry(set, i);
-        if (e.status == commit.ST_CREATE || e.status == commit.ST_REPLACE || e.status == commit.ST_DELETE) {
-            if (e.existed) {
-                var perm: i32 = 420;
-                if (e.old_perm != 0) { perm = (e.old_perm & 511)::i32; }
-                var oldp: *u8 = e.old;
-                if (oldp == nil) { oldp = ""; }
-                filesystem.replace_bytes_atomic(a, e.full, oldp, e.old_len, perm, 493);
-            }
-            or { filesystem.remove_file(e.full); }
-        }
-        i = i + 1;
-    }
+fun make_temp_dir(a: *A.Allocator, prefix: str) str {
+    val tf: res[filesystem.TempFile, filesystem.FsError] = filesystem.temp_create(a, prefix);
+    if (sel tf.err) { ret nil; }
+    var tmp: filesystem.TempFile = tf.ok;
+    val dir_path: str = tmp.path;
+    filesystem.temp_close_and_remove(?tmp);
+    val mk: err[filesystem.FsError] = filesystem.create_dir_all(a, dir_path, 448);
+    if (sel mk.err) { ret nil; }
+    ret dir_path;
 }
 
-fun place_staged(a: *A.Allocator, set: *commit.Set) bool {
+fun skip_stage_dir(name: str) bool {
+    if (name == nil || name[0] == 0) { ret true; }
+    ret util.eq(name, ".git") || util.eq(name, ".qark") || util.eq(name, ".hg") || util.eq(name, ".svn") || util.eq(name, "node_modules") || util.eq(name, "target") || util.eq(name, "out") || util.eq(name, "__pycache__") || util.eq(name, ".venv");
+}
+
+fun copy_workspace_dir(a: *A.Allocator, src_root: str, dst_root: str, dir_rel: str, depth: i64) bool {
+    if (depth > 24) { ret true; }
+    var src_full: str = src_root;
+    if (dir_rel != nil && dir_rel[0] != 0) {
+        val j: res[str, A.Error] = pathx.native(a, src_root, dir_rel);
+        if (sel j.err) { ret false; }
+        src_full = j.ok;
+    }
+    val names: res[vector.Vector[str], filesystem.FsError] = filesystem.read_dir(a, src_full);
+    if (sel names.err) { ret true; }
     var i: usize = 0;
-    for (i < commit.count(set)) {
-        val e: *commit.Entry = commit.entry(set, i);
-        if (e.status == commit.ST_CREATE || e.status == commit.ST_REPLACE) {
-            var perm: i32 = 420;
-            if (e.existed && e.old_perm != 0) { perm = (e.old_perm & 511)::i32; }
-            var datap: *u8 = e.data;
-            if (datap == nil) { datap = ""; }
-            val wr: err[filesystem.FsError] = filesystem.replace_bytes_atomic(a, e.full, datap, e.len, perm, 493);
-            if (sel wr.err) {
-                unplace_staged(a, set, i);
-                ret false;
-            }
+    for (i < names.ok.len) {
+        val name: str = names.ok.data[i];
+        var rel: str = name;
+        if (dir_rel != nil && dir_rel[0] != 0) {
+            val jn: res[str, A.Error] = pathx.join(a, dir_rel, name);
+            if (sel jn.ok) { rel = jn.ok; }
         }
-        or (e.status == commit.ST_DELETE) {
-            filesystem.remove_file(e.full);
+        val child: res[str, A.Error] = pathx.native(a, src_root, rel);
+        if (sel child.ok) {
+            val m: res[filesystem.Metadata, io_error.Error] = filesystem.metadata_link(child.ok);
+            if (sel m.ok) {
+                if (m.ok.kind == filesystem.KIND_DIR) {
+                    if (!skip_stage_dir(name)) {
+                        val dst_dir: res[str, A.Error] = pathx.native(a, dst_root, rel);
+                        if (sel dst_dir.ok) {
+                            filesystem.create_dir_all(a, dst_dir.ok, 448);
+                            if (!copy_workspace_dir(a, src_root, dst_root, rel, depth + 1)) { ret false; }
+                        }
+                    }
+                }
+                or (m.ok.kind == filesystem.KIND_FILE && m.ok.size <= 33554432) {
+                    val dst_file: res[str, A.Error] = pathx.native(a, dst_root, rel);
+                    if (sel dst_file.ok) {
+                        val pr: res[str, A.Error] = path.parent(a, dst_file.ok);
+                        if (sel pr.ok) { filesystem.create_dir_all(a, pr.ok, 448); }
+                        val got: res[vector.Vector[u8], filesystem.FsError] = filesystem.read_bytes(a, child.ok);
+                        if (sel got.ok) {
+                            var datap: *u8 = got.ok.data;
+                            if (datap == nil) { datap = ""; }
+                            filesystem.write_bytes(dst_file.ok, datap, got.ok.len, 384);
+                        }
+                    }
+                }
+            }
         }
         i = i + 1;
     }
     ret true;
 }
 
+# build an isolated disposable staging tree with the workspace + candidate changes
+fun make_stage_tree(a: *A.Allocator, root: str, set: *commit.Set) str {
+    val stage_dir: str = make_temp_dir(a, "qark_stage");
+    if (stage_dir == nil) { ret nil; }
+    if (!copy_workspace_dir(a, root, stage_dir, "", 0)) {
+        filesystem.remove_all(a, stage_dir);
+        ret nil;
+    }
+    if (set != nil) {
+        var i: usize = 0;
+        for (i < commit.count(set)) {
+            val e: *commit.Entry = commit.entry(set, i);
+            if (e.status == commit.ST_CREATE || e.status == commit.ST_REPLACE) {
+                val dst: res[str, A.Error] = pathx.native(a, stage_dir, e.rel);
+                if (sel dst.err) {
+                    filesystem.remove_all(a, stage_dir);
+                    ret nil;
+                }
+                val pr: res[str, A.Error] = path.parent(a, dst.ok);
+                if (sel pr.ok) { filesystem.create_dir_all(a, pr.ok, 448); }
+                var datap: *u8 = e.data;
+                if (datap == nil) { datap = ""; }
+                val wr: err[filesystem.FsError] = filesystem.write_bytes(dst.ok, datap, e.len, 384);
+                if (sel wr.err) {
+                    filesystem.remove_all(a, stage_dir);
+                    ret nil;
+                }
+            }
+            or (e.status == commit.ST_DELETE) {
+                val dst: res[str, A.Error] = pathx.native(a, stage_dir, e.rel);
+                if (sel dst.ok) { filesystem.remove_file(dst.ok); }
+            }
+            i = i + 1;
+        }
+    }
+    ret stage_dir;
+}
+
 # .qark/checks.json maps an extension to a command. {file} is one file's new
-# bytes under .qark/preview. {root} is the workspace: those files are placed
-# at their real paths for the check and restored afterward, so a project
-# checker such as `mach check` sees the edit. a command with neither token
-# gets the preview path appended. agents cannot write .qark themselves.
-fun queue_project_checks(a: *A.Allocator, root: str, set: *commit.Set, runs: *vector.Vector[Run], want_root: bool) {
+# bytes under an isolated preview dir. {root} is an isolated staged workspace
+# tree so a project checker sees the edit without mutating the live workspace.
+fun queue_project_checks(a: *A.Allocator, root: str, stage_root: str, set: *commit.Set, runs: *vector.Vector[Run], want_root: bool) {
     val cfg_rel: res[str, A.Error] = pathx.native(a, root, ".qark/checks.json");
     if (sel cfg_rel.err) { ret; }
     val text: res[str, filesystem.FsError] = filesystem.read_string(a, cfg_rel.ok);
@@ -802,10 +894,12 @@ fun queue_project_checks(a: *A.Allocator, root: str, set: *commit.Set, runs: *ve
     val parsed: res[json.Value, json.JsonError] = json.parse(src, n, a);
     if (sel parsed.err) { ret; }
     var doc: json.Value = parsed.ok;
+    var eff_root: str = stage_root;
+    if (eff_root == nil) { eff_root = root; }
     var i: usize = 0;
     for (i < commit.count(set)) {
         val e: *commit.Entry = commit.entry(set, i);
-        if (pending(e) && e.lang == nil) {
+        if (pending(e)) {
             val ext: str = path.extension(e.rel);
             val spec: opt[*json.Value] = json.value_find(?doc, ext);
             if (sel spec.some) {
@@ -832,7 +926,7 @@ fun queue_project_checks(a: *A.Allocator, root: str, set: *commit.Set, runs: *ve
                                             buf.ok[n] = 0;
                                             if (util.eq(buf.ok, "{root}")) {
                                                 is_root = true;
-                                                argv[argc] = root;
+                                                argv[argc] = eff_root;
                                             }
                                             or (util.eq(buf.ok, "{file}")) {
                                                 has_file = true;
@@ -847,10 +941,13 @@ fun queue_project_checks(a: *A.Allocator, root: str, set: *commit.Set, runs: *ve
                                 }
                                 or { bad = true; }
                             }
+                            or { bad = true; }
                         }
                         w = w + 1;
                     }
                     if (!bad && argc > 0 && is_root == want_root) {
+                        e.custom_check = true;
+                        if (e.lang == nil) { e.lang = ext; }
                         if (is_root) {
                             var found: i64 = -1;
                             var k: usize = 0;
@@ -860,14 +957,13 @@ fun queue_project_checks(a: *A.Allocator, root: str, set: *commit.Set, runs: *ve
                             }
                             if (found >= 0) {
                                 vector.push[usize](?runs.data[found::usize].items, i);
-                                e.lang = ext;
                             }
                             or {
                                 var r: Run;
                                 r.lang = ext;
                                 r.external = true;
                                 r.stage = true;
-                                r.cwd = root;
+                                r.cwd = eff_root;
                                 r.argc = argc;
                                 var c: usize = 0;
                                 for (c < argc) {
@@ -877,18 +973,17 @@ fun queue_project_checks(a: *A.Allocator, root: str, set: *commit.Set, runs: *ve
                                 r.argv[argc] = nil;
                                 r.items = vector.init[usize](a);
                                 vector.push[usize](?r.items, i);
-                                e.lang = ext;
                                 vector.push[Run](runs, r);
                             }
                         }
                         or {
-                            val rel: res[str, A.Error] = pathx.join(a, ".qark/preview", e.rel);
-                            if (sel rel.ok) {
-                                val full: res[str, A.Error] = pathx.native(a, root, rel.ok);
+                            val pdir: str = make_temp_dir(a, "qark_prev");
+                            if (pdir != nil) {
+                                val full: res[str, A.Error] = pathx.native(a, pdir, e.rel);
                                 if (sel full.ok) {
                                     val parent: res[str, A.Error] = path.parent(a, full.ok);
-                                    if (sel parent.ok) { filesystem.create_dir_all(a, parent.ok, 493); }
-                                    val wr: err[filesystem.FsError] = filesystem.write_bytes(full.ok, e.data, e.len, 420);
+                                    if (sel parent.ok) { filesystem.create_dir_all(a, parent.ok, 448); }
+                                    val wr: err[filesystem.FsError] = filesystem.write_bytes(full.ok, e.data, e.len, 384);
                                     if (sel wr.ok) {
                                         var c: usize = 0;
                                         for (c < argc) {
@@ -903,7 +998,7 @@ fun queue_project_checks(a: *A.Allocator, root: str, set: *commit.Set, runs: *ve
                                         r.lang = ext;
                                         r.external = true;
                                         r.cwd = root;
-                                        r.preview = full.ok;
+                                        r.preview = pdir;
                                         r.argc = argc;
                                         c = 0;
                                         for (c < argc) {
@@ -913,10 +1008,11 @@ fun queue_project_checks(a: *A.Allocator, root: str, set: *commit.Set, runs: *ve
                                         r.argv[argc] = nil;
                                         r.items = vector.init[usize](a);
                                         vector.push[usize](?r.items, i);
-                                        e.lang = ext;
                                         vector.push[Run](runs, r);
                                     }
+                                    or { filesystem.remove_all(a, pdir); }
                                 }
+                                or { filesystem.remove_all(a, pdir); }
                             }
                         }
                     }
@@ -966,7 +1062,7 @@ pub fun run(a: *A.Allocator, keep: *A.Allocator, root: str, set: *commit.Set, to
         }
         i = i + 1;
     }
-    queue_project_checks(a, root, set, ?runs, false);
+    queue_project_checks(a, root, nil, set, ?runs, false);
     var k: usize = 0;
     for (k < runs.len) {
         val r: *Run = ?runs.data[k];
@@ -994,7 +1090,7 @@ pub fun run(a: *A.Allocator, keep: *A.Allocator, root: str, set: *commit.Set, to
             }
         }
         if (r.started) { finish_run(a, set, r); }
-        if (r.preview != nil) { filesystem.remove_file(r.preview); }
+        if (r.preview != nil) { filesystem.remove_all(a, r.preview); }
         k = k + 1;
     }
 }
@@ -1008,21 +1104,23 @@ pub fun has_staged(a: *A.Allocator, root: str, set: *commit.Set) bool {
     ret true;
 }
 
-# project checkers whose command names {root}. the new bytes are placed at
-# their real paths for the check and the previous bytes are put back before
-# this returns, whether the checker accepts or refuses.
+# project checkers whose command names {root}. candidate changes are validated
+# in an isolated staging tree so the live workspace is never mutated before commit.
 pub fun run_staged(a: *A.Allocator, root: str, set: *commit.Set, timeout_ms: i64) {
-    var runs: vector.Vector[Run] = vector.init[Run](a);
-    queue_project_checks(a, root, set, ?runs, true);
-    if (runs.len == 0) { ret; }
-    if (!place_staged(a, set)) {
+    var probe_runs: vector.Vector[Run] = vector.init[Run](a);
+    queue_project_checks(a, root, root, set, ?probe_runs, true);
+    if (probe_runs.len == 0) { ret; }
+    val stage_dir: str = make_stage_tree(a, root, set);
+    if (stage_dir == nil) {
         var f: usize = 0;
-        for (f < runs.len) {
-            fail_all(set, ?runs.data[f], "the project checker could not stage the new files");
+        for (f < probe_runs.len) {
+            fail_all(set, ?probe_runs.data[f], "the project checker could not stage the new files");
             f = f + 1;
         }
         ret;
     }
+    var runs: vector.Vector[Run] = vector.init[Run](a);
+    queue_project_checks(a, root, stage_dir, set, ?runs, true);
     var k: usize = 0;
     for (k < runs.len) {
         val r: *Run = ?runs.data[k];
@@ -1035,7 +1133,7 @@ pub fun run_staged(a: *A.Allocator, root: str, set: *commit.Set, timeout_ms: i64
         if (r.started) { finish_run(a, set, r); }
         k = k + 1;
     }
-    unplace_staged(a, set, commit.count(set));
+    filesystem.remove_all(a, stage_dir);
 }
 
 pub fun check_name(ck: u8) str {
@@ -1046,19 +1144,56 @@ pub fun check_name(ck: u8) str {
     ret "none";
 }
 
-# run a project-wide validation command against the staged workspace before commit
+fun mark_project_failed(set: *commit.Set, msg: str, ln: i64, col: i64) {
+    if (set == nil) { ret; }
+    var ci: usize = 0;
+    for (ci < commit.count(set)) {
+        val e: *commit.Entry = commit.entry(set, ci);
+        if (pending(e)) {
+            e.check = commit.CK_FAILED;
+            e.ck_cat = "project_check";
+            e.ck_msg = msg;
+            if (ln > 0) { e.ck_line = ln; }
+            if (col > 0) { e.ck_col = col; }
+        }
+        ci = ci + 1;
+    }
+}
+
+# run a project-wide validation command against an isolated staged workspace before commit
 pub fun run_project_validation(a: *A.Allocator, root: str, set: *commit.Set, val_spec: *json.Value, timeout_ms: i64, ran: *bool, out_msg: *str) bool {
     @ran = false;
     @out_msg = nil;
-    if (val_spec != nil && json.value_is_bool(val_spec) && !json.value_bool(val_spec)) {
+    if (val_spec == nil) { ret true; }
+    if (json.value_is_bool(val_spec) && !json.value_bool(val_spec)) {
         ret true;
     }
     var cmd_arr: *json.Value = nil;
+    var eff_timeout: i64 = timeout_ms;
     var doc: json.Value;
-    if (val_spec != nil && json.value_is_array(val_spec)) {
+    if (json.value_is_array(val_spec)) {
         cmd_arr = val_spec;
     }
-    or {
+    or (json.value_is_object(val_spec)) {
+        val cf: opt[*json.Value] = json.value_find(val_spec, "cmd");
+        if (sel cf.some) {
+            if (json.value_is_array(cf.some)) { cmd_arr = cf.some; }
+        }
+        val tf: opt[*json.Value] = json.value_find(val_spec, "timeout_ms");
+        if (sel tf.some) {
+            if (json.value_is_number(tf.some)) {
+                val tv: i64 = json.value_number(tf.some);
+                if (tv > 0) { eff_timeout = tv; }
+            }
+        }
+        if (cmd_arr == nil) {
+            @ran = true;
+            @out_msg = "validate object must provide a non-empty cmd string array";
+            mark_project_failed(set, @out_msg, 0, 0);
+            ret false;
+        }
+    }
+    or (json.value_is_bool(val_spec) && json.value_bool(val_spec)) {
         val cfg_rel: res[str, A.Error] = pathx.native(a, root, ".qark/checks.json");
         if (sel cfg_rel.ok) {
             val text: res[str, filesystem.FsError] = filesystem.read_string(a, cfg_rel.ok);
@@ -1075,25 +1210,68 @@ pub fun run_project_validation(a: *A.Allocator, root: str, set: *commit.Set, val
                     val pf: opt[*json.Value] = json.value_find(?doc, "project");
                     if (sel pf.some) {
                         if (json.value_is_array(pf.some)) { cmd_arr = pf.some; }
+                        or (json.value_is_object(pf.some)) {
+                            val pcf: opt[*json.Value] = json.value_find(pf.some, "cmd");
+                            if (sel pcf.some) {
+                                if (json.value_is_array(pcf.some)) { cmd_arr = pcf.some; }
+                            }
+                        }
                     }
                     if (cmd_arr == nil) {
                         val sf: opt[*json.Value] = json.value_find(?doc, "*");
                         if (sel sf.some) {
                             if (json.value_is_array(sf.some)) { cmd_arr = sf.some; }
+                            or (json.value_is_object(sf.some)) {
+                                val scf: opt[*json.Value] = json.value_find(sf.some, "cmd");
+                                if (sel scf.some) {
+                                    if (json.value_is_array(scf.some)) { cmd_arr = scf.some; }
+                                }
+                            }
                         }
                     }
                 }
+                or {
+                    @ran = true;
+                    @out_msg = ".qark/checks.json is not valid json";
+                    mark_project_failed(set, @out_msg, 0, 0);
+                    ret false;
+                }
             }
         }
+        if (cmd_arr == nil) {
+            @ran = true;
+            @out_msg = "validate:true requested, but no project validator is configured in .qark/checks.json";
+            mark_project_failed(set, @out_msg, 0, 0);
+            ret false;
+        }
     }
-    if (cmd_arr == nil) { ret true; }
+    or {
+        @ran = true;
+        @out_msg = "validate must be a boolean, a command array, or an object with cmd";
+        mark_project_failed(set, @out_msg, 0, 0);
+        ret false;
+    }
     val words: usize = json.value_count(cmd_arr);
-    if (words == 0 || words >= 11) { ret true; }
+    if (words == 0 || words >= 11) {
+        @ran = true;
+        @out_msg = "project validator command must have between 1 and 10 arguments";
+        mark_project_failed(set, @out_msg, 0, 0);
+        ret false;
+    }
+    val stage_dir: str = make_stage_tree(a, root, set);
+    if (stage_dir == nil) {
+        @ran = true;
+        @out_msg = "project validator could not stage workspace files";
+        mark_project_failed(set, @out_msg, 0, 0);
+        ret false;
+    }
     var argv: [12]*u8;
     var argc: usize = 0;
     var w: usize = 0;
+    var bad_arg: bool = false;
     for (w < words && argc < 11) {
         val g: opt[*json.Value] = json.value_get(cmd_arr, w);
+        var arg_ok: bool = false;
         if (sel g.some) {
             if (json.value_is_string(g.some)) {
                 var raw_n: usize = 0;
@@ -1103,50 +1281,56 @@ pub fun run_project_validation(a: *A.Allocator, root: str, set: *commit.Set, val
                     val dec: res[usize, json.JsonError] = json.value_string_decode(g.some, buf.ok, raw_n + 1);
                     if (sel dec.ok) {
                         buf.ok[dec.ok] = 0;
-                        if (util.eq(buf.ok, "{root}")) { argv[argc] = root; }
-                        or { argv[argc] = buf.ok; }
-                        argc = argc + 1;
+                        if (buf.ok[0] != 0 || argc > 0) {
+                            if (util.eq(buf.ok, "{root}")) { argv[argc] = stage_dir; }
+                            or { argv[argc] = buf.ok; }
+                            argc = argc + 1;
+                            arg_ok = true;
+                        }
                     }
                 }
             }
         }
+        if (!arg_ok) { bad_arg = true; }
         w = w + 1;
     }
-    if (argc == 0) { ret true; }
+    if (bad_arg || argc == 0 || argc != words) {
+        filesystem.remove_all(a, stage_dir);
+        @ran = true;
+        @out_msg = "project validator command arguments must be non-empty strings";
+        mark_project_failed(set, @out_msg, 0, 0);
+        ret false;
+    }
     argv[argc] = nil;
     val found: res[str, exec.Error] = exec.resolve(a, argv[0]);
     if (sel found.err) {
+        filesystem.remove_all(a, stage_dir);
         @ran = true;
         @out_msg = "project validator program was not found on PATH";
+        mark_project_failed(set, @out_msg, 0, 0);
         ret false;
     }
     argv[0] = found.ok;
-    var staged: bool = false;
-    if (set != nil && commit.dirty(set)) {
-        if (!place_staged(a, set)) {
-            @ran = true;
-            @out_msg = "project validator could not stage modified files";
-            ret false;
-        }
-        staged = true;
-    }
     @ran = true;
     var job: runner.Job;
-    val started: err[exec.Error] = runner.start(a, ?argv[0], root, nil, 0, timeout_ms, ?job);
+    val started: err[exec.Error] = runner.start(a, ?argv[0], stage_dir, nil, 0, eff_timeout, ?job);
     if (sel started.err) {
-        if (staged) { unplace_staged(a, set, commit.count(set)); }
+        filesystem.remove_all(a, stage_dir);
         @out_msg = "project validator could not be started";
+        mark_project_failed(set, @out_msg, 0, 0);
         ret false;
     }
     val done: res[runner.RunResult, exec.Error] = runner.finish(a, ?job);
-    if (staged) { unplace_staged(a, set, commit.count(set)); }
+    filesystem.remove_all(a, stage_dir);
     if (sel done.err) {
         @out_msg = "project validator failed to run";
+        mark_project_failed(set, @out_msg, 0, 0);
         ret false;
     }
     val out: runner.RunResult = done.ok;
     if (out.timed_out) {
         @out_msg = "project validator timed out";
+        mark_project_failed(set, @out_msg, 0, 0);
         ret false;
     }
     if (out.exit != 0) {
@@ -1157,19 +1341,7 @@ pub fun run_project_validation(a: *A.Allocator, root: str, set: *commit.Set, val
         var ln: i64 = 0;
         var col: i64 = 0;
         parse_colon_loc(diag, ?ln, ?col);
-        if (set != nil) {
-            var ci: usize = 0;
-            for (ci < commit.count(set)) {
-                val e: *commit.Entry = commit.entry(set, ci);
-                if (pending(e)) {
-                    e.check = commit.CK_FAILED;
-                    e.ck_msg = @out_msg;
-                    if (ln > 0) { e.ck_line = ln; }
-                    if (col > 0) { e.ck_col = col; }
-                }
-                ci = ci + 1;
-            }
-        }
+        mark_project_failed(set, @out_msg, ln, col);
         ret false;
     }
     @out_msg = "ok";

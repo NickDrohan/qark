@@ -13,12 +13,12 @@ Sending the same request twice is safe: files that already hold the same bytes r
 
 | How | Start | Calls |
 | --- | --- | --- |
-| MCP | `qark mcp [--root <workspace>]` | `qark_apply`, `qark_edit`, `qark_read`, `qark_search`, `qark_impact`, `qark_undo`, `qark_check`, `qark_templates`, `qark_define_template`; plus resources (`qark://capabilities`, `qark://schema`, `qark://undo`, `qark://events`) and prompts (`qark-edit-symbol`, `qark-refactor`) |
-| NDJSON | `qark --headless --stdio --root <workspace>` | one `{"id":1,"op":"apply","args":{...}}` per line; ops `apply`, `undo`, `redo`, `read`, `search`, `impact`, `events`, `project.validate`, `capabilities`, `schema`, `release.sign`, `release.verify`, `template.list`, `template.define`, `template.render`, `job.verify`, `session.info` |
-| CLI | `qark apply spec.json --root <workspace>` (`-` reads stdin, `--dry-run` writes nothing; `qark undo [txn] [--steps N]`, `qark redo`, `qark impact <sym>`, `qark events`, `qark check`, `qark release sign\|verify <dir>`, `qark --dump capabilities\|schema`) | prints `{"ok":true,"result":...}` or `{"ok":false,"error":...}` |
-| `qa` CLI | `qa [--root <workspace>] ...` | `qa read <path> [first last \| --outline \| --fold [sym...] \| <symbol>...]`, `qa -e <path> \| -g <glob> (-f/-F -r \| -B/-A/-S -W \| -x \| -k)`, `qa s <pat> [glob]`, `qa impact <sym> [glob]`, `qa undo\|redo [txn]`, `qa -w dst=src` |
+| MCP | `qark mcp [--root <workspace>] [--lock-root] [--require-check]` | `qark_apply`, `qark_edit`, `qark_read`, `qark_search`, `qark_impact`, `qark_undo`, `qark_check`, `qark_templates`, `qark_define_template`; plus resources (`qark://capabilities`, `qark://schema`, `qark://undo`, `qark://events`) and prompts (`qark-edit-symbol`, `qark-refactor`) |
+| NDJSON | `qark --headless --stdio --root <workspace> [--lock-root] [--require-check]` | one `{"id":1,"op":"apply","args":{...}}` per line; ops `apply`, `undo`, `redo`, `read`, `search`, `impact`, `events`, `project.validate`, `capabilities`, `schema`, `release.sign`, `release.verify`, `template.list`, `template.define`, `template.render`, `job.verify`, `session.info` |
+| CLI | `qark apply spec.json --root <workspace>` (`-` reads stdin, `--dry-run` writes nothing; `qark undo [txn] [--steps N]`, `qark redo`, `qark impact <sym>`, `qark events`, `qark check`, `qark release sign\|verify <dir> --key <key>`, `qark --dump capabilities\|schema`) | prints `{"ok":true,"result":...}` or `{"ok":false,"error":...}` |
+| `qa` CLI | `qa [--root <workspace>] ...` | `qa read <path> [first last \| --outline \| --fold [sym...] \| <symbol>...]`, `qa -e <path> \| -g <glob> (-f/-F -r \| -B/-A/-S -W \| -x \| -k)`, `qa s <pat> [glob]`, `qa impact <sym> [glob]`, `qa undo\|redo [txn]`, `qa [--dry] -w dst=src` |
 
-Paths are relative to the workspace root, with `/` or `\`. When you pass an absolute path that lies inside the workspace root (e.g. `D:\Dev\Project\src\main.py`), Qark automatically strips the workspace root prefix (`src/main.py`). Every MCP tool and NDJSON op also accepts an optional `"root": "<dir>"` parameter to target a specific workspace on the fly (and MCP `initialize` automatically picks up `rootPath` / `rootUri` / `workspaceFolders`). Qark refuses paths outside the workspace root, `..`, `:` streams, device names such as `NUL`, trailing dots or spaces, and anything under `.git` or `.qark`.
+Paths are relative to the workspace root, with `/` or `\`. When you pass an absolute path that lies inside the workspace root (e.g. `D:\Dev\Project\src\main.py`), Qark automatically strips the workspace root prefix (`src/main.py`). Every MCP tool and NDJSON op also accepts an optional `"root": "<dir>"` parameter to target a specific workspace for that single call without mutating the session root (unless `--lock-root` is passed at startup, which refuses `session.set_root` and per-call `root` overrides with `root_locked`). Passing `--require-check` at startup locks the session's minimum check policy so callers cannot downgrade checking to `"permissive"` or `false`. Qark refuses paths outside the workspace root, symlinks, `..`, `:` streams, device names such as `NUL`, trailing dots or spaces, and anything under `.git` or `.qark`.
 
 ## MCP Tools at a Glance
 
@@ -120,17 +120,20 @@ Or pass multiple edits in order with `edits`:
 
 - `find` must match exactly once (`replace` or `with` holds the replacement text). `occurrence: N` picks the Nth match (`-1` is the last), `count: N` expects exactly N and replaces them all, `all: true` replaces every match.
 - `find_re` matches with the qark regex dialect (`. [] () | * + ? {} ^ $ \b \< \> \d \w \s \n \r \t`); the replacement may use `\0` for the whole match and `\1`-`\9` for captures, e.g. `{"find_re": "def (\\w+)\\(", "replace": "def \\1_v2("}` (single-escaped `\w` and `\1` in raw JSON are also accepted).
-- `symbol` targets a named function, method (`Parent.method`), class, record, struct, enum, trait, or section directly using AST/lexer-aware brace and indentation boundary detection (never swallowing trailing top-level Python code or next-symbol decorators):
+- `symbol` targets a named function, method (`Parent.method`), class, record, struct, enum, trait, or section directly using AST/lexer-aware brace and indentation boundary detection (never swallowing trailing top-level Python code or next-symbol decorators, and handling single-line functions and JS class methods):
   - `{"symbol": "name", "with": "..."}` replaces the whole symbol span (keeping leading `@decorator` / `#[attr]` lines unless the replacement provides its own).
-  - `{"symbol": "name", "body": "..."}` replaces **only** the symbol's body while keeping its declaration signature and closing `}` intact, auto-indenting the body lines.
+  - `{"symbol": "name", "body": "..."}` replaces **only** the symbol's body while keeping its declaration signature and closing `}` intact, auto-indenting the body lines (works for both multi-line and single-line declarations).
   - `{"symbol": "name", "signature": "..."}` replaces **only** the declaration signature lines while keeping the body intact.
-  - `{"symbol": "name", "rename": "new_name"}` renames the symbol declaration and all identifier-boundary occurrences inside its scope.
+  - `{"symbol": "name", "rename": "new_name"}` renames the symbol declaration and all code-token occurrences inside its scope (skipping strings and comments).
+  - Optional `"expect_signature": "def double(x):"` verifies the target symbol's current declaration header before applying `body`, `signature`, `rename`, or `with`, refusing with `signature_mismatch` if the signature drifted.
   - Adding `"symbol": "name"` (or `"within": {"symbol": "name"}`) to any `find`, `find_re`, `ex`, or `keys` edit restricts it to that symbol.
-- `contract` enforces method and line scope guardrails on a file entry or top-level spec:
-  - `{"contract": {"symbols": ["total", "count"], "preserve_signatures": true, "max_lines_changed": 25, "forbid_delete": true}}` (also accepts `"symbol": "name"`, `"methods": [...]`, or `"lines": [first, last]`).
-  - Qark verifies byte-for-byte that no bytes outside the permitted symbols or line range were modified, that signatures were preserved when `preserve_signatures: true`, and that line deltas stay within `max_lines_changed`, refusing with `contract_violation` before anything touches disk.
+- `contract` (or alias `scope`) enforces method and line scope guardrails on a file entry, glob entry, or top-level spec (when both top-level and per-entry contracts are given, both are enforced):
+  - `{"contract": {"symbols": ["total", "count"], "preserve_signatures": true, "max_lines_changed": 25, "forbid_delete": true}}` (also accepts `"symbol": "name"`, `"methods": [...]`, `"lines": [first, last]`, or `"max_changed_lines": 25`). Unknown contract fields are refused with `contract_bad`.
+  - Qark verifies byte-for-byte that no bytes outside the permitted symbols or line range were modified, that declaration headers were preserved when `preserve_signatures: true`, and that hunk line deltas stay within `max_lines_changed`, refusing with `contract_violation` or `contract_scope` before anything touches disk.
+- `require_expect: true` at the top level refuses any transaction that modifies or deletes an existing file without an explicit `expect` SHA-256 (`expect_required`).
+- `idempotency_key: "<key>"` deduplicates retried transactions across reconnects: if the key was already committed with the same `spec_sha256`, Qark replays the stored receipt with `"replayed": true` without touching disk; if the spec differs, Qark refuses with `idempotency_mismatch`.
 - `rebase: true` performs deterministic 3-way proposal rebasing when `expect` is set and another agent or process modified the file concurrently:
-  - Qark looks up the base version matching `expect` in `.qark/undo` (or uses explicit `base_text`), computes a 3-way line merge between `Base`, `Current` (on disk), and `Proposed`, and commits the merged result with `"rebased": true` and `"base_sha256"` in the file receipt — or refuses with `rebase_conflict` if both modified the same lines.
+  - Qark looks up the base version matching `expect` in `.qark/undo` (or verifies explicit `base_text` against `expect`, refusing with `rebase_base_mismatch` or `base_unavailable` when the base cannot be verified), computes a 3-way line merge between `Base`, `Current` (on disk), and `Proposed`, and commits the merged result with `"rebased": true` and `"base_sha256"` in the file receipt — or refuses with `rebase_conflict` if both modified the same lines.
 - `within` scopes any `find`, `find_re`, `ex`, or `keys` edit to part of the file: `[first, last]` lines, a string, or `{"find"|"find_re"|"symbol": ..., "occurrence": N}` naming the span.
 - `insert_before`/`insert_after` take a 1-based line number, or an anchor: `"text"` or `{"find"|"find_re"|"symbol": ..., "occurrence": N}` -- the insert lands on the line before/after the line or symbol span holding the match. Use `with` for the inserted text, and set `"auto_indent": true` to automatically indent every inserted line to match the anchor line's leading whitespace.
 - Line endings never need to match the file's: `find`, `within`, and string anchors written with `\n` match a CRLF file. Inserted and replacement text is written with the file's own endings, and the file's receipt `notes` says when matching was normalized. A `find_re` that only fails on line endings gets an error naming `\r\n`.
@@ -162,7 +165,7 @@ To refactor across multiple files at once, use `"glob"` instead of `"path"` (`{"
 - Matches come grouped per file with that file's `sha256` and each match's enclosing `symbol` (when inside a function, class, or record), so a follow-up edit can target that symbol or `expect` the hash directly.
 - It skips `.git`, `.qark`, `node_modules`, and build output unless `all` is true, and skips binary or >4 MiB files.
 
-`read` with `"outline": true` adds a `symbols` list — functions, classes, records, structs, enums, traits, interfaces, types, and sections with `line`/`end`/`kind`/`name` — without needing the file's text. `read` with `"symbol": "<name>"` (or `"Parent.method"`) returns only that symbol's span (`first_line`, `last_line`, `text`, and the whole file's `sha256`), or lists `available_symbols` when not found. Pass `"symbols": ["sym1", "sym2"]` to read several symbols at once (returned in `spans` and `text`). Pass `"fold": true` (optionally with `"symbol"` or `"symbols"` to keep specific functions expanded) for a compact signature-folded view of the file that keeps all imports, types, and function signatures while folding function bodies into `# ... [lines X-Y folded: name]`.
+`read` with `"outline": true` (or `"symbols": true, "content": false`) adds a `symbols` list — functions, methods (with `parent`), classes, records, structs, enums, traits, interfaces, types, and sections with `line`/`end`/`kind`/`name` — without needing the file's text. `read` with `"symbol": "<name>"` (or `"Parent.method"`) returns only that symbol's span (`first_line`, `last_line`, `text`, and the whole file's `sha256`), or lists `available_symbols` when not found. Pass `"symbols": ["sym1", "sym2"]` to read several symbols at once (returned in `spans` and `text`). Pass `"fold": true` (optionally with `"symbol"` or `"symbols"` to keep specific functions expanded) for a compact signature-folded view of the file that keeps all imports, types, and function signatures while folding function bodies into `# ... [lines X-Y folded: name]`.
 
 `impact` (NDJSON `impact`, CLI `qark impact <symbol> [glob]`, or `qark_search` with `"impact": true` / `"impact": "<symbol>"`) computes a resolved reference and impact graph across the workspace:
 - Returns `definitions` (path, line, end, kind, sha256), `references` (every call/reference site with its enclosing `symbol`, `line`, `col`, and `sha256`), `imports` and `dependents` (when `"path"` is also given), `affected_files`, and `affected_symbols` (`path:symbol`).
@@ -189,8 +192,8 @@ Every changed source file in a receipt (both `dry_run` and committed) includes a
 
 Pass `"stream": true` on `apply` to include per-phase transaction timing and status events (`compile`, `observe`, `check`, `validate`, `commit`) in `receipt.events`. Call `{"op": "events", "args": {"since_offset": 0}}` (or `qark events`) to stream committed transaction events from `.qark/journal.ndjson`.
 
-Every apply that writes to disk saves a persistent snapshot under `.qark/undo/<txn>.json` (holding both `old_text` and `new_text` plus `prev_txn`).
-- Revert the latest transaction (or walk back N transactions with `"steps": N`): `{"op": "undo", "args": {"steps": 1}}` (or `qark_apply` with `{"undo": true}`, or `qark undo [--steps N]`).
+Every apply that writes to disk saves a persistent snapshot under `.qark/undo/<txn>.json` and a write-ahead log (`.qark/wal.json`) before publishing, recovering automatically if interrupted mid-commit.
+- Revert the latest transaction (or walk back N transactions atomically with `"steps": N`): `{"op": "undo", "args": {"steps": 1}}` (or `qark_apply` with `{"undo": true}`, or `qark undo [--steps N]`).
 - Redo an undone transaction: `{"op": "redo", "args": {}}` (or `{"op": "undo", "args": {"redo": true}}`, `qark_apply` with `{"redo": true}`, or `qark redo`).
 - Inspect the undo stack and available `redo_txn`: `{"op": "undo", "args": {"list": true}}` (or `qark undo --list`).
 
@@ -198,7 +201,7 @@ Every apply that writes to disk saves a persistent snapshot under `.qark/undo/<t
 
 - Discover capabilities: `{"op": "capabilities"}` or `qark --dump capabilities` returns version, supported features, symbol edit modes, contract fields, operations, languages, limits, and active checkers.
 - Discover schemas: `{"op": "schema", "args": {"op": "apply"}}` or `qark --dump schema` returns machine-readable operation and contract schemas.
-- Sign and verify releases: `qark release sign <dir> [--key <key>]` (NDJSON `release.sign`) hashes every release artifact, writes `SHA256SUMS` and a keyed HMAC-SHA256 signed `RELEASE.json`. `qark release verify <dir> [--key <key>]` (NDJSON `release.verify`) verifies `SHA256SUMS`, the cryptographic signature, and every file's SHA-256, refusing with `release_tampered` or `release_bad_signature` if any byte was altered.
+- Sign and verify releases: `qark release sign <dir> --key <key>` (NDJSON `release.sign`, or set `QARK_RELEASE_KEY`) hashes every release artifact, writes `SHA256SUMS` and a keyed RFC 2104 HMAC-SHA256 signed `RELEASE.json`. `qark release verify <dir> --key <key>` (NDJSON `release.verify`) verifies `SHA256SUMS` 1-for-1 against `RELEASE.json.files`, the cryptographic signature, and every file's SHA-256, refusing with `release_tampered`, `release_bad_signature`, or `release_key_required`.
 
 ## The receipt & validation completeness
 
@@ -211,11 +214,11 @@ Every apply that writes to disk saves a persistent snapshot under `.qark/undo/<t
  "ms": {"compile": 0.5, "check": 8.1, "commit": 5.2, "total": 13.8}}
 ```
 
-- **Fail-closed checkers (`check_policy`)**: By default (`"check": true` / `"strict"`), Qark installs its Node helper as `.qark/checkers/check.cjs` (isolated from workspace `"type": "module"` settings while respecting `.js`/`.mjs`/`.cjs` and nearest `package.json` semantics) and fails closed on both source syntax errors (`code: "check_failed"`, `check: "failed"`) and checker infrastructure crashes/timeouts/malformed output (`code: "checker_error"`, `check: "error"`, with bounded `checker_diagnostics`). Pass `"check": "required"` to also refuse missing language runtimes (`check_unavailable`), `"check": "permissive"` to explicitly allow checker crashes as skipped (`validation_complete: false`), or `false` (`"off"`).
-- **`validation_complete`**: `true` only when `check_policy` is `"strict"` or `"required"`, at least one file was checked (`checks.ok > 0`), and `failed == 0`, `error == 0`, `skipped == 0`, and `unchecked == 0`.
+- **Fail-closed checkers (`check_policy`)**: By default (`"check": true` / `"strict"`), Qark installs its Node helper as `.qark/checkers/check.cjs` (isolated from workspace `"type": "module"` settings while respecting `.js`/`.mjs`/`.cjs`, Node's CommonJS module wrapper, and nearest or batch-staged `package.json` semantics) and fails closed on both source syntax errors (`code: "check_failed"`, `check: "failed"`) and checker infrastructure crashes/timeouts/malformed output (`code: "checker_error"`, `check: "error"`, with bounded `checker_diagnostics`). Pass `"check": "required"` (top-level or per-file) to also refuse missing language runtimes or unsupported file types (`check_unavailable`), `"check": "permissive"` to explicitly allow checker crashes as skipped (`validation_complete: false`), or `false` (`"off"`).
+- **`validation_complete`**: `true` only when `check_policy` is `"strict"` or `"required"`, at least one file was checked (`checks.ok > 0`, or project validation passed), and `failed == 0`, `error == 0`, `skipped == 0`, and `unchecked == 0`.
 - **`changed_lines`**: `[first_line, last_line]` (1-based inclusive) on every created or replaced file in the receipt and in `.qark/journal.ndjson` (`event: "transaction.committed"`).
 - Each file's `notes` reports advisory detail, such as line endings normalized to match or spec keys Qark ignored. Top-level `warnings` lists unrecognized spec keys — how a misspelled key like `expct` surfaces instead of silently doing nothing.
-- Every apply that changes the disk appends one line to `.qark/journal.ndjson` (who, what, hashes, `validation_complete`, `changed_lines`), so other agents and editors can follow what changed. See `docs/autocode-integration.md` for the full editor/orchestrator integration contract.
+- Every apply that changes the disk appends one line to `.qark/journal.ndjson` (who, what, hashes, `validation_complete`, `changed_lines`), so other agents and editors can follow what changed. See `docs/autocode-integration.md` and `scripts/client/qark-session.mjs` for the full editor/orchestrator integration contract and reference Node.js client.
 
 ## When Qark refuses
 
@@ -226,20 +229,25 @@ Nothing was written. Every refusal has a `code` and a `message`. Edit failures a
 | `conflict`, reason `exists` | the file is there with other bytes | edit it, or `mode: replace` with `expect` set to the `current_sha256` in the reply |
 | `conflict`, reason `stale` | the file changed since you read it | read it again (or pass `rebase: true` for 3-way merge) |
 | `conflict`, reason `missing` | replace, delete, or edit of a missing file | `create` it instead |
-| `check_failed` | a file has a syntax error (including duplicate `let`/`const` in JS) | fix the `line` and `col` named per file |
+| `expect_required` | `require_expect: true` and an existing file had no `expect` | pass `expect: "<current_sha256>"` |
+| `idempotency_mismatch` | `idempotency_key` was reused with a different spec | use a new `idempotency_key` or resend the original spec |
+| `check_failed` | a file has a syntax error (including duplicate `let`/`const` in JS) or project validation failed | fix the `line` and `col` named per file |
 | `checker_error` | a language checker crashed, timed out, or returned malformed output | inspect `checker_diagnostics` (`category`, `executable`, `exit_code`, `stderr`, `affected_files`); nothing was written |
+| `check_unavailable` | `check: "required"` and no checker/runtime is available for a file | install the runtime or use `check: "strict"` |
 | `tmpl_var` | a template names a variable that is not there | use one of the names listed after "visible here" |
 | `tmpl_code` | a `{{ }}` tag holds code, or the file needs literal `{{` | use a variable with filters, or write `\{{` for literal braces |
 | `tmpl_syntax`, `tmpl_unknown`, `tmpl_filter`, `tmpl_type` | a template is malformed, missing, or misused | the message names the line and the fix |
 | `spec_each`, `spec_each_path`, `duplicate_path` | `each` names no list, or two files land on one path | put a list in `vars`, and an item variable in `path` |
+| `spec_glob_unsupported` | a `glob` entry used `expect`, `rebase`, `move`, `delete`, `path`, or `each` | use per-file entries for those fields |
 | `edit_not_found`, `edit_ambiguous`, `edit_range` | an edit did not match, matched multiple times, or is out of bounds | inspect `mismatch_category` (`near_miss`, `whitespace`, `crlf`, `ambiguous`, `out_of_bounds`), `line`, `col`, `target_lines`, and `actual_line` to repair in one turn |
-| `contract_violation` | an edit modified lines or signatures outside `contract` | keep edits inside `contract.symbols` / `contract.lines` |
-| `rebase_conflict` | concurrent edits overlap with a stale `expect` proposal | read the latest file and re-apply |
+| `signature_mismatch` | `expect_signature` did not match the target symbol's declaration header | read the symbol's current signature and retry |
+| `contract_violation`, `contract_bad` | an edit modified lines or signatures outside `contract`, or `contract` has unknown keys | keep edits inside `contract.symbols` / `contract.lines` |
+| `rebase_conflict`, `rebase_base_mismatch`, `base_unavailable` | concurrent edits overlap, `base_text` does not match `expect`, or base snapshot is unavailable | read the latest file and re-apply |
 | `edit_too_many` | a pattern or `within` matched over 32768 times | narrow the pattern or scope it with `within` |
 | `move_same`, `edit_missing` | a `move` names its own path, or its source is gone | give a different destination, or create the file |
 | `edit_count` | a `keys` count is above 10000 | use a smaller count, or `text` / `lines` |
 | `edit_macro` | a macro called itself more than 8 deep | the edit was not applied |
-| `path_*` | the path is unsafe | use a plain relative path |
+| `path_*` | the path is unsafe or traverses a symlink (`path_link`) | use a plain relative path inside the workspace |
 | `locked` | another Qark held the workspace for over 10 s | send the same request again |
 | `too_large`, `too_many_files` | over 8 MiB per file, 64 MiB, or 1024 files per apply | split the change |
 
@@ -271,13 +279,13 @@ A count in `keys` repeats the edit: `3ix<Esc>` inserts `xxx`, `3dd` deletes thre
 
 `.qark/checks.json` maps a file extension to a command. The first word is found on `PATH`. Exit 0 accepts the file. A non-zero exit, a missing program, or a timeout refuses the whole apply and nothing is written.
 
-`{file}` is the new bytes of that one file, written under `.qark/preview/`. `{root}` is the workspace directory. For a `{root}` command, Qark places every matching file at its real path, runs the command once, then puts the previous bytes back before publishing. A command with neither token gets the preview path appended.
+`{file}` is the new bytes of that one file, written to an isolated per-run temporary preview directory. `{root}` is a disposable isolated staging tree containing a copy of the workspace with the candidate changes applied — **the live workspace is never mutated during `{root}` checks, `validate` commands, or `dry_run`**.
 
 ```json
 {"mach": ["mach", "check", "{root}"]}
 ```
 
-`mach check` sees the project as the apply will leave it. You can also configure `"project"` (or `"*"`) in `.qark/checks.json` or pass `"validate": ["pytest", "-q"]` directly in an `apply` spec (or run `qark check` / NDJSON `project.validate`): Qark stages all modified files under the workspace lock, runs the project-wide validation command, and automatically rolls back every staged file and refuses with `check_failed` if the command exits non-zero. Agents cannot write `.qark` themselves. `mach` has to be on the PATH of the Qark process, or the command can name the executable by its full path.
+`mach check` sees the project in the isolated staging tree as the apply will leave it. You can also configure `"project"` (or `"*"`) in `.qark/checks.json` or pass `"validate": ["pytest", "-q"]` (or alias `"project_check"`) directly in an `apply` spec (or run `qark check` / NDJSON `project.validate`): Qark stages all candidate changes in an isolated staging tree, runs the project-wide validation command, and refuses with `check_failed` before touching the live workspace if the command exits non-zero. Passing `"validate": true` when no project command is configured in `.qark/checks.json` fails closed (`check_failed`). Agents cannot write `.qark` themselves.
 
 ## Rules
 
