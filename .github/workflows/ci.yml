@@ -75,7 +75,8 @@ jobs:
           import fs from 'node:fs';
           import os from 'node:os';
           import path from 'node:path';
-          import { QarkSession } from './scripts/client/qark-session.mjs';
+          import { pathToFileURL } from 'node:url';
+          const { QarkSession } = await import(pathToFileURL(path.resolve('scripts/client/qark-session.mjs')).href);
 
           const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'qark-ci-cli-'));
           try {
