@@ -14,12 +14,15 @@ export class QarkSession {
     this.defaultTimeoutMs = options.timeoutMs ?? 30000;
     this.maxStderrBytes = options.maxStderrBytes ?? 8192;
     this.maxPending = options.maxPending ?? 1024;
+    this.maxQueuedBytes = options.maxQueuedBytes ?? 32 * 1024 * 1024;
     this.stderrBuf = "";
     this.closed = false;
     this.exitError = null;
     this.nextId = 1;
     this.pending = new Map();
-    this._writeChain = Promise.resolve();
+    this._writeQueue = [];
+    this._queuedBytes = 0;
+    this._draining = false;
 
     const isNodeHost =
       /(^|[\\/])node(\.exe)?$/i.test(String(qarkBin)) &&
@@ -55,12 +58,23 @@ export class QarkSession {
         this._failAll(parseErr);
         return;
       }
+      const hasValidBody =
+        msg !== null &&
+        typeof msg === "object" &&
+        !Array.isArray(msg) &&
+        (msg.ok === true
+          ? Object.prototype.hasOwnProperty.call(msg, "result") && msg.result !== undefined
+          : msg.ok === false &&
+            msg.error !== null &&
+            typeof msg.error === "object" &&
+            !Array.isArray(msg.error));
       if (
         msg === null ||
         typeof msg !== "object" ||
         Array.isArray(msg) ||
         (typeof msg.id !== "number" && typeof msg.id !== "string") ||
-        typeof msg.ok !== "boolean"
+        typeof msg.ok !== "boolean" ||
+        !hasValidBody
       ) {
         const protoErr = new Error("Malformed protocol envelope from Qark worker");
         protoErr.code = "QARK_BAD_PROTOCOL";
@@ -119,10 +133,55 @@ export class QarkSession {
       this.exitError = err;
     }
     this.closed = true;
+    this._writeQueue.length = 0;
+    this._queuedBytes = 0;
     for (const [id, entry] of this.pending.entries()) {
       this.pending.delete(id);
       clearTimeout(entry.timer);
       entry.reject(this.exitError);
+    }
+  }
+
+  async _drainQueue() {
+    if (this._draining) return;
+    this._draining = true;
+    try {
+      while (this._writeQueue.length > 0 && !this.closed && this.proc.exitCode === null) {
+        const item = this._writeQueue.shift();
+        this._queuedBytes = Math.max(0, this._queuedBytes - item.bytes);
+        const entry = this.pending.get(item.id);
+        if (!entry) continue;
+        entry.sent = true;
+        const flushed = this.proc.stdin.write(item.payload, "utf8", (writeErr) => {
+          if (writeErr && this.pending.has(item.id)) {
+            this.pending.delete(item.id);
+            clearTimeout(entry.timer);
+            const err = new Error(`Failed to write to Qark worker stdin: ${writeErr.message}`);
+            err.code = "QARK_WRITE_ERROR";
+            entry.reject(err);
+          }
+        });
+        if (!flushed && !this.closed && this.proc.exitCode === null) {
+          await new Promise((resolveWait) => {
+            const cleanup = () => {
+              this.proc.stdin.removeListener("drain", onDone);
+              this.proc.stdin.removeListener("close", onDone);
+              this.proc.removeListener("exit", onDone);
+              this.proc.removeListener("close", onDone);
+            };
+            const onDone = () => {
+              cleanup();
+              resolveWait();
+            };
+            this.proc.stdin.once("drain", onDone);
+            this.proc.stdin.once("close", onDone);
+            this.proc.once("exit", onDone);
+            this.proc.once("close", onDone);
+          });
+        }
+      }
+    } finally {
+      this._draining = false;
     }
   }
 
@@ -141,61 +200,48 @@ export class QarkSession {
       if (!closedErr.code) closedErr.code = "QARK_SESSION_CLOSED";
       throw closedErr;
     }
-    if (this.pending.size >= this.maxPending) {
-      const queueErr = new Error(`QarkSession pending queue limit (${this.maxPending}) exceeded`);
+    const id = this.nextId++;
+    const payload = JSON.stringify({ id, op, args }) + "\n";
+    const bytes = Buffer.byteLength(payload, "utf8");
+    if (this.pending.size >= this.maxPending || this._queuedBytes + bytes > this.maxQueuedBytes) {
+      const queueErr = new Error(
+        `QarkSession queue limit (${this.maxPending} requests / ${this.maxQueuedBytes} bytes) exceeded`
+      );
       queueErr.code = "QARK_QUEUE_FULL";
       throw queueErr;
     }
-    const id = this.nextId++;
-    const payload = JSON.stringify({ id, op, args }) + "\n";
 
     return new Promise((resolve, reject) => {
-      const timer =
+      const entry = { resolve, reject, timer: null, sent: false };
+      entry.timer =
         timeoutMs > 0
           ? setTimeout(() => {
               this.pending.delete(id);
+              const qIdx = this._writeQueue.findIndex((q) => q.id === id);
+              if (qIdx >= 0) {
+                const [removed] = this._writeQueue.splice(qIdx, 1);
+                this._queuedBytes = Math.max(0, this._queuedBytes - removed.bytes);
+              }
               const timeoutErr = new Error(
                 `Qark request #${id} (${op}) timed out after ${timeoutMs}ms`
               );
               timeoutErr.code = "QARK_TIMEOUT";
-              timeoutErr.outcomeUnknown = true;
+              timeoutErr.outcomeUnknown = entry.sent;
               reject(timeoutErr);
             }, timeoutMs)
           : null;
 
-      this.pending.set(id, { resolve, reject, timer });
-
-      this._writeChain = this._writeChain
-        .then(async () => {
-          if (!this.pending.has(id) || this.closed) return;
-          const flushed = this.proc.stdin.write(payload, "utf8", (writeErr) => {
-            if (writeErr && this.pending.has(id)) {
-              this.pending.delete(id);
-              clearTimeout(timer);
-              const err = new Error(`Failed to write to Qark worker stdin: ${writeErr.message}`);
-              err.code = "QARK_WRITE_ERROR";
-              reject(err);
-            }
-          });
-          if (!flushed && !this.closed && this.proc.exitCode === null) {
-            await Promise.race([
-              once(this.proc.stdin, "drain").catch(() => {}),
-              once(this.proc, "exit").catch(() => {}),
-            ]);
-          }
-        })
-        .catch((err) => {
-          if (this.pending.has(id)) {
-            this.pending.delete(id);
-            clearTimeout(timer);
-            reject(err);
-          }
-        });
+      this.pending.set(id, entry);
+      this._writeQueue.push({ id, payload, bytes });
+      this._queuedBytes += bytes;
+      this._drainQueue();
     });
   }
 
   async close(timeoutMs = 2000) {
     this.closed = true;
+    this._writeQueue.length = 0;
+    this._queuedBytes = 0;
     const closedErr = new Error("QarkSession closed by caller");
     closedErr.code = "QARK_SESSION_CLOSED";
     for (const [id, entry] of this.pending.entries()) {

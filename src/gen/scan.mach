@@ -1924,7 +1924,7 @@ fun find_word_col(p: *u8, off: usize, n: usize, w: *u8, wn: usize) i64 {
 }
 
 # find whole-word match on a source line from start_col while skipping comments and string literals (but scanning inside ${...})
-fun find_code_word_col_from(p: *u8, off: usize, n: usize, start_col: usize, w: *u8, wn: usize, hash_cmt: bool, in_block: *bool) i64 {
+fun find_code_word_col_from(p: *u8, off: usize, n: usize, start_col: usize, w: *u8, wn: usize, hash_cmt: bool, in_block: *bool, tmpl_depth: *i64) i64 {
     if (wn == 0 || n == 0 || start_col >= n) { ret -1; }
     var i: usize = start_col;
     for (i < n) {
@@ -1955,11 +1955,24 @@ fun find_code_word_col_from(p: *u8, off: usize, n: usize, start_col: usize, w: *
             i = i + 1;
             cnt;
         }
-        if (c == '`') {
+        if (@tmpl_depth > 0 && c == '{') {
+            @tmpl_depth = @tmpl_depth + 1;
+            i = i + 1;
+            cnt;
+        }
+        if (c == '`' || (@tmpl_depth > 0 && c == '}')) {
+            if (c == '}') {
+                @tmpl_depth = @tmpl_depth - 1;
+                if (@tmpl_depth > 0) {
+                    i = i + 1;
+                    cnt;
+                }
+            }
             i = i + 1;
             for (i < n && p[off + i] != '`') {
                 if (p[off + i] == '\\' && i + 1 < n) { i = i + 2; cnt; }
                 if (p[off + i] == '$' && i + 1 < n && p[off + i + 1] == '{') {
+                    @tmpl_depth = @tmpl_depth + 1;
                     i = i + 2;
                     brk;
                 }
@@ -1986,7 +1999,8 @@ fun find_code_word_col_from(p: *u8, off: usize, n: usize, start_col: usize, w: *
 }
 
 fun find_code_word_col(p: *u8, off: usize, n: usize, w: *u8, wn: usize, hash_cmt: bool, in_block: *bool) i64 {
-    ret find_code_word_col_from(p, off, n, 0, w, wn, hash_cmt, in_block);
+    var td: i64 = 0;
+    ret find_code_word_col_from(p, off, n, 0, w, wn, hash_cmt, in_block, ?td);
 }
 
 fun stem_of(a: *A.Allocator, rel: str) str {
@@ -2089,6 +2103,19 @@ fun import_matches_target(a: *A.Allocator, importer_rel: str, imp: str, target_p
         val res_no_ext: str = strip_ext(a, resolved);
         if (util.eq(resolved, target_path) || util.eq(res_no_ext, target_no_ext)) {
             ret true;
+        }
+        val res_n: usize = str_len(resolved);
+        val tne_len: usize = str_len(target_no_ext);
+        if (res_n == 0) {
+            if (util.eq(target_no_ext, "index") || util.eq(target_no_ext, "__init__")) { ret true; }
+        }
+        or (tne_len > res_n && target_no_ext[res_n] == '/') {
+            if (find_word_col(target_no_ext, 0, res_n, resolved, res_n) == 1) {
+                val tail: str = (target_no_ext::usize + res_n + 1)::*u8;
+                if (util.eq(tail, "index") || util.eq(tail, "__init__")) {
+                    ret true;
+                }
+            }
         }
         ret false;
     }
@@ -2240,11 +2267,16 @@ pub fun impact_graph(a: *A.Allocator, root: str, sym_name: *u8, sym_n: usize, ta
                                             si = si + 1;
                                         }
                                         var search_from: usize = 0;
+                                        var tmpl_depth: i64 = 0;
+                                        var def_skipped: bool = false;
                                         for (search_from < llen) {
-                                            val col: i64 = find_code_word_col_from(p, loff, llen, search_from, sym_name, sym_n, hash_cmt, ?in_blk);
+                                            val col: i64 = find_code_word_col_from(p, loff, llen, search_from, sym_name, sym_n, hash_cmt, ?in_blk, ?tmpl_depth);
                                             if (col <= 0) { brk; }
                                             search_from = (col - 1)::usize + sym_n;
-                                            if (!is_def_line) {
+                                            if (is_def_line && !def_skipped) {
+                                                def_skipped = true;
+                                            }
+                                            or {
                                                 jw.obj(?refs_w);
                                                 jw.f_str(?refs_w, "path", rel);
                                                 jw.f_str(?refs_w, "sha256", ?sha[0]);

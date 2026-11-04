@@ -1129,6 +1129,32 @@ fun slice_trim_eq(a: *u8, a0: usize, a1: usize, b: *u8, b0: usize, b1: usize) bo
     ret slice_eq(a, s0, s1, b, t0, t1);
 }
 
+fun is_regex_kw(p: *u8, k0: usize, k1: usize) bool {
+    val len: usize = k1 - k0;
+    if (len == 2) {
+        if (p[k0] == 'i' && p[k0 + 1] == 'n') { ret true; }
+        if (p[k0] == 'o' && p[k0 + 1] == 'f') { ret true; }
+        if (p[k0] == 'd' && p[k0 + 1] == 'o') { ret true; }
+    }
+    if (len == 3 && p[k0] == 'n' && p[k0 + 1] == 'e' && p[k0 + 2] == 'w') { ret true; }
+    if (len == 4) {
+        if (p[k0] == 'c' && p[k0 + 1] == 'a' && p[k0 + 2] == 's' && p[k0 + 3] == 'e') { ret true; }
+        if (p[k0] == 'v' && p[k0 + 1] == 'o' && p[k0 + 2] == 'i' && p[k0 + 3] == 'd') { ret true; }
+        if (p[k0] == 'e' && p[k0 + 1] == 'l' && p[k0 + 2] == 's' && p[k0 + 3] == 'e') { ret true; }
+    }
+    if (len == 5) {
+        if (p[k0] == 'y' && p[k0 + 1] == 'i' && p[k0 + 2] == 'e' && p[k0 + 3] == 'l' && p[k0 + 4] == 'd') { ret true; }
+        if (p[k0] == 't' && p[k0 + 1] == 'h' && p[k0 + 2] == 'r' && p[k0 + 3] == 'o' && p[k0 + 4] == 'w') { ret true; }
+        if (p[k0] == 'a' && p[k0 + 1] == 'w' && p[k0 + 2] == 'a' && p[k0 + 3] == 'i' && p[k0 + 4] == 't') { ret true; }
+    }
+    if (len == 6) {
+        if (p[k0] == 'r' && p[k0 + 1] == 'e' && p[k0 + 2] == 't' && p[k0 + 3] == 'u' && p[k0 + 4] == 'r' && p[k0 + 5] == 'n') { ret true; }
+        if (p[k0] == 't' && p[k0 + 1] == 'y' && p[k0 + 2] == 'p' && p[k0 + 3] == 'e' && p[k0 + 4] == 'o' && p[k0 + 5] == 'f') { ret true; }
+        if (p[k0] == 'd' && p[k0 + 1] == 'e' && p[k0 + 2] == 'l' && p[k0 + 3] == 'e' && p[k0 + 4] == 't' && p[k0 + 5] == 'e') { ret true; }
+    }
+    ret false;
+}
+
 # Locate the signature/body separator ('{' for brace langs, ':' for python) on [s0, s1)
 # and for single-line definitions locate the end of the body on that span.
 fun find_sym_delim(p: *u8, s0: usize, s1: usize, is_py: bool, open_idx: *usize, close_idx: *usize) bool {
@@ -1137,11 +1163,14 @@ fun find_sym_delim(p: *u8, s0: usize, s1: usize, is_py: bool, open_idx: *usize, 
     var bdepth: i64 = 0;
     var found_open: bool = false;
     var in_str: u8 = 0;
+    var last_sig: u8 = 0;
+    var prev_kw0: usize = 0;
+    var prev_kw1: usize = 0;
     for (i < s1) {
         val c: u8 = p[i];
         if (in_str != 0) {
             if (c == '\\' && i + 1 < s1) { i = i + 2; cnt; }
-            if (c == in_str) { in_str = 0; }
+            if (c == in_str) { in_str = 0; last_sig = c; prev_kw0 = 0; prev_kw1 = 0; }
             i = i + 1;
             cnt;
         }
@@ -1162,6 +1191,31 @@ fun find_sym_delim(p: *u8, s0: usize, s1: usize, is_py: bool, open_idx: *usize, 
         }
         if (is_py && c == '#') {
             for (i < s1 && p[i] != '\n') { i = i + 1; }
+            cnt;
+        }
+        if (!is_py && c == '/') {
+            if (last_sig == 0 || last_sig == '(' || last_sig == ',' || last_sig == '=' || last_sig == ':' || last_sig == '[' || last_sig == '!' || last_sig == '&' || last_sig == '|' || last_sig == '?' || last_sig == '{' || last_sig == '}' || last_sig == ';' || last_sig == '+' || last_sig == '-' || last_sig == '*' || last_sig == '%' || last_sig == '<' || last_sig == '>' || last_sig == '^' || last_sig == '~' || (last_sig == 'I' && is_regex_kw(p, prev_kw0, prev_kw1))) {
+                i = i + 1;
+                var in_cc: bool = false;
+                for (i < s1 && p[i] != '\n') {
+                    if (p[i] == '\\' && i + 1 < s1) { i = i + 2; cnt; }
+                    if (p[i] == '[') { in_cc = true; }
+                    or (p[i] == ']') { in_cc = false; }
+                    or (p[i] == '/' && !in_cc) { i = i + 1; brk; }
+                    i = i + 1;
+                }
+                last_sig = '/';
+                prev_kw0 = 0;
+                prev_kw1 = 0;
+                cnt;
+            }
+        }
+        if (is_ident_byte(c) && !(c >= '0' && c <= '9')) {
+            val id0: usize = i;
+            for (i < s1 && is_ident_byte(p[i])) { i = i + 1; }
+            prev_kw0 = id0;
+            prev_kw1 = i;
+            last_sig = 'I';
             cnt;
         }
         if (!found_open) {
@@ -1190,6 +1244,11 @@ fun find_sym_delim(p: *u8, s0: usize, s1: usize, is_py: bool, open_idx: *usize, 
                     ret true;
                 }
             }
+        }
+        if (c != ' ' && c != '\t' && c != '\r' && c != '\n') {
+            last_sig = c;
+            prev_kw0 = 0;
+            prev_kw1 = 0;
         }
         i = i + 1;
     }
@@ -1232,6 +1291,8 @@ fun symbol_shadows_name(t: *Text, lang: str, os: *scan.Sym, name: *u8, name_n: u
     val sig1: usize = line_start(t, (os.sig_end + 1)::usize);
     var i: usize = sig0;
     var pdepth: i64 = 0;
+    var bdepth: i64 = 0;
+    var in_default: bool = false;
     for (i < sig1) {
         val c: u8 = t.p[i];
         if (c == '"' || c == '\'' || c == '`') {
@@ -1244,17 +1305,29 @@ fun symbol_shadows_name(t: *Text, lang: str, os: *scan.Sym, name: *u8, name_n: u
             if (i < sig1) { i = i + 1; }
             cnt;
         }
-        if (c == '(') { pdepth = pdepth + 1; i = i + 1; cnt; }
-        if (c == ')') {
-            if (pdepth > 0) { pdepth = pdepth - 1; }
+        if (c == '(') {
+            if (pdepth == 0) { in_default = false; bdepth = 0; }
+            pdepth = pdepth + 1;
             i = i + 1;
             cnt;
+        }
+        if (c == ')') {
+            if (pdepth > 0) { pdepth = pdepth - 1; }
+            if (pdepth == 0) { in_default = false; bdepth = 0; }
+            i = i + 1;
+            cnt;
+        }
+        if (pdepth == 1) {
+            if (c == '{' || c == '[') { bdepth = bdepth + 1; i = i + 1; cnt; }
+            if (c == '}' || c == ']') { if (bdepth > 0) { bdepth = bdepth - 1; } i = i + 1; cnt; }
+            if (bdepth == 0 && (c == '=' || c == ':')) { in_default = true; i = i + 1; cnt; }
+            if (bdepth == 0 && c == ',') { in_default = false; i = i + 1; cnt; }
         }
         if (pdepth > 0 && is_ident_byte(c) && !(c >= '0' && c <= '9')) {
             val id0: usize = i;
             for (i < sig1 && is_ident_byte(t.p[i])) { i = i + 1; }
             val id1: usize = i;
-            if (id1 - id0 == name_n && slice_eq(t.p, id0, id1, name, 0, name_n)) {
+            if (pdepth == 1 && !in_default && id1 - id0 == name_n && slice_eq(t.p, id0, id1, name, 0, name_n)) {
                 # Ignore TypeScript/Rust/Mach type annotations after ':'
                 var prev: usize = id0;
                 for (prev > sig0 && (t.p[prev - 1] == ' ' || t.p[prev - 1] == '\t')) { prev = prev - 1; }
@@ -1456,7 +1529,7 @@ fun collect_symbol_rename_hits(a: *A.Allocator, lang: str, t: *Text, sa: usize, 
         }
         # Skip JS regex literals
         if ((util.eq(lang, "node") || util.eq(lang, "js") || util.eq(lang, "ts")) && c == '/') {
-            if (last_sig == 0 || last_sig == '(' || last_sig == ',' || last_sig == '=' || last_sig == ':' || last_sig == '[' || last_sig == '!' || last_sig == '&' || last_sig == '|' || last_sig == '?' || last_sig == '{' || last_sig == '}' || last_sig == ';') {
+            if (last_sig == 0 || last_sig == '(' || last_sig == ',' || last_sig == '=' || last_sig == ':' || last_sig == '[' || last_sig == '!' || last_sig == '&' || last_sig == '|' || last_sig == '?' || last_sig == '{' || last_sig == '}' || last_sig == ';' || last_sig == '+' || last_sig == '-' || last_sig == '*' || last_sig == '%' || last_sig == '<' || last_sig == '>' || last_sig == '^' || last_sig == '~' || (last_sig == 'I' && is_regex_kw(t.p, prev_kw0, prev_kw1))) {
                 i = i + 1;
                 var in_cc: bool = false;
                 for (i < sb && t.p[i] != '\n') {
@@ -1467,6 +1540,8 @@ fun collect_symbol_rename_hits(a: *A.Allocator, lang: str, t: *Text, sa: usize, 
                     i = i + 1;
                 }
                 last_sig = '/';
+                prev_kw0 = 0;
+                prev_kw1 = 0;
                 cnt;
             }
         }
@@ -1636,8 +1711,22 @@ fun symbol_edit(a: *A.Allocator, t: *Text, obj: *json.Value, e: *Err) bool {
         }
     }
 
-    # Mode 1: {"symbol": "name", "rename": "new_name"}
     val ren_f: opt[*json.Value] = json.value_find(obj, "rename");
+    val body_f: opt[*json.Value] = json.value_find(obj, "body");
+    val sig_f: opt[*json.Value] = json.value_find(obj, "signature");
+    val with_f: opt[*json.Value] = json.value_find(obj, "with");
+    val rep_f: opt[*json.Value] = json.value_find(obj, "replace");
+    var mode_count: usize = 0;
+    if (sel ren_f.some) { mode_count = mode_count + 1; }
+    if (sel body_f.some) { mode_count = mode_count + 1; }
+    if (sel sig_f.some) { mode_count = mode_count + 1; }
+    if (sel with_f.some) { mode_count = mode_count + 1; }
+    if (sel rep_f.some) { mode_count = mode_count + 1; }
+    if (mode_count > 1) {
+        ret fail(e, "edit_bad", "symbol edit must specify only one of with, body, signature, or rename", sym.line);
+    }
+
+    # Mode 1: {"symbol": "name", "rename": "new_name"}
     if (sel ren_f.some) {
         var rnp: *u8 = nil;
         var rnn: usize = 0;
@@ -1677,7 +1766,6 @@ fun symbol_edit(a: *A.Allocator, t: *Text, obj: *json.Value, e: *Err) bool {
         ret true;
     }
     # Mode 2: {"symbol": "name", "body": "..."}
-    val body_f: opt[*json.Value] = json.value_find(obj, "body");
     if (sel body_f.some) {
         var ins: *u8 = nil;
         var insn: usize = 0;
@@ -1782,7 +1870,6 @@ fun symbol_edit(a: *A.Allocator, t: *Text, obj: *json.Value, e: *Err) bool {
         ret true;
     }
     # Mode 3: {"symbol": "name", "signature": "..."}
-    val sig_f: opt[*json.Value] = json.value_find(obj, "signature");
     if (sel sig_f.some) {
         var ins: *u8 = nil;
         var insn: usize = 0;
@@ -1828,7 +1915,28 @@ fun symbol_edit(a: *A.Allocator, t: *Text, obj: *json.Value, e: *Err) bool {
         }
     }
     val from: usize = line_start(t, lo::usize);
-    val to: usize = line_start(t, (hi + 1)::usize);
+    var to: usize = line_start(t, (hi + 1)::usize);
+    if (!is_py && has_delim && close_idx >= sig_s0 && close_idx < sym_end_s1) {
+        var after_close: usize = close_idx + 1;
+        if (after_close < sym_end_s1 && t.p[after_close] == ';') { after_close = after_close + 1; }
+        var has_tail_code: bool = false;
+        var ti: usize = after_close;
+        for (ti < sym_end_s1) {
+            val tc: u8 = t.p[ti];
+            if (tc != ' ' && tc != '\t' && tc != '\r' && tc != '\n') {
+                has_tail_code = true;
+                brk;
+            }
+            ti = ti + 1;
+        }
+        if (has_tail_code) {
+            to = after_close;
+            var trim_c: usize = insn;
+            if (trim_c > 0 && ins[trim_c - 1] == '\n') { trim_c = trim_c - 1; }
+            if (trim_c > 0 && ins[trim_c - 1] == '\r') { trim_c = trim_c - 1; }
+            insn = trim_c;
+        }
+    }
     if (to == t.n && t.n > 0 && t.p[t.n - 1] != '\n' && insn > 0) {
         var trim: usize = insn;
         if (trim > 0 && ins[trim - 1] == '\n') { trim = trim - 1; }
@@ -1986,6 +2094,26 @@ pub fun apply(a: *A.Allocator, name: str, text: *u8, n: usize, edits: *json.Valu
         val has_ex: opt[*json.Value] = json.value_find(obj, "ex");
         val has_keys: opt[*json.Value] = json.value_find(obj, "keys");
         val has_sym: opt[*json.Value] = json.value_find(obj, "symbol");
+        val has_within: opt[*json.Value] = json.value_find(obj, "within");
+        val has_ren: opt[*json.Value] = json.value_find(obj, "rename");
+        val has_body: opt[*json.Value] = json.value_find(obj, "body");
+        val has_sig: opt[*json.Value] = json.value_find(obj, "signature");
+        val has_sym_mode: bool = sel has_ren.some || sel has_body.some || sel has_sig.some;
+        val sym_scopes_op: bool = !has_sym_mode && !sel has_within.some && (sel has_find.some || sel has_find_re.some || sel has_ex.some || sel has_keys.some);
+        var op_count: usize = 0;
+        if (sel has_find.some) { op_count = op_count + 1; }
+        if (sel has_find_re.some) { op_count = op_count + 1; }
+        if (sel has_lines.some) { op_count = op_count + 1; }
+        if (sel has_before.some) { op_count = op_count + 1; }
+        if (sel has_after.some) { op_count = op_count + 1; }
+        if (sel has_append.some) { op_count = op_count + 1; }
+        if (sel has_prepend.some) { op_count = op_count + 1; }
+        if (sel has_ex.some) { op_count = op_count + 1; }
+        if (sel has_keys.some) { op_count = op_count + 1; }
+        if (sel has_sym.some && !sym_scopes_op) { op_count = op_count + 1; }
+        if (op_count > 1) {
+            ret fail(e, "edit_bad", "an edit must specify only one operation (find, find_re, lines, symbol, insert_before, insert_after, append, prepend, ex, or keys)", 0);
+        }
         if (sel has_find_re.some) { ok = re_edit(a, ?t, obj, e); }
         or (sel has_find.some) { ok = find_edit(a, ?t, obj, e); }
         or (sel has_lines.some) { ok = range_edit(a, ?t, obj, e); }
