@@ -173,8 +173,9 @@ function buildPkgMap(files, wsRoot) {
   const first = files[0];
   if (first && Array.isArray(first.packages)) {
     for (const p of first.packages) {
-      if (p && typeof p.name === 'string') {
-        const full = path.resolve(wsRoot, p.name);
+      const pkgRel = p && (typeof p.name === 'string' ? p.name : typeof p.path === 'string' ? p.path : null);
+      if (pkgRel) {
+        const full = path.resolve(wsRoot, pkgRel);
         map.set(normKey(full), { deleted: Boolean(p.deleted), text: p.text || '' });
       }
     }

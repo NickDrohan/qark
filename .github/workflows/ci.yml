@@ -52,7 +52,7 @@ jobs:
                 fs.writeFileSync(full, v, 'utf8');
               }
               const packages = Object.entries(overlayFiles).map(([p, t]) =>
-                t === null ? { path: p, deleted: true } : { path: p, text: t }
+                t === null ? { name: p, deleted: true } : { name: p, text: t }
               );
               const payload = JSON.stringify([{ root, packages, name: relPath, text }]);
               const res = spawnSync(process.execPath, [helper], { input: payload, encoding: 'utf8' });
