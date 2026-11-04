@@ -191,8 +191,10 @@ fun lib_find(ctx: *u8, name: str, out: *spec.Tpl) bool {
     val s: *session.Session = ctx::*session.Session;
     var i: usize = 0;
     for (i < s.tpls.len) {
-        if (util.eq(s.tpls.data[i].name, name)) {
-            @out = s.tpls.data[i];
+        val stpl: *spec.Tpl = ?s.tpls.data[i];
+        val root_ok: bool = stpl.root == nil || s.root == nil || util.eq(stpl.root, s.root);
+        if (root_ok && util.eq(stpl.name, name)) {
+            @out = @stpl;
             ret true;
         }
         i = i + 1;
@@ -877,6 +879,101 @@ fun recover_wal(a: *A.Allocator, root: str) i64 {
     }
     if (files_arr == nil || json.value_count(files_arr) == 0) { ret -1; }
 
+    var vi: usize = 0;
+    for (vi < json.value_count(files_arr)) {
+        val vg: opt[*json.Value] = json.value_get(files_arr, vi);
+        if (!sel vg.some) { ret -1; }
+        var vg_val: *json.Value = nil;
+        if (sel vg.some) { vg_val = vg.some; }
+        if (vg_val == nil || !json.value_is_object(vg_val)) { ret -1; }
+        var vp: *u8 = nil;
+        var vpn: usize = 0;
+        var vst: *u8 = nil;
+        var vstn: usize = 0;
+        val vpf: opt[*json.Value] = json.value_find(vg_val, "path");
+        val vstf: opt[*json.Value] = json.value_find(vg_val, "status");
+        if (sel vpf.some) { spec.decode_pub(a, vpf.some, ?vp, ?vpn); }
+        if (sel vstf.some) { spec.decode_pub(a, vstf.some, ?vst, ?vstn); }
+        if (vp == nil || vpn == 0 || vst == nil || pathx.check(vp) != pathx.P_OK || commit.check_ancestry(a, root, vp) != nil) {
+            ret -1;
+        }
+        val vfull: res[str, A.Error] = pathx.native(a, root, vp);
+        if (sel vfull.err) { ret -1; }
+        var vnsha: *u8 = nil;
+        var vnshan: usize = 0;
+        val vnsf: opt[*json.Value] = json.value_find(vg_val, "sha256");
+        if (sel vnsf.some) { spec.decode_pub(a, vnsf.some, ?vnsha, ?vnshan); }
+        var vpsha: *u8 = nil;
+        var vpshan: usize = 0;
+        val vpsf: opt[*json.Value] = json.value_find(vg_val, "prev_sha256");
+        if (sel vpsf.some) { spec.decode_pub(a, vpsf.some, ?vpsha, ?vpshan); }
+        if (util.eq(vst, "created")) {
+            val cm: res[filesystem.Metadata, io_error.Error] = filesystem.metadata_link(vfull.ok);
+            if (sel cm.ok) {
+                if (cm.ok.kind != filesystem.KIND_FILE) { ret -1; }
+                if (vnsha != nil && vnshan == 64) {
+                    val cb: res[vector.Vector[u8], filesystem.FsError] = filesystem.read_bytes(a, vfull.ok);
+                    if (sel cb.err) { ret -1; }
+                    var csha: [65]u8;
+                    commit.hash_hex(cb.ok.data, cb.ok.len, ?csha[0]);
+                    if (!util.eq(?csha[0], vnsha)) { ret -1; }
+                }
+            }
+            if (sel cm.err) {
+                if (cm.err.kind != io_error.NOT_FOUND && cm.err.kind != io_error.NOT_DIRECTORY) {
+                    ret -1;
+                }
+            }
+        }
+        or (util.eq(vst, "replaced") || util.eq(vst, "deleted")) {
+            var vold_b: *u8 = nil;
+            var vold_n: usize = 0;
+            var vhas_old: bool = false;
+            val votf: opt[*json.Value] = json.value_find(vg_val, "old_text");
+            if (sel votf.some) {
+                if (spec.decode_pub(a, votf.some, ?vold_b, ?vold_n)) { vhas_old = true; }
+            }
+            if (!vhas_old) {
+                val vohf: opt[*json.Value] = json.value_find(vg_val, "old_hex");
+                var vhp: *u8 = nil;
+                var vhn: usize = 0;
+                if (sel vohf.some) {
+                    if (spec.decode_pub(a, vohf.some, ?vhp, ?vhn) && decode_hex_bytes(a, vhp, vhn, ?vold_b, ?vold_n)) {
+                        vhas_old = true;
+                    }
+                }
+            }
+            if (!vhas_old) { ret -1; }
+            var vexp_sha: [65]u8;
+            commit.hash_hex(vold_b, vold_n, ?vexp_sha[0]);
+            if (vpsha != nil && vpshan == 64 && !util.eq(vpsha, ?vexp_sha[0])) {
+                ret -1;
+            }
+            val rm_meta: res[filesystem.Metadata, io_error.Error] = filesystem.metadata_link(vfull.ok);
+            if (sel rm_meta.ok) {
+                if (rm_meta.ok.kind != filesystem.KIND_FILE) { ret -1; }
+                if ((util.eq(vst, "replaced") && vnsha != nil && vnshan == 64) || (util.eq(vst, "deleted") && vpsha != nil && vpshan == 64)) {
+                    val rb_cur: res[vector.Vector[u8], filesystem.FsError] = filesystem.read_bytes(a, vfull.ok);
+                    if (sel rb_cur.err) { ret -1; }
+                    var rcur_sha: [65]u8;
+                    commit.hash_hex(rb_cur.ok.data, rb_cur.ok.len, ?rcur_sha[0]);
+                    val matches_old: bool = util.eq(?rcur_sha[0], ?vexp_sha[0]);
+                    val matches_new: bool = vnsha != nil && vnshan == 64 && util.eq(?rcur_sha[0], vnsha);
+                    if (!matches_old && !matches_new) { ret -1; }
+                }
+            }
+            if (sel rm_meta.err) {
+                if (rm_meta.err.kind != io_error.NOT_FOUND && rm_meta.err.kind != io_error.NOT_DIRECTORY) {
+                    ret -1;
+                }
+            }
+        }
+        or {
+            ret -1;
+        }
+        vi = vi + 1;
+    }
+
     var i: usize = 0;
     for (i < json.value_count(files_arr)) {
         val g: opt[*json.Value] = json.value_get(files_arr, i);
@@ -1358,6 +1455,7 @@ pub fun redo(s: *session.Session, args: *json.Value, w: *jw.Jw) bool {
     commit.unlock(?held);
     jw.obj(w);
     jw.f_str(w, "txn", ?rtxn[0]);
+    if (s.root != nil) { jw.f_str(w, "root", s.root); }
     jw.f_str(w, "redone_txn", last_txn);
     if (txn_cnt > 1) {
         jw.f_i64(w, "steps_redone", txn_cnt::i64);
@@ -1713,6 +1811,7 @@ pub fun undo(s: *session.Session, args: *json.Value, w: *jw.Jw) bool {
     commit.unlock(?held);
     jw.obj(w);
     jw.f_str(w, "txn", ?utxn[0]);
+    if (s.root != nil) { jw.f_str(w, "root", s.root); }
     jw.f_str(w, "reverted_txn", last_reverted);
     if (prev_txn != nil && prev_n > 0) {
         jw.f_str(w, "prev_txn", prev_txn);
@@ -1907,11 +2006,32 @@ pub fun apply(s: *session.Session, args: *json.Value, w: *jw.Jw) bool {
     var req_sha: [65]u8;
     commit.hash_hex(compact.buf, compact.len, ?req_sha[0]);
 
-    # Check idempotency BEFORE spec.compile so retries of already-applied edits/moves/deletes succeed
+    var held: commit.Lock;
+    held.held = false;
+    var has_early_lock: bool = false;
+
+    # Acquire lock and check idempotency BEFORE spec.compile so concurrent or retried relative edits/moves/deletes are serialized and replayed cleanly
     if (idem_rel != nil) {
+        var early_set: commit.Set = commit.init(a, s.root);
+        val early_locked: i64 = commit.lock(?early_set, s.lock_ms, ?held);
+        if (early_locked == 1) { ret simple_error(w, "locked", "another qark process held the workspace lock too long; nothing was written. retry the same request"); }
+        if (early_locked != 0) { ret simple_error(w, "lock_failed", "the workspace lock under .qark could not be taken; nothing was written"); }
+        has_early_lock = true;
+        if (!s.force_dry && !spec.fbool_pub(args, "dry_run")) {
+            if (recover_wal(a, s.root) < 0) {
+                commit.unlock(?held);
+                ret recovery_error(w, "workspace recovery from an interrupted transaction failed; manual inspection is required");
+            }
+        }
         val id_st0: i64 = check_idempotency(a, s.root, idem_rel, ?req_sha[0], w);
-        if (id_st0 == 1) { ret true; }
-        if (id_st0 < 0) { ret false; }
+        if (id_st0 == 1) {
+            commit.unlock(?held);
+            ret true;
+        }
+        if (id_st0 < 0) {
+            commit.unlock(?held);
+            ret false;
+        }
     }
 
     var sp: spec.Spec;
@@ -1919,7 +2039,10 @@ pub fun apply(s: *session.Session, args: *json.Value, w: *jw.Jw) bool {
     var lib: spec.Lib;
     lib.ctx = (s::usize)::*u8;
     lib.find = lib_find;
-    if (!spec.compile(?sp, a, s.root, args, compact.buf, compact.len, ?lib, ?e)) { ret spec_error(w, ?e); }
+    if (!spec.compile(?sp, a, s.root, args, compact.buf, compact.len, ?lib, ?e)) {
+        if (has_early_lock) { commit.unlock(?held); }
+        ret spec_error(w, ?e);
+    }
     if (s.force_dry) { sp.dry = true; }
     if (s.require_check) {
         var top_chk_weak: bool = sp.check == spec.CHECK_OFF || sp.check == spec.CHECK_PERMISSIVE;
@@ -1936,6 +2059,7 @@ pub fun apply(s: *session.Session, args: *json.Value, w: *jw.Jw) bool {
             }
         }
         if (top_chk_weak) {
+            if (has_early_lock) { commit.unlock(?held); }
             ret simple_error(w, "check_unavailable", "session requires syntax checking (--require-check); check policy cannot be weakened");
         }
         sp.check = spec.CHECK_REQUIRED;
@@ -1943,6 +2067,7 @@ pub fun apply(s: *session.Session, args: *json.Value, w: *jw.Jw) bool {
         for (pci < commit.count(?sp.set)) {
             val pce: *commit.Entry = commit.entry(?sp.set, pci);
             if (pce.check_policy == commit.CP_OFF || pce.check_policy == commit.CP_PERMISSIVE || pce.check_policy == commit.CP_STRICT) {
+                if (has_early_lock) { commit.unlock(?held); }
                 ret simple_error(w, "check_unavailable", "session requires syntax checking (--require-check); per-file check policy cannot weaken required checking");
             }
             pce.check_policy = commit.CP_REQUIRED;
@@ -1954,10 +2079,11 @@ pub fun apply(s: *session.Session, args: *json.Value, w: *jw.Jw) bool {
     val t_compile: i64 = now_us(t0);
     if (stream) { push_event(?ev_w, ?ev_cnt, "compile", "ok", t_compile, commit.count(?sp.set)::i64); }
 
-    var held: commit.Lock;
-    val locked: i64 = commit.lock(?sp.set, s.lock_ms, ?held);
-    if (locked == 1) { ret simple_error(w, "locked", "another qark process held the workspace lock too long; nothing was written. retry the same request"); }
-    if (locked != 0) { ret simple_error(w, "lock_failed", "the workspace lock under .qark could not be taken; nothing was written"); }
+    if (!has_early_lock) {
+        val locked: i64 = commit.lock(?sp.set, s.lock_ms, ?held);
+        if (locked == 1) { ret simple_error(w, "locked", "another qark process held the workspace lock too long; nothing was written. retry the same request"); }
+        if (locked != 0) { ret simple_error(w, "lock_failed", "the workspace lock under .qark could not be taken; nothing was written"); }
+    }
 
     if (sp.dry) {
         if (has_pending_wal(a, s.root)) {
@@ -2149,6 +2275,7 @@ pub fun apply(s: *session.Session, args: *json.Value, w: *jw.Jw) bool {
     var rw: jw.Jw = jw.init(a);
     jw.obj(?rw);
     jw.f_str(?rw, "txn", ?txn[0]);
+    if (s.root != nil) { jw.f_str(?rw, "root", s.root); }
     jw.f_bool(?rw, "dry_run", sp.dry);
     if (sp.dry) {
         jw.f_bool(?rw, "ready", conflicts == 0 && !blocked);
@@ -2721,7 +2848,10 @@ pub fun templates(s: *session.Session, args: *json.Value, w: *jw.Jw) bool {
     jw.arr(w);
     var i: usize = 0;
     for (i < s.tpls.len) {
-        template_entry(a, w, ?s.tpls.data[i], false);
+        val stpl: *spec.Tpl = ?s.tpls.data[i];
+        if (stpl.root == nil || s.root == nil || util.eq(stpl.root, s.root)) {
+            template_entry(a, w, stpl, false);
+        }
         i = i + 1;
     }
     list_workspace(s, w, ".qark/templates", 0);
@@ -2785,6 +2915,11 @@ pub fun define(s: *session.Session, args: *json.Value, w: *jw.Jw) bool {
     t.body = b_c.ok;
     t.len = bn;
     t.src = "session";
+    t.root = nil;
+    if (s.root != nil) {
+        val r_c: res[str, A.Error] = util.dup(s.a, s.root);
+        if (sel r_c.ok) { t.root = r_c.ok; }
+    }
     t.lang = nil;
     if (lang != nil) {
         val l_c: res[str, A.Error] = util.dup(s.a, lang);
@@ -2815,7 +2950,9 @@ pub fun define(s: *session.Session, args: *json.Value, w: *jw.Jw) bool {
     var replaced: bool = false;
     var i: usize = 0;
     for (i < s.tpls.len) {
-        if (util.eq(s.tpls.data[i].name, t.name)) {
+        val cur_t: *spec.Tpl = ?s.tpls.data[i];
+        val same_root: bool = cur_t.root == nil || t.root == nil || util.eq(cur_t.root, t.root);
+        if (same_root && util.eq(cur_t.name, t.name)) {
             s.tpls.data[i] = t;
             replaced = true;
         }
@@ -3325,7 +3462,7 @@ pub fun schema(s: *session.Session, args: *json.Value, w: *jw.Jw) bool {
     jw.obj(w);
     if (schema_match(filter_op, "apply")) {
         jw.key(w, "apply");
-        jw.raw_v(w, "{\"fields\":[\"files\",\"path\",\"glob\",\"text\",\"lines\",\"tmpl\",\"template\",\"json\",\"edits\",\"move\",\"delete\",\"mode\",\"expect\",\"require_expect\",\"idempotency_key\",\"check\",\"contract\",\"scope\",\"rebase\",\"base_text\",\"validate\",\"project_check\",\"timeout_ms\",\"best_effort\",\"stream\",\"dry_run\",\"preview\",\"diff\",\"undo\",\"redo\",\"tag\",\"job\",\"dest\",\"vars\",\"templates\",\"expand\"],\"edit_fields\":[\"symbol\",\"with\",\"body\",\"signature\",\"expect_signature\",\"rename\",\"find\",\"find_re\",\"replace\",\"lines\",\"insert_before\",\"insert_after\",\"auto_indent\",\"append\",\"prepend\",\"ex\",\"keys\",\"within\",\"occurrence\",\"all\",\"count\"],\"contract_fields\":[\"symbol\",\"symbols\",\"methods\",\"lines\",\"preserve_signatures\",\"max_lines_changed\",\"max_changed_lines\",\"forbid_delete\"],\"check_policies\":[\"strict\",\"required\",\"permissive\",\"off\"],\"returns\":[\"txn\",\"tag\",\"dry_run\",\"ready\",\"replayed\",\"idempotent_replay\",\"check_policy\",\"validation_complete\",\"checks\",\"checker_diagnostics\",\"created\",\"replaced\",\"unchanged\",\"deleted\",\"files\",\"events\"],\"error_fields\":[\"code\",\"message\",\"file\",\"line\",\"col\",\"mismatch_category\",\"target_lines\",\"actual_line\",\"checker_diagnostics\",\"files\",\"rollback_failed\",\"recovery_required\"]}");
+        jw.raw_v(w, "{\"fields\":[\"files\",\"path\",\"glob\",\"text\",\"lines\",\"tmpl\",\"template\",\"json\",\"edits\",\"move\",\"delete\",\"mode\",\"expect\",\"require_expect\",\"idempotency_key\",\"check\",\"contract\",\"scope\",\"rebase\",\"base_text\",\"validate\",\"project_check\",\"timeout_ms\",\"best_effort\",\"stream\",\"dry_run\",\"preview\",\"diff\",\"undo\",\"redo\",\"tag\",\"job\",\"dest\",\"vars\",\"templates\",\"expand\"],\"edit_fields\":[\"symbol\",\"with\",\"body\",\"signature\",\"expect_signature\",\"rename\",\"find\",\"find_re\",\"replace\",\"lines\",\"insert_before\",\"insert_after\",\"auto_indent\",\"append\",\"prepend\",\"ex\",\"keys\",\"within\",\"occurrence\",\"all\",\"count\"],\"contract_fields\":[\"symbol\",\"symbols\",\"methods\",\"lines\",\"preserve_signatures\",\"max_lines_changed\",\"max_changed_lines\",\"forbid_delete\"],\"check_policies\":[\"strict\",\"required\",\"permissive\",\"off\"],\"returns\":[\"txn\",\"root\",\"tag\",\"dry_run\",\"ready\",\"replayed\",\"idempotent_replay\",\"check_policy\",\"validation_complete\",\"checks\",\"checker_diagnostics\",\"created\",\"replaced\",\"unchanged\",\"deleted\",\"files\",\"events\"],\"error_fields\":[\"code\",\"message\",\"file\",\"line\",\"col\",\"mismatch_category\",\"target_lines\",\"actual_line\",\"checker_diagnostics\",\"files\",\"rollback_failed\",\"recovery_required\"]}");
     }
     if (schema_match(filter_op, "read")) {
         jw.key(w, "read");
@@ -3341,11 +3478,11 @@ pub fun schema(s: *session.Session, args: *json.Value, w: *jw.Jw) bool {
     }
     if (schema_match(filter_op, "undo")) {
         jw.key(w, "undo");
-        jw.raw_v(w, "{\"fields\":[\"txn\",\"steps\",\"list\",\"redo\",\"dry_run\",\"force\",\"diff\"],\"returns\":[\"txn\",\"reverted_txn\",\"steps_reverted\",\"dry_run\",\"created\",\"replaced\",\"unchanged\",\"deleted\",\"files\",\"txns\",\"count\"]}");
+        jw.raw_v(w, "{\"fields\":[\"txn\",\"steps\",\"list\",\"redo\",\"dry_run\",\"force\",\"diff\"],\"returns\":[\"txn\",\"root\",\"reverted_txn\",\"steps_reverted\",\"dry_run\",\"created\",\"replaced\",\"unchanged\",\"deleted\",\"files\",\"txns\",\"count\"]}");
     }
     if (schema_match(filter_op, "redo")) {
         jw.key(w, "redo");
-        jw.raw_v(w, "{\"fields\":[\"txn\",\"steps\",\"dry_run\",\"force\",\"diff\"],\"returns\":[\"txn\",\"redone_txn\",\"steps_redone\",\"dry_run\",\"created\",\"replaced\",\"unchanged\",\"deleted\",\"files\"]}");
+        jw.raw_v(w, "{\"fields\":[\"txn\",\"steps\",\"dry_run\",\"force\",\"diff\"],\"returns\":[\"txn\",\"root\",\"redone_txn\",\"steps_redone\",\"dry_run\",\"created\",\"replaced\",\"unchanged\",\"deleted\",\"files\"]}");
     }
     if (schema_match(filter_op, "events")) {
         jw.key(w, "events");
@@ -3519,6 +3656,9 @@ pub fun release_sign(s: *session.Session, args: *json.Value, w: *jw.Jw) bool {
                 if (sel fm.ok) {
                     if (fm.ok.kind == filesystem.KIND_FILE) {
                         val fbytes: res[vector.Vector[u8], filesystem.FsError] = filesystem.read_bytes(a, fpath.ok);
+                        if (sel fbytes.err) {
+                            ret simple_error(w, "io_read", "could not read a file in the release directory");
+                        }
                         if (sel fbytes.ok) {
                             var fsha: [65]u8;
                             commit.hash_hex(fbytes.ok.data, fbytes.ok.len, ?fsha[0]);
@@ -3541,6 +3681,9 @@ pub fun release_sign(s: *session.Session, args: *json.Value, w: *jw.Jw) bool {
         i = i + 1;
     }
     jw.arr_end(?files_w);
+    if (sums_w.failed || files_w.failed) {
+        ret simple_error(w, "oom", "out of memory");
+    }
     if (fcount == 0) {
         ret simple_error(w, "release_empty", "no release files found in directory to sign");
     }

@@ -1,6 +1,6 @@
 # Qark
 
-Qark is a syntax-checked, crash-recoverable file writer built for agents — one serialized bottleneck every Qark write goes through, so multi-agent work stays consistent. An agent hands Qark a spec; Qark renders every file, refuses unsafe paths, syntax-checks the result, compares against what is on disk with sha256 optimistic concurrency, and publishes **all of the files or none of them** under a cooperative workspace lock (`.qark/lock`) and two-phase write-ahead log (`.qark/wal.json`). Every call returns a receipt: per-file status, sha256, line counts, notes, and unified diffs when asked.
+Qark is a syntax-checked, crash-recoverable file writer built for agents — one serialized bottleneck every Qark write goes through, so multi-agent work stays consistent. An agent hands Qark a spec; Qark renders every file, refuses unsafe paths, syntax-checks the result, compares against what is on disk with sha256 optimistic concurrency, and publishes candidate files via atomic per-file rename under a cooperative workspace lock (`.qark/lock`) and two-phase write-ahead log (`.qark/wal.json`), rolling back on publish failure or recovering on the next locked operation. Every call returns a receipt: per-file status, sha256, line counts, notes, and unified diffs when asked.
 
 Full-content writes (`text`, `lines`, `json`, `tmpl`) are idempotent when repeated (`unchanged: same_content`); for relative `edits`, `delete`, or `move` retries across transport timeouts, pass `idempotency_key` so Qark replays the committed receipt (`replayed: true`). A conflicting write is refused with a named error, not silently clobbered.
 
@@ -58,7 +58,7 @@ See `qa --help` and `agent/README.md`.
 | `src/` | the whole tool: spec compiler, edit engine, checkers, commit/journal, ndjson + MCP servers, editor ops |
 | `agent/skill/SKILL.md` | the agent contract — give this file to an agent and it can use Qark |
 | `agent/reference/ops.txt` | `qark --dump ops` — the operation reference |
-| `agent/eval/` | the PowerShell eval suite (164 deterministic checks) and model benches |
+| `agent/eval/` | the PowerShell eval suite (173 deterministic checks) and model benches |
 | `agent/README.md` | how to train/score an agent on Qark |
 | `docs/autocode-integration.md` | editor/orchestrator integration guide, fail-closed checker contract, and reference Node.js client |
 | `templates/`, `scripts/` | builtin templates, language checkers (`check.cjs`, `check.py`, `check.ps1`), MCP tool schema |

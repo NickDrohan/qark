@@ -781,9 +781,16 @@ fun make_temp_dir(a: *A.Allocator, prefix: str) str {
     val tf: res[filesystem.TempFile, filesystem.FsError] = filesystem.temp_create(a, prefix);
     if (sel tf.err) { ret nil; }
     var tmp: filesystem.TempFile = tf.ok;
-    val dir_path: str = tmp.path;
+    var w: jw.Jw = jw.init(a);
+    jw.raw(?w, tmp.path);
+    jw.raw(?w, ".d");
+    val dir_path: str = jw.text(?w);
+    if (w.failed || dir_path == nil) {
+        filesystem.temp_close_and_remove(?tmp);
+        ret nil;
+    }
+    val mk: err[io_error.Error] = filesystem.create_dir(dir_path, 448);
     filesystem.temp_close_and_remove(?tmp);
-    val mk: err[filesystem.FsError] = filesystem.create_dir_all(a, dir_path, 448);
     if (sel mk.err) { ret nil; }
     ret dir_path;
 }
