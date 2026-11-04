@@ -1,0 +1,159 @@
+name: Qark CI
+
+on:
+  push:
+    branches: [ master, main ]
+  pull_request:
+
+jobs:
+  node-differential-and-client:
+    name: Node Checker Differential & Client Lifecycle (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ ubuntu-latest, windows-latest ]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Run 12-case JavaScript checker differential suite
+        shell: node {0}
+        run: |
+          import { spawnSync } from 'node:child_process';
+          import fs from 'node:fs';
+          import os from 'node:os';
+          import path from 'node:path';
+
+          const helper = path.resolve('scripts/checkers/check.cjs');
+          const cases = [
+            ['explicit_cjs_export', { 'package.json': '{"type":"commonjs"}' }, {}, 'a.js', 'export const x=1;\n', false],
+            ['cjs_require', {}, {}, 'a.cjs', 'const require=1;\n', false],
+            ['cjs_module', {}, {}, 'a.cjs', 'let module=1;\n', false],
+            ['to_esm', { 'package.json': '{"type":"commonjs"}' }, { 'package.json': '{"type":"module"}' }, 'a.js', 'await Promise.resolve(1);\n', true],
+            ['to_cjs', { 'package.json': '{"type":"module"}' }, { 'package.json': '{"type":"commonjs"}' }, 'a.js', 'await Promise.resolve(1);\n', false],
+            ['delete_nested', { 'package.json': '{"type":"module"}', 'sub/package.json': '{"type":"commonjs"}' }, { 'sub/package.json': null }, 'sub/a.js', 'export const x=1;\n', true],
+            ['valid', {}, {}, 'a.mjs', 'export const x=1;\n', true],
+            ['invalid', { 'package.json': '{"type":"commonjs"}' }, {}, 'a.js', 'const x=;\n', false],
+            ['no_package_export', {}, {}, 'a.js', 'export const x=1;\n', true],
+            ['no_type_await', { 'package.json': '{}' }, {}, 'a.js', 'await Promise.resolve(1);\n', true],
+            ['no_type_binding', { 'package.json': '{}' }, {}, 'a.js', 'const require=1;\n', true],
+            ['malformed_package', { 'package.json': '{oops' }, {}, 'a.js', 'const x=1;\n', false],
+          ];
+
+          for (const [label, diskFiles, overlayFiles, relPath, text, expectedOk] of cases) {
+            const root = fs.mkdtempSync(path.join(os.tmpdir(), 'qark-ci-chk-'));
+            try {
+              for (const [k, v] of Object.entries(diskFiles)) {
+                const full = path.join(root, k);
+                fs.mkdirSync(path.dirname(full), { recursive: true });
+                fs.writeFileSync(full, v, 'utf8');
+              }
+              const packages = Object.entries(overlayFiles).map(([p, t]) =>
+                t === null ? { name: p, deleted: true } : { name: p, text: t }
+              );
+              const payload = JSON.stringify([{ root, packages, name: relPath, text }]);
+              const res = spawnSync(process.execPath, [helper], { input: payload, encoding: 'utf8' });
+              if (res.status !== 0) {
+                throw new Error(`${label}: helper exited with ${res.status}: ${res.stderr}`);
+              }
+              const parsed = JSON.parse(res.stdout);
+              if (!Array.isArray(parsed) || parsed.length !== 1 || Boolean(parsed[0].ok) !== expectedOk) {
+                throw new Error(`${label}: expected ok=${expectedOk}, got ${res.stdout}`);
+              }
+              console.log(`PASS ${label}: ok=${parsed[0].ok}`);
+            } finally {
+              fs.rmSync(root, { recursive: true, force: true });
+            }
+          }
+
+      - name: Run QarkSession client lifecycle & protocol hardening suite
+        shell: node {0}
+        run: |
+          import fs from 'node:fs';
+          import os from 'node:os';
+          import path from 'node:path';
+          import { pathToFileURL } from 'node:url';
+          const { QarkSession } = await import(pathToFileURL(path.resolve('scripts/client/qark-session.mjs')).href);
+
+          const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'qark-ci-cli-'));
+          try {
+            const writeWorker = (name, code) => {
+              const p = path.join(tmp, name);
+              fs.writeFileSync(p, code, 'utf8');
+              return p;
+            };
+
+            // 1. Exit-before-reply rejects with QARK_PROCESS_EXITED
+            {
+              const w = writeWorker('exit7.mjs', 'process.stdin.once("data", () => process.exit(7));');
+              const s = new QarkSession({ bin: process.execPath, args: [w] });
+              let code = null;
+              try { await s.request('session.info', {}); } catch (e) { code = e.code; }
+              if (code !== 'QARK_PROCESS_EXITED' || s.pending.size !== 0) {
+                throw new Error(`exit7 failed: code=${code}, pending=${s.pending.size}`);
+              }
+            }
+
+            // 2. Malformed JSON rejects with QARK_BAD_JSON
+            {
+              const w = writeWorker('badjson.mjs', 'process.stdin.once("data", () => process.stdout.write("{bad\\n"));');
+              const s = new QarkSession({ bin: process.execPath, args: [w] });
+              let code = null;
+              try { await s.request('session.info', {}); } catch (e) { code = e.code; }
+              await s.close(100);
+              if (code !== 'QARK_BAD_JSON' || s.pending.size !== 0) {
+                throw new Error(`badjson failed: code=${code}, pending=${s.pending.size}`);
+              }
+            }
+
+            // 3. Valid JSON null frame rejects with QARK_BAD_PROTOCOL (never throws uncaught TypeError)
+            {
+              const w = writeWorker('nulljson.mjs', 'process.stdin.once("data", () => process.stdout.write("null\\n"));');
+              const s = new QarkSession({ bin: process.execPath, args: [w] });
+              let code = null;
+              try { await s.request('session.info', {}); } catch (e) { code = e.code; }
+              await s.close(100);
+              if (code !== 'QARK_BAD_PROTOCOL' || s.pending.size !== 0) {
+                throw new Error(`nulljson failed: code=${code}, pending=${s.pending.size}`);
+              }
+            }
+
+            // 4. Worker ignoring SIGTERM is escalated and reaped by close()
+            {
+              const w = writeWorker(
+                'ignoreterm.mjs',
+                'import readline from "node:readline"; process.on("SIGTERM", () => {}); const rl = readline.createInterface({ input: process.stdin }); rl.on("line", (l) => { const m = JSON.parse(l); process.stdout.write(JSON.stringify({ id: m.id, ok: true, result: { ok: true } }) + "\\n"); });'
+              );
+              const s = new QarkSession({ bin: process.execPath, args: [w] });
+              await s.request('ping', {});
+              await s.close(60);
+              if (s.proc.exitCode === null && s.proc.signalCode === null) {
+                throw new Error('ignoreterm worker was still alive after close(60)');
+              }
+            }
+            console.log('PASS all 4 QarkSession client lifecycle cases');
+          } finally {
+            fs.rmSync(tmp, { recursive: true, force: true });
+          }
+
+      - name: Verify MCP tool schemas and annotations
+        shell: node {0}
+        run: |
+          import fs from 'node:fs';
+          const tools = JSON.parse(fs.readFileSync('scripts/mcp/tools.json', 'utf8'));
+          if (!Array.isArray(tools) || tools.length !== 9) {
+            throw new Error(`Expected 9 MCP tools, got ${tools?.length}`);
+          }
+          const byName = Object.fromEntries(tools.map((t) => [t.name, t]));
+          for (const mut of ['qark_apply', 'qark_edit', 'qark_undo']) {
+            if (byName[mut]?.annotations?.destructiveHint !== true) {
+              throw new Error(`${mut} must have destructiveHint: true`);
+            }
+          }
+          if (byName.qark_check?.annotations?.readOnlyHint !== false || byName.qark_check?.annotations?.idempotentHint !== false) {
+            throw new Error('qark_check must have readOnlyHint: false and idempotentHint: false');
+          }
+          console.log('PASS MCP tool schemas and annotations');

@@ -90,6 +90,7 @@ pub rec Tpl {
     src:     str;
     desc:    str;
     pathpat: str;
+    root:    str;
     prog:    tmpl.Prog;
 }
 
@@ -1390,6 +1391,11 @@ fun compile_glob(sp: *Spec, fv: *json.Value, fi: usize, glob_pat: str, e: *Err) 
             ret fail(e, ce_syn.code, ce_syn.msg, at(a, fi, "contract"));
         }
     }
+    var probe_glang: str = nil;
+    var probe_gpol: u8 = commit.CP_INHERIT;
+    if (!parse_file_check(a, fv, fi, false, ?probe_glang, ?probe_gpol, e)) {
+        ret false;
+    }
     val best_effort: bool = sp.best_effort || fbool(fv, "best_effort") == 1;
     val gpat: str = pathx.strip_root(sp.root, glob_pat);
     var paths: vector.Vector[str] = vector.init[str](a);
@@ -1402,6 +1408,14 @@ fun compile_glob(sp: *Spec, fv: *json.Value, fi: usize, glob_pat: str, e: *Err) 
         }
         if (walk_errs > 0) {
             ret fail(e, "glob_io_error", "glob walk encountered unreadable directories; fix permissions or set best_effort: true", at(a, fi, "glob"));
+        }
+    }
+    or {
+        if (walk_trunc) {
+            vector.push[str](?sp.warns, "glob best_effort: directory walk was truncated at 16384 files");
+        }
+        if (walk_errs > 0) {
+            vector.push[str](?sp.warns, "glob best_effort: skipped one or more unreadable directories during walk");
         }
     }
     if (paths.len == 0) {
@@ -1417,6 +1431,7 @@ fun compile_glob(sp: *Spec, fv: *json.Value, fi: usize, glob_pat: str, e: *Err) 
                 e.path = cand_rel;
                 ret fail(e, canc, "a directory or file in the glob match is a symbolic link or non-directory", at(a, fi, "glob"));
             }
+            vector.push[str](?sp.warns, cat3(a, "glob best_effort skipped unsafe path: ", cand_rel, ""));
             pi = pi + 1;
             cnt;
         }
@@ -1428,6 +1443,7 @@ fun compile_glob(sp: *Spec, fv: *json.Value, fi: usize, glob_pat: str, e: *Err) 
                 e.path = cand_rel;
                 ret fail(e, "edit_missing", "a file matched by glob could not be read", at(a, fi, "glob"));
             }
+            vector.push[str](?sp.warns, cat3(a, "glob best_effort skipped unreadable file: ", cand_rel, ""));
             pi = pi + 1;
             cnt;
         }
@@ -1505,6 +1521,9 @@ fun compile_glob(sp: *Spec, fv: *json.Value, fi: usize, glob_pat: str, e: *Err) 
                 jw.raw(?w, "]");
                 e.field = w.buf;
                 ret false;
+            }
+            or (ee.index > 0 && best_effort) {
+                vector.push[str](?sp.warns, cat3(a, "glob best_effort skipped partial edit miss: ", cand_rel, ""));
             }
         }
         pi = pi + 1;

@@ -929,6 +929,33 @@ $rSharedRead = QAdv "read" @{ paths = @("imp/lib.mjs", "imp/use.mjs"); max_bytes
 $rImpactRel = QAdv "impact" @{ symbol = "calc"; path = "imp/lib.mjs" }
 Check "R2-15: read shares max_bytes with truncated:true, and impact finds multiple refs per line, template expr refs, and relative ./ dependents" ($rImpSeed.ok -and $rSharedRead.ok -and $rSharedRead.result.truncated -eq $true -and $rImpactRel.ok -and $rImpactRel.result.complete -eq $true -and $rImpactRel.result.references.Count -ge 4 -and ($rImpactRel.result.dependents -contains "imp/use.mjs")) @{ seed = $rImpSeed; read = $rSharedRead; impact = $rImpactRel }
 
+# Q16 & Q33: Root-scoped session templates, root field in receipts, and job.write syntax checking
+$altRoot = Join-Path $root "alt_root"
+New-Item -ItemType Directory -Force -Path $altRoot | Out-Null
+$rTplDef = QAdv "template.define" @{ name = "scoped/hello"; text = "hello {{name}}`n" }
+$rTplOtherRoot = QAdv "template.render" @{ root = $altRoot; template = "scoped/hello"; vars = @{ name = "world" } }
+$rJobBad = QAdv "job.write" @{ job = "j1"; path = "bad.py"; text = "def broken(:`n" }
+Check "Q16/Q33: session templates are scoped to their defining root, receipts include root, and job.write enforces syntax checking" ($rTplDef.ok -and (-not $rTplOtherRoot.ok) -and $rTplOtherRoot.error.code -eq "tmpl_unknown" -and $rImpSeed.result.root.Length -gt 0 -and (-not $rJobBad.ok) -and $rJobBad.error.code -eq "check_failed") @{ tplDef = $rTplDef; tplOther = $rTplOtherRoot; jobBad = $rJobBad }
+
+# R2-01 (external post-crash edit guard): recover_wal refuses to overwrite a file modified externally after a crash
+$extWalFile = Join-Path $advRoot "wal_external_edit.txt"
+[System.IO.File]::WriteAllText($extWalFile, "user-edited-after-crash`n", $utf8)
+$oldSha = ([System.BitConverter]::ToString([System.Security.Cryptography.SHA256]::Create().ComputeHash($utf8.GetBytes("old-v1`n")))).Replace("-", "").ToLower()
+$newSha = ([System.BitConverter]::ToString([System.Security.Cryptography.SHA256]::Create().ComputeHash($utf8.GetBytes("new-v2`n")))).Replace("-", "").ToLower()
+$extSnap = @{
+    txn = "cafebabedeadbeef"
+    files = @(
+        @{ path = "wal_external_edit.txt"; status = "replaced"; old_text = "old-v1`n"; prev_sha256 = $oldSha; sha256 = $newSha }
+    )
+} | ConvertTo-Json -Compress -Depth 10
+[System.IO.File]::WriteAllText((Join-Path $advRoot ".qark\undo\cafebabedeadbeef.json"), $extSnap, $utf8)
+[System.IO.File]::WriteAllText((Join-Path $advRoot ".qark\wal.json"), '{"txn":"cafebabedeadbeef","state":"publishing"}', $utf8)
+$rExtWal = QAdv "apply" @{ path = "wal_after_ext.txt"; text = "should-block`n" }
+$extStillIntact = ([System.IO.File]::ReadAllText($extWalFile) -eq "user-edited-after-crash`n")
+Remove-Item -Force (Join-Path $advRoot ".qark\wal.json")
+Remove-Item -Force (Join-Path $advRoot ".qark\undo\cafebabedeadbeef.json")
+Check "R2-01 (external edit guard): recover_wal refuses to overwrite post-crash user edits when disk hash matches neither prev_sha256 nor sha256" ((-not $rExtWal.ok) -and $rExtWal.error.code -eq "recovery_required" -and $extStillIntact) @{ res = $rExtWal; intact = $extStillIntact }
+
 $wadv.StandardInput.Close()
 [void]$wadv.WaitForExit(5000)
 
