@@ -216,6 +216,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
+          fetch-depth: 0
 
       - uses: actions/setup-node@v4
         with:
@@ -224,6 +225,11 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
+
+      - name: Fetch submodule tags for Mach dependency version verification
+        shell: bash
+        run: |
+          git -C dep/std fetch --tags --force
 
       - name: Install Mach compiler (v6.10.1) on Linux
         if: runner.os == 'Linux'
