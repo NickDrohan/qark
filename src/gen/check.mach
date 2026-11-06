@@ -45,12 +45,13 @@ pub val TIMEOUT_MS: i64 = 20000;
 # ---
 # warm: the session's long-lived checkers for python, node, and powershell
 pub rec Tools {
-    seen:   [4]bool;
-    python: str;
-    node:   str;
-    pwsh:   str;
-    bash:   str;
-    warm:   [3]warm.Warm;
+    seen:           [4]bool;
+    python:         str;
+    node:           str;
+    pwsh:           str;
+    bash:           str;
+    warm:           [3]warm.Warm;
+    no_custom_exec: bool;
 }
 
 rec Run {
@@ -987,16 +988,20 @@ fun make_stage_tree(a: *A.Allocator, root: str, set: *commit.Set, out_err: *str)
                     filesystem.remove_file(dst.ok);
                 }
                 var cperm: i32 = 420;
-                if (e.target_perm != 0) {
+                if (e.has_target_perm || e.target_perm != 0) {
                     cperm = (e.target_perm & 511)::i32;
                 }
                 or (e.exec) {
-                    cperm = 493;
+                    if (e.existed && e.has_old_perm) {
+                        cperm = ((e.old_perm | 73) & 511)::i32;
+                    }
+                    or {
+                        cperm = 493;
+                    }
                 }
-                or (e.existed && (e.old_perm & 511) != 0) {
+                or (e.existed && (e.has_old_perm || (e.old_perm & 511) != 0)) {
                     cperm = (e.old_perm & 511)::i32;
                 }
-                if (cperm == 0) { cperm = 420; }
                 var datap: *u8 = e.data;
                 if (datap == nil) { datap = ""; }
                 val wr: err[filesystem.FsError] = filesystem.write_bytes(dst.ok, datap, e.len, cperm);
@@ -1092,7 +1097,7 @@ fun read_checks_config(a: *A.Allocator, root: str, set: *commit.Set, out_doc: *j
 # .qark/checks.json maps an extension to a command. {file} is one file's new
 # bytes under an isolated preview dir. {root} is an isolated staged workspace
 # tree so a project checker sees the edit without mutating the live workspace.
-fun queue_project_checks(a: *A.Allocator, root: str, stage_root: str, set: *commit.Set, runs: *vector.Vector[Run], want_root: bool) {
+fun queue_project_checks(a: *A.Allocator, root: str, stage_root: str, set: *commit.Set, runs: *vector.Vector[Run], want_root: bool, no_custom_exec: bool) {
     var doc: json.Value;
     var cfg_err: str = nil;
     val cfg_st: i64 = read_checks_config(a, root, set, ?doc, ?cfg_err);
@@ -1120,11 +1125,22 @@ fun queue_project_checks(a: *A.Allocator, root: str, stage_root: str, set: *comm
         val e: *commit.Entry = commit.entry(set, i);
         if (pending(e)) {
             val ext: str = path.extension(e.rel);
-            val spec: opt[*json.Value] = json.value_find(?doc, ext);
+            var spec: opt[*json.Value] = json.value_find(?doc, ext);
+            if (!sel spec.some && no_custom_exec) {
+                spec = json.value_find(?doc, "project");
+                if (!sel spec.some) { spec = json.value_find(?doc, "*"); }
+            }
             if (sel spec.some) {
                 e.custom_check = true;
                 if (e.lang == nil) { e.lang = ext; }
-                if (json.value_is_array(spec.some) && json.value_count(spec.some) > 0 && json.value_count(spec.some) < 10) {
+                if (no_custom_exec) {
+                    if (!want_root) {
+                        e.check = commit.CK_ERROR;
+                        e.ck_cat = "exec_forbidden";
+                        e.ck_msg = "custom checker execution in .qark/checks.json is disabled by --no-custom-exec";
+                    }
+                }
+                or (json.value_is_array(spec.some) && json.value_count(spec.some) > 0 && json.value_count(spec.some) < 10) {
                     var argv: [12]*u8;
                     var argc: usize = 0;
                     var is_root: bool = false;
@@ -1324,7 +1340,7 @@ pub fun run(a: *A.Allocator, keep: *A.Allocator, root: str, set: *commit.Set, to
         }
         i = i + 1;
     }
-    queue_project_checks(a, root, nil, set, ?runs, false);
+    queue_project_checks(a, root, nil, set, ?runs, false, tools.no_custom_exec);
     var k: usize = 0;
     for (k < runs.len) {
         val r: *Run = ?runs.data[k];
@@ -1372,7 +1388,7 @@ pub fun has_staged(a: *A.Allocator, root: str, set: *commit.Set) bool {
 # in an isolated staging tree so the live workspace is never mutated before commit.
 pub fun run_staged(a: *A.Allocator, root: str, set: *commit.Set, timeout_ms: i64) {
     var probe_runs: vector.Vector[Run] = vector.init[Run](a);
-    queue_project_checks(a, root, root, set, ?probe_runs, true);
+    queue_project_checks(a, root, root, set, ?probe_runs, true, false);
     if (probe_runs.len == 0) { ret; }
     var stage_err: str = nil;
     val stage_dir: str = make_stage_tree(a, root, set, ?stage_err);
@@ -1386,7 +1402,7 @@ pub fun run_staged(a: *A.Allocator, root: str, set: *commit.Set, timeout_ms: i64
         ret;
     }
     var runs: vector.Vector[Run] = vector.init[Run](a);
-    queue_project_checks(a, root, stage_dir, set, ?runs, true);
+    queue_project_checks(a, root, stage_dir, set, ?runs, true, false);
     var k: usize = 0;
     for (k < runs.len) {
         val r: *Run = ?runs.data[k];

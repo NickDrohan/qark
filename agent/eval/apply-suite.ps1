@@ -263,9 +263,11 @@ $r = Q "apply" @{ path = "same.txt"; mode = "upsert"; text = "x`n" }
 $r = Q "apply" @{ path = "same.txt"; mode = "upsert"; text = "x`n" }
 Check "same bytes report same_content" ($r.ok -and $r.result.files[0].status -eq "unchanged" -and $r.result.files[0].reason -eq "same_content") $r
 
-# unrecognized keys warn instead of vanishing
-$r = Q "apply" @{ path = "warn.txt"; mode = "upsert"; text = "w`n"; expct = "0" }
-Check "misspelled file key warns in notes" ($r.ok -and ($r.result.files[0].notes -match "expct")) $r
+# unrecognized keys warn instead of vanishing; safety-critical typos fail closed
+$r = Q "apply" @{ files = @(@{ path = "warn.txt"; mode = "upsert"; text = "w`n"; extra_note = "0" }) }
+Check "unknown file key warns in notes" ($r.ok -and ($r.result.files[0].notes -match "extra_note")) $r
+$rTypo = Q "apply" @{ path = "warn.txt"; mode = "upsert"; text = "w`n"; expct = "0" }
+Check "R10: safety-critical typo expct fails closed with spec_unknown_key" ((-not $rTypo.ok) -and $rTypo.error.code -eq "spec_unknown_key") $rTypo
 $r = Q "apply" @{ path = "warn2.txt"; mode = "upsert"; text = "w`n"; bogus = 1 }
 Check "unknown top-level key warns" ($r.ok -and ($r.result.warnings -match "bogus")) $r
 $r = Q "apply" @{ path = "warn3.txt"; mode = "upsert"; text = "y`n" }
@@ -1081,8 +1083,74 @@ Check "R3-12: conflicting edit operations fail with edit_bad and simultaneous co
 $r3DryPersist = QAdv "template.define" @{ name = "no_persist"; text = "hi {{x}}`n"; persist = $true; dry_run = $true }
 Check "R3-14: template.define rejects persist:true with dry_run:true (dry_run_persist)" ((-not $r3DryPersist.ok) -and $r3DryPersist.error.code -eq "dry_run_persist") $r3DryPersist
 
+# R06: strict CAS expect precondition on identical content & precondition_matched receipt field
+$r4CasInit = QAdv "apply" @{ path = "cas_noop.txt"; mode = "upsert"; text = "same-body`n" }
+$casSha = $r4CasInit.result.files[0].sha256
+$staleSha = "0000000000000000000000000000000000000000000000000000000000000000"
+$r4CasStale = QAdv "apply" @{ path = "cas_noop.txt"; mode = "upsert"; expect = $staleSha; text = "same-body`n" }
+$r4CasMatch = QAdv "apply" @{ path = "cas_noop.txt"; mode = "upsert"; expect = $casSha; text = "same-body`n" }
+Check "R06: stale expect fails closed with conflict even when content is identical, and matched expect emits precondition_matched:true" ((-not $r4CasStale.ok) -and $r4CasStale.error.code -eq "conflict" -and $r4CasStale.error.files[0].reason -eq "stale" -and $r4CasMatch.ok -and $r4CasMatch.result.files[0].status -eq "unchanged" -and $r4CasMatch.result.files[0].precondition_matched -eq $true) @{ stale = $r4CasStale; match = $r4CasMatch }
+
+# R04 & R10: durable:true, strict_spec:true, and journal v2 schema (ts_ms, created, replaced, deleted)
+$r4Durable = QAdv "apply" @{ path = "durable_doc.txt"; mode = "upsert"; durable = $true; strict_spec = $true; text = "durable-ok`n" }
+$r4StrictBogus = QAdv "apply" @{ path = "durable_doc.txt"; mode = "upsert"; strict_spec = $true; bogus_field = 123; text = "durable-ok`n" }
+$advJournalLines = [System.IO.File]::ReadAllLines((Join-Path $advRoot ".qark\journal.ndjson"))
+$lastJournalObj = $advJournalLines[$advJournalLines.Count - 1] | ConvertFrom-Json
+Check "R04/R10: durable:true emits durable receipt, strict_spec:true rejects unknown keys with spec_unknown_key, and journal v2 includes ts_ms/created/replaced/deleted" ($r4Durable.ok -and $r4Durable.result.durable -eq $true -and (-not $r4StrictBogus.ok) -and $r4StrictBogus.error.code -eq "spec_unknown_key" -and $lastJournalObj.v -eq 2 -and $null -ne $lastJournalObj.ts_ms -and $lastJournalObj.created -eq 1 -and $lastJournalObj.replaced -eq 0 -and $lastJournalObj.deleted -eq 0) @{ durable = $r4Durable; strict = $r4StrictBogus; journal = $lastJournalObj }
+
+# R05: explicit perm:0 (000) is preserved in snapshot and across undo/redo
+$r4Perm0 = QAdv "apply" @{ files = @(@{ path = "perm_zero.txt"; mode = "upsert"; perm = 0; text = "zero-perm`n" }) }
+$permSnap = Get-Content (Join-Path $advRoot ".qark\undo\$($r4Perm0.result.txn).json") -Raw | ConvertFrom-Json
+$r4PermUndo = QAdv "undo" @{}
+$r4PermRedo = QAdv "redo" @{}
+$redoSnap = Get-Content (Join-Path $advRoot ".qark\undo\$($r4PermRedo.result.redone_txn).json") -Raw | ConvertFrom-Json
+$r4PermDel = QAdv "apply" @{ path = "perm_zero.txt"; delete = $true }
+Check "R05: explicit perm:0 (000) is preserved in snapshot and across undo/redo" ($r4Perm0.ok -and $permSnap.files[0].has_target_perm -eq $true -and $permSnap.files[0].target_perm -eq 0 -and $r4PermUndo.ok -and $r4PermRedo.ok -and $r4PermRedo.result.redone_txn -eq $r4Perm0.result.txn -and $redoSnap.files[0].has_target_perm -eq $true -and $redoSnap.files[0].target_perm -eq 0 -and $r4PermDel.ok) @{ apply = $r4Perm0; snap = $permSnap; undo = $r4PermUndo; redo = $r4PermRedo; del = $r4PermDel }
+
+# R03: torn journal tail containing txn substring is repaired in-place on committed WAL recovery, and interior corruption fails closed
+$tornTxn = "9999888877776666"
+$fullJLine = "{`"v`":2,`"event`":`"transaction.committed`",`"ts_ms`":1700000000000,`"txn`":`"$tornTxn`",`"spec_sha256`":`"$casSha`",`"check_policy`":`"strict`",`"validation_complete`":true,`"created`":1,`"replaced`":0,`"deleted`":0,`"files`":[{`"path`":`"torn.txt`",`"status`":`"created`",`"sha256`":`"$casSha`"}]}"
+$tornPrefix = "{`"v`":2,`"event`":`"transaction.committed`",`"ts_ms`":1700000000000,`"txn`":`"$tornTxn`",`"spec_sha256`":"
+$journalFile = Join-Path $advRoot ".qark\journal.ndjson"
+$existingJournal = [System.IO.File]::ReadAllText($journalFile)
+[System.IO.File]::WriteAllText($journalFile, $existingJournal + $tornPrefix, $utf8)
+[System.IO.File]::WriteAllText((Join-Path $advRoot "torn.txt"), "same-body`n", $utf8)
+$tornSnapJson = @{
+    v = 1; txn = $tornTxn; prev_txn = $r4PermDel.result.txn; spec_sha256 = $casSha;
+    files = @(@{ path = "torn.txt"; status = "created"; existed = $false; sha256 = $casSha; perm = 0; target_perm = 420; has_target_perm = $true; data_hex = "73616d652d626f64790a" })
+} | ConvertTo-Json -Compress -Depth 5
+[System.IO.File]::WriteAllText((Join-Path $advRoot ".qark\undo\$tornTxn.json"), $tornSnapJson, $utf8)
+$tornWalJson = @{ v = 1; op = "apply"; state = "committed"; txn = $tornTxn; has_latest = $true; latest_txn = $tornTxn; journal_line = ($fullJLine + "`n") } | ConvertTo-Json -Compress
+[System.IO.File]::WriteAllText((Join-Path $advRoot ".qark\wal.json"), $tornWalJson, $utf8)
+$r4RecoverTorn = QAdv "apply" @{ path = "after_torn.txt"; mode = "upsert"; text = "ok`n" }
+$repairedLines = @([System.IO.File]::ReadAllLines($journalFile) | Where-Object { $_.Contains($tornTxn) })
+$repairedParsed = $null
+try { $repairedParsed = $repairedLines[0] | ConvertFrom-Json } catch {}
+# Now simulate interior journal corruption with a committed WAL
+[System.IO.File]::WriteAllText($journalFile, "{corrupt_interior_line`n" + [System.IO.File]::ReadAllText($journalFile), $utf8)
+[System.IO.File]::WriteAllText((Join-Path $advRoot ".qark\wal.json"), $tornWalJson, $utf8)
+$r4CorruptInterior = QAdv "apply" @{ path = "after_corrupt.txt"; mode = "upsert"; text = "no`n" }
+# Restore clean journal and remove WAL
+[System.IO.File]::WriteAllText($journalFile, $existingJournal, $utf8)
+Remove-Item -Force (Join-Path $advRoot ".qark\wal.json") -ErrorAction SilentlyContinue
+Check "R03: torn journal tail is repaired in-place into one valid NDJSON record and interior journal corruption fails closed with recovery_required" ($r4RecoverTorn.ok -and $repairedLines.Count -eq 1 -and $null -ne $repairedParsed -and $repairedParsed.txn -eq $tornTxn -and (-not $r4CorruptInterior.ok) -and $r4CorruptInterior.error.code -eq "recovery_required") @{ rec = $r4RecoverTorn; lines = $repairedLines; corrupt = $r4CorruptInterior }
+
 $wadv.StandardInput.Close()
 [void]$wadv.WaitForExit(5000)
+
+# R09: --no-custom-exec refuses validate commands, project.validate, and .qark/checks.json custom checkers with exec_forbidden
+$wnoexec = Start-Worker @("--headless", "--stdio", "--root", "`"$advRoot`"", "--no-custom-exec")
+$wnoexec.StandardInput.WriteLine((@{ id = 1; op = "apply"; args = @{ path = "noexec.txt"; mode = "upsert"; text = "hi`n"; validate = @("node", "-e", "process.exit(0)") } } | ConvertTo-Json -Compress -Depth 10))
+$rNoExecVal = (Read-Reply $wnoexec "noexec-validate") | ConvertFrom-Json
+$wnoexec.StandardInput.WriteLine((@{ id = 2; op = "project.validate"; args = @{ command = @("node", "-e", "process.exit(0)") } } | ConvertTo-Json -Compress -Depth 10))
+$rNoExecProj = (Read-Reply $wnoexec "noexec-proj") | ConvertFrom-Json
+[System.IO.File]::WriteAllText((Join-Path $advRoot ".qark\checks.json"), '{"txt":["node","-e","process.exit(0)"]}', $utf8)
+$wnoexec.StandardInput.WriteLine((@{ id = 3; op = "apply"; args = @{ path = "noexec.txt"; mode = "upsert"; text = "hi`n" } } | ConvertTo-Json -Compress -Depth 10))
+$rNoExecCustom = (Read-Reply $wnoexec "noexec-custom") | ConvertFrom-Json
+Remove-Item -Force (Join-Path $advRoot ".qark\checks.json") -ErrorAction SilentlyContinue
+$wnoexec.StandardInput.Close()
+[void]$wnoexec.WaitForExit(5000)
+Check "R09: --no-custom-exec refuses validate command, project.validate, and .qark/checks.json with exec_forbidden" ((-not $rNoExecVal.ok) -and $rNoExecVal.error.code -eq "exec_forbidden" -and (-not $rNoExecProj.ok) -and $rNoExecProj.error.code -eq "exec_forbidden" -and (-not $rNoExecCustom.ok) -and $rNoExecCustom.error.code -eq "checker_error" -and $rNoExecCustom.error.checker_diagnostics.category -eq "exec_forbidden") @{ val = $rNoExecVal; proj = $rNoExecProj; custom = $rNoExecCustom }
 
 # R2-07: --require-check refuses per-file check:false
 $wreq = Start-Worker @("--headless", "--stdio", "--root", "`"$advRoot`"", "--require-check")

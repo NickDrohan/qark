@@ -128,12 +128,15 @@ export class QarkSession {
     this.defaultTimeoutMs = options.timeoutMs ?? 30000;
     this.maxStderrBytes = options.maxStderrBytes ?? 8192;
     this.maxPending = options.maxPending ?? 1024;
+    this.maxQueuedBytes = options.maxQueuedBytes ?? 32 * 1024 * 1024;
     this.stderrBuf = "";
     this.closed = false;
     this.exitError = null;
     this.nextId = 1;
     this.pending = new Map();
-    this._writeChain = Promise.resolve();
+    this._writeQueue = [];
+    this._queuedBytes = 0;
+    this._draining = false;
 
     const isNodeHost =
       /(^|[\\/])node(\.exe)?$/i.test(String(qarkBin)) &&
@@ -145,7 +148,9 @@ export class QarkSession {
 
     this.proc = spawn(qarkBin, spawnArgs, { stdio: ["pipe", "pipe", "pipe"] });
 
-    this.proc.stdin.on("error", () => {});
+    this.proc.stdin.on("error", () => {
+      // Handled via write callback and process exit/error listeners.
+    });
 
     this.proc.stderr.setEncoding("utf8");
     this.proc.stderr.on("data", (chunk) => {
@@ -167,12 +172,23 @@ export class QarkSession {
         this._failAll(parseErr);
         return;
       }
+      const hasValidBody =
+        msg !== null &&
+        typeof msg === "object" &&
+        !Array.isArray(msg) &&
+        (msg.ok === true
+          ? Object.prototype.hasOwnProperty.call(msg, "result") && msg.result !== undefined
+          : msg.ok === false &&
+            msg.error !== null &&
+            typeof msg.error === "object" &&
+            !Array.isArray(msg.error));
       if (
         msg === null ||
         typeof msg !== "object" ||
         Array.isArray(msg) ||
         (typeof msg.id !== "number" && typeof msg.id !== "string") ||
-        typeof msg.ok !== "boolean"
+        typeof msg.ok !== "boolean" ||
+        !hasValidBody
       ) {
         const protoErr = new Error("Malformed protocol envelope from Qark worker");
         protoErr.code = "QARK_BAD_PROTOCOL";
@@ -231,11 +247,65 @@ export class QarkSession {
       this.exitError = err;
     }
     this.closed = true;
+    this._writeQueue.length = 0;
+    this._queuedBytes = 0;
     for (const [id, entry] of this.pending.entries()) {
       this.pending.delete(id);
       clearTimeout(entry.timer);
       entry.reject(this.exitError);
     }
+  }
+
+  async _drainQueue() {
+    if (this._draining) return;
+    this._draining = true;
+    try {
+      while (this._writeQueue.length > 0 && !this.closed && this.proc.exitCode === null) {
+        const item = this._writeQueue.shift();
+        this._queuedBytes = Math.max(0, this._queuedBytes - item.bytes);
+        const entry = this.pending.get(item.id);
+        if (!entry) continue;
+        entry.sent = true;
+        const flushed = this.proc.stdin.write(item.payload, "utf8", (writeErr) => {
+          if (writeErr && this.pending.has(item.id)) {
+            this.pending.delete(item.id);
+            clearTimeout(entry.timer);
+            const err = new Error(`Failed to write to Qark worker stdin: ${writeErr.message}`);
+            err.code = "QARK_WRITE_ERROR";
+            entry.reject(err);
+          }
+        });
+        if (!flushed && !this.closed && this.proc.exitCode === null) {
+          await new Promise((resolveWait) => {
+            const cleanup = () => {
+              this.proc.stdin.removeListener("drain", onDone);
+              this.proc.stdin.removeListener("close", onDone);
+              this.proc.removeListener("exit", onDone);
+              this.proc.removeListener("close", onDone);
+            };
+            const onDone = () => {
+              cleanup();
+              resolveWait();
+            };
+            this.proc.stdin.once("drain", onDone);
+            this.proc.stdin.once("close", onDone);
+            this.proc.once("exit", onDone);
+            this.proc.once("close", onDone);
+          });
+        }
+      }
+    } finally {
+      this._draining = false;
+    }
+  }
+
+  async request(op, args = {}, timeoutMs = this.defaultTimeoutMs) {
+    return this.call(op, args, timeoutMs);
+  }
+
+  async info(timeoutMs = this.defaultTimeoutMs) {
+    const res = await this.call("session.info", {}, timeoutMs);
+    return res.result || res;
   }
 
   async call(op, args = {}, timeoutMs = this.defaultTimeoutMs) {
@@ -244,61 +314,48 @@ export class QarkSession {
       if (!closedErr.code) closedErr.code = "QARK_SESSION_CLOSED";
       throw closedErr;
     }
-    if (this.pending.size >= this.maxPending) {
-      const queueErr = new Error(`QarkSession pending queue limit (${this.maxPending}) exceeded`);
+    const id = this.nextId++;
+    const payload = JSON.stringify({ id, op, args }) + "\n";
+    const bytes = Buffer.byteLength(payload, "utf8");
+    if (this.pending.size >= this.maxPending || this._queuedBytes + bytes > this.maxQueuedBytes) {
+      const queueErr = new Error(
+        `QarkSession queue limit (${this.maxPending} requests / ${this.maxQueuedBytes} bytes) exceeded`
+      );
       queueErr.code = "QARK_QUEUE_FULL";
       throw queueErr;
     }
-    const id = this.nextId++;
-    const payload = JSON.stringify({ id, op, args }) + "\n";
 
     return new Promise((resolve, reject) => {
-      const timer =
+      const entry = { resolve, reject, timer: null, sent: false };
+      entry.timer =
         timeoutMs > 0
           ? setTimeout(() => {
               this.pending.delete(id);
+              const qIdx = this._writeQueue.findIndex((q) => q.id === id);
+              if (qIdx >= 0) {
+                const [removed] = this._writeQueue.splice(qIdx, 1);
+                this._queuedBytes = Math.max(0, this._queuedBytes - removed.bytes);
+              }
               const timeoutErr = new Error(
                 `Qark request #${id} (${op}) timed out after ${timeoutMs}ms`
               );
               timeoutErr.code = "QARK_TIMEOUT";
-              timeoutErr.outcomeUnknown = true;
+              timeoutErr.outcomeUnknown = entry.sent;
               reject(timeoutErr);
             }, timeoutMs)
           : null;
 
-      this.pending.set(id, { resolve, reject, timer });
-
-      this._writeChain = this._writeChain
-        .then(async () => {
-          if (!this.pending.has(id) || this.closed) return;
-          const flushed = this.proc.stdin.write(payload, "utf8", (writeErr) => {
-            if (writeErr && this.pending.has(id)) {
-              this.pending.delete(id);
-              clearTimeout(timer);
-              const err = new Error(`Failed to write to Qark worker stdin: ${writeErr.message}`);
-              err.code = "QARK_WRITE_ERROR";
-              reject(err);
-            }
-          });
-          if (!flushed && !this.closed && this.proc.exitCode === null) {
-            await Promise.race([
-              once(this.proc.stdin, "drain").catch(() => {}),
-              once(this.proc, "exit").catch(() => {}),
-            ]);
-          }
-        })
-        .catch((err) => {
-          if (this.pending.has(id)) {
-            this.pending.delete(id);
-            clearTimeout(timer);
-            reject(err);
-          }
-        });
+      this.pending.set(id, entry);
+      this._writeQueue.push({ id, payload, bytes });
+      this._queuedBytes += bytes;
+      this._drainQueue();
     });
   }
 
   async close(timeoutMs = 2000) {
     this.closed = true;
+    this._writeQueue.length = 0;
+    this._queuedBytes = 0;
     const closedErr = new Error("QarkSession closed by caller");
     closedErr.code = "QARK_SESSION_CLOSED";
     for (const [id, entry] of this.pending.entries()) {
@@ -526,7 +583,7 @@ Every committed transaction appends one NDJSON record to `.qark/journal.ndjson`,
 {
   "v": 2,
   "event": "transaction.committed",
-  "ts": 1793591200,
+  "ts_ms": 1793591200000,
   "txn": "a70d17f49f9a9f4b",
   "tag": "labyrinth-victory-overlay",
   "spec_sha256": "4b9c...",
@@ -588,3 +645,23 @@ When an orchestrator decomposes a feature into `N` separate transactions (e.g., 
 ```
 
 Qark verifies that no file was concurrently modified outside the transaction chain, restores the exact pre-feature bytes across all affected files, and records the undone transactions so `{"op": "redo", "args": {}}` can replay them if needed.
+
+---
+
+## 7. Security Boundaries, Threat Model, and Hardening Flags
+
+### 7.1 Workspace Threat Model
+
+Qark operates across three distinct workspace concurrency models:
+
+1. **Cooperative Multi-Agent Workspace:** Multiple Qark worker or MCP processes coordinate via `.qark/lock`, hash-pinned compare-and-swap (`expect`), WAL recovery (`.qark/wal.json`), and the append-only journal (`.qark/journal.ndjson`). Full multi-file serializability and crash recovery hold under this model.
+2. **Mixed Editor / External Tool Workspace:** An IDE, formatter, or human edits files outside Qark while Qark transactions or rollbacks run. Qark enforces compare-and-swap (`expect`) on every `apply` (even when proposed content matches current disk bytes, returning `"precondition_matched": true` on matched `expect`), and verifies post-image hashes before any in-flight `publish()` rollback, `recover_wal`, `undo`, or `redo` so external edits made after a partial publish are never silently clobbered.
+3. **Hostile Local Concurrent Process (Symlink Racer):** Another process running as the same OS user races symlinks or directory swaps against Qark. Qark verifies `metadata_link` on the workspace root (`--root`), re-checks path ancestry and `.qark` control-directory links immediately before and after staging/publishing/locking, and fails closed with `conflict` (`reason: "path_link"`). Full immunity against a same-UID local racer requires OS-level namespace/container isolation or `openat2(RESOLVE_NO_SYMLINKS)` dirfd plumbing.
+
+### 7.2 Hardening Flags & Spec Options
+
+- **Strict CAS `expect` (`precondition_matched`):** Whenever `"expect": "<sha256>"` is supplied on a file entry (regardless of `mode` or whether the resulting bytes are identical to disk), Qark verifies the on-disk SHA-256 matches `expect` before returning `unchanged`, `replaced`, or `deleted`, and emits `"precondition_matched": true` in the per-file receipt.
+- **Crash-Durable Commits (`--durable` / `"durable": true`):** By default, Qark uses fast atomic rename durability (suitable for local agent inner loops). Passing `--durable` on the CLI or `"durable": true` in the `apply` spec enables `fsync`/`FlushFileBuffers` on staged temp files, `.qark/wal.json`, `.qark/journal.ndjson`, and snapshot state, returning `"durable": true` in the receipt.
+- **Untrusted Workspace Safe Mode (`--no-custom-exec`):** Starting Qark with `--no-custom-exec` disables execution of workspace-defined `.qark/checks.json` commands and `validate` / `project.validate` shell commands, failing closed with `exec_forbidden` while keeping built-in/system language syntax checkers active.
+- **Strict Spec Validation (`--strict-spec` / `"strict_spec": true`):** Rejects any unrecognized top-level, file-level, or edit-level key with `spec_unknown_key`. Safety-critical key typos (`expct`, `require_expct`, `rebse`, `cntract`, `check_polcy`, `idempotency`, `expect_sig`, `forbid_deletes`) always fail closed with `spec_unknown_key` even when `strict_spec` is not set.
+

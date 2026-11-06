@@ -27,7 +27,7 @@ use write: qark.rpc.write;
 use ui: qark.ui.app;
 use util: qark.util;
 
-pub val VERSION: str = "0.3.0";
+pub val VERSION: str = "0.3.1";
 
 fun arg(argv: **u8, i: i64) str {
     if (argv == nil || i < 0) { ret nil; }
@@ -265,6 +265,14 @@ pub fun run(argc: i64, argv: **u8) i64 {
     }
     if (has(argc, argv, "--lock-root")) { s.lock_root = true; }
     if (has(argc, argv, "--require-check")) { s.require_check = true; }
+    if (has(argc, argv, "--no-custom-exec")) { s.no_custom_exec = true; }
+    if (has(argc, argv, "--strict-spec")) { s.strict_spec = true; }
+    if (has(argc, argv, "--durable")) {
+        s.durable = true;
+    }
+    if (s.no_custom_exec) {
+        s.tools.no_custom_exec = true;
+    }
     if (dumped != nil) {
         session.begin_request(?s);
         var dw: jw.Jw = jw.init(?s.ra);

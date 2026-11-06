@@ -251,6 +251,9 @@ fun file_receipt(w: *jw.Jw, a: *A.Allocator, e: *commit.Entry, dry: bool, previe
         jw.f_str(w, "message", commit.reason_message(e.reason));
         if (e.existed) { jw.f_str(w, "current_sha256", ?e.old_sha[0]); }
     }
+    if (e.has_expect && e.status != commit.ST_CONFLICT) {
+        jw.f_bool(w, "precondition_matched", true);
+    }
     if (e.status == commit.ST_UNCHANGED) {
         if (e.edited) {
             jw.f_str(w, "reason", "no_change");
@@ -499,6 +502,7 @@ fun emit_checker_diagnostics(w: *jw.Jw, set: *commit.Set) {
 fun build_journal_line(s: *session.Session, sp: *spec.Spec, txn: *u8, val_ran: bool, val_ok: bool, out_buf: **u8, out_len: *usize) bool {
     var w: jw.Jw = jw.init(?s.ra);
     jw.obj(?w);
+    jw.f_i64(?w, "v", 2);
     jw.f_str(?w, "event", "transaction.committed");
     val clock: time.Clock = time.now();
     if (sel clock.ok) { jw.f_i64(?w, "ts_ms", time.time_unix_msec(clock.ok)); }
@@ -508,6 +512,9 @@ fun build_journal_line(s: *session.Session, sp: *spec.Spec, txn: *u8, val_ran: b
     jw.f_str(?w, "spec_sha256", ?sp.sha[0]);
     jw.f_str(?w, "check_policy", check_policy_name(sp.check));
     jw.f_bool(?w, "validation_complete", is_validation_complete(?sp.set, sp.check, val_ran, val_ok));
+    jw.f_i64(?w, "created", commit.tally(?sp.set, commit.ST_CREATE));
+    jw.f_i64(?w, "replaced", commit.tally(?sp.set, commit.ST_REPLACE));
+    jw.f_i64(?w, "deleted", commit.tally(?sp.set, commit.ST_DELETE));
     jw.key(?w, "files");
     jw.arr(?w);
     var i: usize = 0;
@@ -550,11 +557,15 @@ fun build_journal_line(s: *session.Session, sp: *spec.Spec, txn: *u8, val_ran: b
 fun build_undo_journal_line(s: *session.Session, set: *commit.Set, ev_name: str, txn: *u8, target_txn: str, out_buf: **u8, out_len: *usize) bool {
     var w: jw.Jw = jw.init(?s.ra);
     jw.obj(?w);
+    jw.f_i64(?w, "v", 2);
     jw.f_str(?w, "event", ev_name);
     val clock: time.Clock = time.now();
     if (sel clock.ok) { jw.f_i64(?w, "ts_ms", time.time_unix_msec(clock.ok)); }
     jw.f_str(?w, "txn", txn);
     jw.f_str(?w, "target_txn", target_txn);
+    jw.f_i64(?w, "created", commit.tally(set, commit.ST_CREATE));
+    jw.f_i64(?w, "replaced", commit.tally(set, commit.ST_REPLACE));
+    jw.f_i64(?w, "deleted", commit.tally(set, commit.ST_DELETE));
     jw.key(?w, "files");
     jw.arr(?w);
     var i: usize = 0;
@@ -579,34 +590,19 @@ fun build_undo_journal_line(s: *session.Session, set: *commit.Set, ev_name: str,
     ret true;
 }
 
-fun journal_has_txn(a: *A.Allocator, root: str, txn: *u8, out_existing_off: *i64) bool {
-    @out_existing_off = -1;
-    if (txn == nil || txn[0] == 0) { ret false; }
-    val jfull: res[str, A.Error] = pathx.native(a, root, ".qark/journal.ndjson");
-    if (sel jfull.err) { ret false; }
-    val jm: res[filesystem.Metadata, io_error.Error] = filesystem.metadata_link(jfull.ok);
-    if (sel jm.err) { ret false; }
-    if (jm.ok.kind != filesystem.KIND_FILE) { ret false; }
-    val jtxt: res[str, filesystem.FsError] = filesystem.read_string(a, jfull.ok);
-    if (sel jtxt.err) { ret false; }
-    var needle_w: jw.Jw = jw.init(a);
-    jw.raw(?needle_w, "\"txn\":\"");
-    jw.raw(?needle_w, txn);
-    jw.raw(?needle_w, "\"");
-    if (needle_w.failed || needle_w.buf == nil) { ret false; }
-    val jp: *u8 = jtxt.ok;
-    val jn: usize = str_len(jp);
-    val np: *u8 = needle_w.buf;
-    val nn: usize = needle_w.len;
-    if (jn < nn) { ret false; }
+fun sync_path(p: str) bool {
+    ret commit.sync_file(p);
+}
+
+fun slice_has_txn_needle(a: *A.Allocator, p: *u8, n: usize, txn: *u8) bool {
+    var nw: jw.Jw = jw.init(a);
+    jw.raw(?nw, "\"txn\":\"");
+    jw.raw(?nw, txn);
+    jw.raw(?nw, "\"");
+    if (nw.failed || nw.buf == nil || n < nw.len) { ret false; }
     var pos: usize = 0;
-    for (pos + nn <= jn) {
-        if (util.mem_eq((jp::usize + pos)::*u8, np, nn)) {
-            var line_s: usize = pos;
-            for (line_s > 0 && jp[line_s - 1] != '\n') { line_s = line_s - 1; }
-            @out_existing_off = line_s::i64;
-            ret true;
-        }
+    for (pos + nw.len <= n) {
+        if (util.mem_eq((p::usize + pos)::*u8, nw.buf, nw.len)) { ret true; }
         pos = pos + 1;
     }
     ret false;
@@ -615,14 +611,114 @@ fun journal_has_txn(a: *A.Allocator, root: str, txn: *u8, out_existing_off: *i64
 fun ensure_journal_line(a: *A.Allocator, root: str, set: *commit.Set, txn: *u8, line_p: *u8, line_n: usize, out_off: *i64) bool {
     @out_off = -1;
     if (line_p == nil || line_n == 0) { ret true; }
-    var existing_off: i64 = -1;
-    if (journal_has_txn(a, root, txn, ?existing_off)) {
-        @out_off = existing_off;
+    if (txn == nil || txn[0] == 0) { ret false; }
+    if (!commit.check_control_dir(a, root)) { ret false; }
+    val jfull: res[str, A.Error] = pathx.native(a, root, ".qark/journal.ndjson");
+    if (sel jfull.err) { ret false; }
+    val jm: res[filesystem.Metadata, io_error.Error] = filesystem.metadata_link(jfull.ok);
+    if (sel jm.err) {
+        if (jm.err.kind == io_error.NOT_FOUND || jm.err.kind == io_error.NOT_DIRECTORY) {
+            val off0: i64 = commit.journal(set, line_p, line_n);
+            if (off0 < 0) { ret false; }
+            @out_off = off0;
+            ret true;
+        }
+        ret false;
+    }
+    if (jm.ok.kind != filesystem.KIND_FILE) { ret false; }
+    val jbytes: res[vector.Vector[u8], filesystem.FsError] = filesystem.read_bytes(a, jfull.ok);
+    if (sel jbytes.err) { ret false; }
+    val jp: *u8 = jbytes.ok.data;
+    val jn: usize = jbytes.ok.len;
+    if (jn == 0 || jp == nil) {
+        val off1: i64 = commit.journal(set, line_p, line_n);
+        if (off1 < 0) { ret false; }
+        @out_off = off1;
         ret true;
     }
-    val off: i64 = commit.journal(set, line_p, line_n);
-    if (off < 0) { ret false; }
-    @out_off = off;
+    var pos: usize = 0;
+    var valid_end: usize = 0;
+    var found_off: i64 = -1;
+    var has_torn_tail: bool = false;
+    for (pos < jn) {
+        var nl: usize = pos;
+        for (nl < jn && jp[nl] != '\n') { nl = nl + 1; }
+        if (nl == jn) {
+            has_torn_tail = true;
+            brk;
+        }
+        var le: usize = nl;
+        if (le > pos && jp[le - 1] == '\r') { le = le - 1; }
+        var line_valid: bool = false;
+        var ltxn: *u8 = nil;
+        var ltxn_n: usize = 0;
+        if (le > pos) {
+            val parsed: res[json.Value, json.JsonError] = json.parse((jp::usize + pos)::*u8, le - pos, a);
+            if (sel parsed.ok) {
+                var doc: json.Value = parsed.ok;
+                if (json.value_is_object(?doc)) {
+                    val tf: opt[*json.Value] = json.value_find(?doc, "txn");
+                    if (sel tf.some) {
+                        if (json.value_is_string(tf.some) && spec.decode_pub(a, tf.some, ?ltxn, ?ltxn_n) && ltxn != nil && ltxn_n > 0) {
+                            line_valid = true;
+                        }
+                    }
+                }
+            }
+        }
+        if (!line_valid) {
+            if (nl + 1 == jn) {
+                has_torn_tail = true;
+                brk;
+            }
+            ret false;
+        }
+        valid_end = nl + 1;
+        if (found_off < 0 && util.eq(ltxn, txn)) {
+            found_off = pos::i64;
+        }
+        pos = nl + 1;
+    }
+    if (found_off >= 0) {
+        if (has_torn_tail) {
+            val wr_trim: err[filesystem.FsError] = filesystem.replace_bytes_atomic(a, jfull.ok, jp, valid_end, 384, 448);
+            if (sel wr_trim.err) { ret false; }
+            if (set.durable && !sync_path(jfull.ok)) { ret false; }
+        }
+        @out_off = found_off;
+        ret true;
+    }
+    if (!has_torn_tail) {
+        val off: i64 = commit.journal(set, line_p, line_n);
+        if (off < 0) { ret false; }
+        @out_off = off;
+        ret true;
+    }
+    val tail_p: *u8 = (jp::usize + valid_end)::*u8;
+    val tail_n: usize = jn - valid_end;
+    val is_prefix: bool = tail_n <= line_n && util.mem_eq(tail_p, line_p, tail_n);
+    val has_txn_tok: bool = slice_has_txn_needle(a, tail_p, tail_n, txn);
+    if (!is_prefix && !has_txn_tok) {
+        ret false;
+    }
+    val total_n: usize = valid_end + line_n;
+    val buf: res[*u8, A.Error] = A.allocate[u8](a, total_n + 1);
+    if (sel buf.err) { ret false; }
+    var bi: usize = 0;
+    for (bi < valid_end) {
+        buf.ok[bi] = jp[bi];
+        bi = bi + 1;
+    }
+    var li: usize = 0;
+    for (li < line_n) {
+        buf.ok[valid_end + li] = line_p[li];
+        li = li + 1;
+    }
+    buf.ok[total_n] = 0;
+    val wr_rep: err[filesystem.FsError] = filesystem.replace_bytes_atomic(a, jfull.ok, buf.ok, total_n, 384, 448);
+    if (sel wr_rep.err) { ret false; }
+    if (set.durable && !sync_path(jfull.ok)) { ret false; }
+    @out_off = valid_end::i64;
     ret true;
 }
 
@@ -667,7 +763,8 @@ fun emit_set_files_snapshot(a: *A.Allocator, w: *jw.Jw, set: *commit.Set) bool {
             jw.f_str(w, "path", e.rel);
             jw.f_str(w, "status", commit.status_name(e.status));
             if (e.exec) { jw.f_bool(w, "exec", true); }
-            if (e.target_perm != 0) { jw.f_i64(w, "target_perm", e.target_perm::i64); }
+            if (e.has_target_perm) { jw.f_bool(w, "has_target_perm", true); }
+            if (e.has_target_perm || e.target_perm != 0) { jw.f_i64(w, "target_perm", e.target_perm::i64); }
             if (e.mode != commit.MODE_DELETE) {
                 jw.f_str(w, "sha256", ?e.sha[0]);
                 if (e.len == 0) {
@@ -1176,14 +1273,16 @@ fun recover_wal(a: *A.Allocator, root: str) i64 {
                 ret -1;
             }
             var perm: u32 = 420;
+            var has_pm: bool = false;
             val pmf: opt[*json.Value] = json.value_find(g_val, "old_perm");
             if (sel pmf.some) {
-                if (json.value_is_number(pmf.some) && json.value_number(pmf.some) > 0) {
+                if (json.value_is_number(pmf.some) && json.value_number(pmf.some) >= 0) {
                     perm = json.value_number(pmf.some)::u32;
+                    has_pm = true;
                 }
             }
             var perm_bits: i32 = (perm & 511)::i32;
-            if (perm_bits == 0) { perm_bits = 420; }
+            if (!has_pm && perm_bits == 0) { perm_bits = 420; }
             val wr: err[filesystem.FsError] = filesystem.replace_bytes_atomic(a, ffull.ok, old_b, old_n, perm_bits, 493);
             if (sel wr.err) { ret -1; }
             val verify_b: res[vector.Vector[u8], filesystem.FsError] = filesystem.read_bytes(a, ffull.ok);
@@ -1331,8 +1430,10 @@ pub fun redo(s: *session.Session, args: *json.Value, w: *jw.Jw) bool {
     val dry: bool = spec.fbool_pub(args, "dry_run") || s.force_dry;
     val force: bool = spec.fbool_pub(args, "force");
     val show_diff: bool = spec.fbool_pub(args, "diff");
+    val durable: bool = spec.fbool_pub(args, "durable") || s.durable;
 
     var fwd_set: commit.Set = commit.init(a, s.root);
+    fwd_set.durable = durable;
     var held: commit.Lock;
     val locked: i64 = commit.lock(?fwd_set, s.lock_ms, ?held);
     if (locked == 1) { ret simple_error(w, "locked", "another qark process held the workspace lock"); }
@@ -1489,10 +1590,12 @@ pub fun redo(s: *session.Session, args: *json.Value, w: *jw.Jw) bool {
                 }
                 val is_exec: bool = spec.fbool_pub(g.some, "exec");
                 var tperm: u32 = 0;
+                var has_tperm: bool = false;
                 val tpf: opt[*json.Value] = json.value_find(g.some, "target_perm");
                 if (sel tpf.some) {
-                    if (json.value_is_number(tpf.some) && json.value_number(tpf.some) > 0) {
+                    if (json.value_is_number(tpf.some) && json.value_number(tpf.some) >= 0) {
                         tperm = json.value_number(tpf.some)::u32;
+                        has_tperm = true;
                     }
                 }
                 if (p == nil || pn == 0 || st == nil || pathx.check(p) != pathx.P_OK) {
@@ -1522,6 +1625,7 @@ pub fun redo(s: *session.Session, args: *json.Value, w: *jw.Jw) bool {
                         ent.data = new_t;
                         ent.len = new_n;
                         ent.exec = is_exec;
+                        ent.has_target_perm = has_tperm;
                         ent.target_perm = tperm;
                         commit.hash_hex(new_t, new_n, ?ent.sha[0]);
                         if (force) { ent.mode = commit.MODE_UPSERT; }
@@ -1532,6 +1636,7 @@ pub fun redo(s: *session.Session, args: *json.Value, w: *jw.Jw) bool {
                         ent.mode = commit.MODE_DELETE;
                         ent.data = nil;
                         ent.len = 0;
+                        ent.has_target_perm = false;
                         ent.target_perm = 0;
                         ent.force_replace = false;
                         ent.force_delete = force;
@@ -1555,6 +1660,7 @@ pub fun redo(s: *session.Session, args: *json.Value, w: *jw.Jw) bool {
                             val ent: *commit.Entry = commit.entry(?fwd_set, added.ok);
                             ent.pre_existed = false;
                             ent.exec = is_exec;
+                            ent.has_target_perm = has_tperm;
                             ent.target_perm = tperm;
                         }
                     }
@@ -1570,6 +1676,7 @@ pub fun redo(s: *session.Session, args: *json.Value, w: *jw.Jw) bool {
                             val ent: *commit.Entry = commit.entry(?fwd_set, added.ok);
                             ent.pre_existed = true;
                             ent.exec = is_exec;
+                            ent.has_target_perm = has_tperm;
                             ent.target_perm = tperm;
                             ent.force_replace = same_sha;
                             if (!force && psha != nil) {
@@ -1667,6 +1774,7 @@ pub fun redo(s: *session.Session, args: *json.Value, w: *jw.Jw) bool {
         jw.f_i64(w, "steps_redone", txn_cnt::i64);
     }
     jw.f_bool(w, "dry_run", dry);
+    if (fwd_set.durable) { jw.f_bool(w, "durable", true); }
     counts(w, ?fwd_set);
     files_list(w, ?fwd_set, dry, false, false, show_diff, a);
     jw.obj_end(w);
@@ -1714,8 +1822,10 @@ pub fun undo(s: *session.Session, args: *json.Value, w: *jw.Jw) bool {
     val dry: bool = spec.fbool_pub(args, "dry_run") || s.force_dry;
     val force: bool = spec.fbool_pub(args, "force");
     val show_diff: bool = spec.fbool_pub(args, "diff");
+    val durable: bool = spec.fbool_pub(args, "durable") || s.durable;
 
     var rev_set: commit.Set = commit.init(a, s.root);
+    rev_set.durable = durable;
     var held: commit.Lock;
     val locked: i64 = commit.lock(?rev_set, s.lock_ms, ?held);
     if (locked == 1) { ret simple_error(w, "locked", "another qark process held the workspace lock"); }
@@ -1866,10 +1976,12 @@ pub fun undo(s: *session.Session, args: *json.Value, w: *jw.Jw) bool {
                     }
                 }
                 var operm: u32 = 0;
+                var has_operm: bool = false;
                 val opmf: opt[*json.Value] = json.value_find(g.some, "old_perm");
                 if (sel opmf.some) {
-                    if (json.value_is_number(opmf.some) && json.value_number(opmf.some) > 0) {
+                    if (json.value_is_number(opmf.some) && json.value_number(opmf.some) >= 0) {
                         operm = json.value_number(opmf.some)::u32;
+                        has_operm = true;
                     }
                 }
                 if (p == nil || pn == 0 || st == nil || pathx.check(p) != pathx.P_OK) {
@@ -1892,6 +2004,7 @@ pub fun undo(s: *session.Session, args: *json.Value, w: *jw.Jw) bool {
                         ent.mode = commit.MODE_DELETE;
                         ent.data = nil;
                         ent.len = 0;
+                        ent.has_target_perm = false;
                         ent.target_perm = 0;
                         ent.force_replace = false;
                         ent.force_delete = force;
@@ -1907,6 +2020,7 @@ pub fun undo(s: *session.Session, args: *json.Value, w: *jw.Jw) bool {
                         ent.force_replace = same_sha;
                         ent.data = old_t;
                         ent.len = old_n;
+                        ent.has_target_perm = has_operm;
                         ent.target_perm = operm;
                         commit.hash_hex(old_t, old_n, ?ent.sha[0]);
                         if (force) { ent.mode = commit.MODE_UPSERT; }
@@ -1941,6 +2055,7 @@ pub fun undo(s: *session.Session, args: *json.Value, w: *jw.Jw) bool {
                         if (sel added.ok) {
                             val ent: *commit.Entry = commit.entry(?rev_set, added.ok);
                             ent.pre_existed = true;
+                            ent.has_target_perm = has_operm;
                             ent.target_perm = operm;
                             ent.force_replace = same_sha;
                             if (!force && sha != nil) {
@@ -1959,6 +2074,7 @@ pub fun undo(s: *session.Session, args: *json.Value, w: *jw.Jw) bool {
                         if (sel added.ok) {
                             val ent: *commit.Entry = commit.entry(?rev_set, added.ok);
                             ent.pre_existed = false;
+                            ent.has_target_perm = has_operm;
                             ent.target_perm = operm;
                         }
                     }
@@ -2068,6 +2184,7 @@ pub fun undo(s: *session.Session, args: *json.Value, w: *jw.Jw) bool {
         jw.f_i64(w, "steps_reverted", steps);
     }
     jw.f_bool(w, "dry_run", dry);
+    if (rev_set.durable) { jw.f_bool(w, "durable", true); }
     counts(w, ?rev_set);
     files_list(w, ?rev_set, dry, false, false, show_diff, a);
     jw.obj_end(w);
@@ -2248,6 +2365,9 @@ pub fun apply(s: *session.Session, args: *json.Value, w: *jw.Jw) bool {
     if (s.require_check && val_spec != nil && json.value_is_bool(val_spec) && !json.value_bool(val_spec)) {
         ret simple_error(w, "check_unavailable", "session requires syntax checking (--require-check); validate cannot be disabled");
     }
+    if (s.no_custom_exec && val_spec != nil && !(json.value_is_bool(val_spec) && !json.value_bool(val_spec))) {
+        ret simple_error(w, "exec_forbidden", "custom validation command execution is disabled by --no-custom-exec");
+    }
 
     var compact: jw.Jw = jw.init(a);
     spec.emit_json(?compact, args, false, 0);
@@ -2290,6 +2410,17 @@ pub fun apply(s: *session.Session, args: *json.Value, w: *jw.Jw) bool {
     if (!spec.compile(?sp, a, s.root, args, compact.buf, compact.len, ?lib, ?e)) {
         if (has_early_lock) { commit.unlock(?held); }
         ret spec_error(w, ?e);
+    }
+    if (s.strict_spec && sp.unknown_key != nil) {
+        e.code = "spec_unknown_key";
+        e.msg = sp.unknown_key;
+        e.field = sp.unknown_fld;
+        if (has_early_lock) { commit.unlock(?held); }
+        ret spec_error(w, ?e);
+    }
+    if (s.durable) {
+        sp.durable = true;
+        sp.set.durable = true;
     }
     if (s.force_dry) { sp.dry = true; }
     if (s.require_check) {
@@ -2404,14 +2535,15 @@ pub fun apply(s: *session.Session, args: *json.Value, w: *jw.Jw) bool {
     var val_ok: bool = true;
     var val_msg: str = nil;
     val do_check: bool = sp.check != spec.CHECK_OFF || has_any_file_check(?sp.set);
+    s.tools.no_custom_exec = s.no_custom_exec;
     if (do_check) {
         check.run(a, s.a, s.root, ?sp.set, ?s.tools, timeout_ms);
-        if (conflicts == 0 && check.has_staged(a, s.root, ?sp.set)) {
+        if (!s.no_custom_exec && conflicts == 0 && check.has_staged(a, s.root, ?sp.set)) {
             check.run_staged(a, s.root, ?sp.set, timeout_ms);
         }
         t_check = now_us(t0);
     }
-    if (conflicts == 0 && (val_spec != nil || do_check)) {
+    if (!s.no_custom_exec && conflicts == 0 && (val_spec != nil || do_check)) {
         val t_dval0: i64 = now_us(t0);
         val_ok = check.run_project_validation(a, s.root, ?sp.set, val_spec, timeout_ms, ?val_ran, ?val_msg);
         if (val_ran && stream) {
@@ -2516,6 +2648,9 @@ pub fun apply(s: *session.Session, args: *json.Value, w: *jw.Jw) bool {
     jw.f_str(?rw, "txn", ?txn[0]);
     if (s.root != nil) { jw.f_str(?rw, "root", s.root); }
     jw.f_bool(?rw, "dry_run", sp.dry);
+    if (sp.set.durable) {
+        jw.f_bool(?rw, "durable", true);
+    }
     if (sp.dry) {
         jw.f_bool(?rw, "ready", conflicts == 0 && !blocked);
     }
@@ -3654,6 +3789,9 @@ pub fun project_validate(s: *session.Session, args: *json.Value, w: *jw.Jw) bool
                 }
             }
         }
+    }
+    if (s.no_custom_exec) {
+        ret simple_error(w, "exec_forbidden", "custom validation command execution is disabled by --no-custom-exec");
     }
     val a: *A.Allocator = ?s.ra;
     var val_spec: *json.Value = nil;
