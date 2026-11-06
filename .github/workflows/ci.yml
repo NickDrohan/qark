@@ -235,7 +235,7 @@ jobs:
           tar -xzf /tmp/mach.tar.gz -C "$HOME/.local/bin"
           chmod +x "$HOME/.local/bin/mach"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-          "$HOME/.local/bin/mach" --version
+          "$HOME/.local/bin/mach" info
 
       - name: Install Mach compiler (v6.10.1) on Windows
         if: runner.os == 'Windows'
@@ -249,7 +249,7 @@ jobs:
           $machExe = Get-ChildItem -Path $destDir -Filter "mach.exe" -Recurse | Select-Object -First 1
           if (-not $machExe) { throw "mach.exe not found in archive" }
           $machExe.DirectoryName | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-          & $machExe.FullName --version
+          & $machExe.FullName info
 
       - name: Build and run POSIX unit, smoke, permission, torn-journal, and SIGKILL suite (Linux)
         if: runner.os == 'Linux'
