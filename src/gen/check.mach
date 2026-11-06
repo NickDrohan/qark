@@ -155,7 +155,9 @@ fun line_at(p: *u8, off: usize, n: usize, col: *i64) i64 {
 fun native_json(a: *A.Allocator, e: *commit.Entry) {
     val parsed: res[json.Value, json.JsonError] = json.parse(e.data, e.len, a);
     if (sel parsed.ok) {
-        e.check = commit.CK_OK;
+        if (e.check != commit.CK_FAILED && e.check != commit.CK_ERROR) {
+            e.check = commit.CK_OK;
+        }
         ret;
     }
     var off: usize = 0;
@@ -181,7 +183,9 @@ fun native_json(a: *A.Allocator, e: *commit.Entry) {
 fun native_toml(a: *A.Allocator, e: *commit.Entry) {
     val parsed: res[toml.Table, toml.TomlError] = toml.parse(a, e.data);
     if (sel parsed.ok) {
-        e.check = commit.CK_OK;
+        if (e.check != commit.CK_FAILED && e.check != commit.CK_ERROR) {
+            e.check = commit.CK_OK;
+        }
         ret;
     }
     var off: usize = 0;
@@ -266,12 +270,15 @@ fun mark_all(set: *commit.Set, r: *Run, why: str, failed: bool) {
         if (failed) {
             e.check = commit.CK_FAILED;
             e.ck_cat = "project_check";
+            e.ck_msg = why;
         }
         or {
-            e.check = commit.CK_SKIPPED;
-            e.ck_cat = "tool_missing";
+            if (e.check != commit.CK_FAILED && e.check != commit.CK_ERROR) {
+                e.check = commit.CK_SKIPPED;
+                e.ck_cat = "tool_missing";
+                e.ck_msg = why;
+            }
         }
-        e.ck_msg = why;
         i = i + 1;
     }
 }
@@ -730,7 +737,11 @@ fun assign_batch(a: *A.Allocator, set: *commit.Set, r: *Run, text: *u8, n: usize
             if (sel okf.some) {
                 if (json.value_is_bool(okf.some)) { ok = json.value_bool(okf.some); }
             }
-            if (ok) { e.check = commit.CK_OK; }
+            if (ok) {
+                if (e.check != commit.CK_FAILED && e.check != commit.CK_ERROR) {
+                    e.check = commit.CK_OK;
+                }
+            }
             or {
                 e.check = commit.CK_FAILED;
                 e.ck_cat = "syntax_error";
@@ -800,8 +811,66 @@ fun skip_stage_dir(name: str) bool {
     ret util.eq(name, ".qark");
 }
 
-fun copy_workspace_dir(a: *A.Allocator, src_root: str, dst_root: str, dir_rel: str, depth: i64, files_seen: *i64, bytes_seen: *usize) bool {
-    if (depth > 32) { ret false; }
+fun say_stage_err(a: *A.Allocator, prefix: str, rel: str) str {
+    var w: jw.Jw = jw.init(a);
+    jw.raw(?w, prefix);
+    if (rel != nil) { jw.raw(?w, rel); }
+    if (w.failed || w.buf == nil) { ret prefix; }
+    ret jw.text(?w);
+}
+
+fun verify_staged_candidates(a: *A.Allocator, stage_dir: str, set: *commit.Set, idx: *vector.Vector[usize]) bool {
+    if (stage_dir == nil || set == nil) { ret true; }
+    var ok_all: bool = true;
+    var count: usize = commit.count(set);
+    if (idx != nil) { count = idx.len; }
+    var k: usize = 0;
+    for (k < count) {
+        var ei: usize = k;
+        if (idx != nil) { ei = idx.data[k]; }
+        val e: *commit.Entry = commit.entry(set, ei);
+        if (e.status == commit.ST_CREATE || e.status == commit.ST_REPLACE) {
+            val dst: res[str, A.Error] = pathx.native(a, stage_dir, e.rel);
+            var mutated: bool = false;
+            if (sel dst.ok) {
+                val got: res[vector.Vector[u8], filesystem.FsError] = filesystem.read_bytes(a, dst.ok);
+                if (sel got.ok) {
+                    var got_sha: [65]u8;
+                    commit.hash_hex(got.ok.data, got.ok.len, ?got_sha[0]);
+                    if (!util.eq(?got_sha[0], ?e.sha[0])) { mutated = true; }
+                }
+                or { mutated = true; }
+            }
+            or { mutated = true; }
+            if (mutated) {
+                e.check = commit.CK_ERROR;
+                e.ck_cat = "stage_mutated";
+                e.ck_msg = "validator modified or deleted the staged candidate file during validation";
+                ok_all = false;
+            }
+        }
+        or (e.status == commit.ST_DELETE) {
+            val dst: res[str, A.Error] = pathx.native(a, stage_dir, e.rel);
+            if (sel dst.ok) {
+                val m: res[filesystem.Metadata, io_error.Error] = filesystem.metadata_link(dst.ok);
+                if (sel m.ok) {
+                    e.check = commit.CK_ERROR;
+                    e.ck_cat = "stage_mutated";
+                    e.ck_msg = "validator recreated a staged deleted file during validation";
+                    ok_all = false;
+                }
+            }
+        }
+        k = k + 1;
+    }
+    ret ok_all;
+}
+
+fun copy_workspace_dir(a: *A.Allocator, src_root: str, dst_root: str, dir_rel: str, depth: i64, files_seen: *i64, bytes_seen: *usize, out_err: *str) bool {
+    if (depth > 32) {
+        if (out_err != nil && @out_err == nil) { @out_err = "workspace directory tree exceeds maximum staging depth (32 levels)"; }
+        ret false;
+    }
     var src_full: str = src_root;
     if (dir_rel != nil && dir_rel[0] != 0) {
         val j: res[str, A.Error] = pathx.native(a, src_root, dir_rel);
@@ -809,7 +878,10 @@ fun copy_workspace_dir(a: *A.Allocator, src_root: str, dst_root: str, dir_rel: s
         src_full = j.ok;
     }
     val names: res[vector.Vector[str], filesystem.FsError] = filesystem.read_dir(a, src_full);
-    if (sel names.err) { ret false; }
+    if (sel names.err) {
+        if (out_err != nil && @out_err == nil) { @out_err = say_stage_err(a, "could not read workspace directory while staging: ", dir_rel); }
+        ret false;
+    }
     var i: usize = 0;
     for (i < names.ok.len) {
         val name: str = names.ok.data[i];
@@ -823,18 +895,31 @@ fun copy_workspace_dir(a: *A.Allocator, src_root: str, dst_root: str, dir_rel: s
             val child: res[str, A.Error] = pathx.native(a, src_root, rel);
             if (sel child.err) { ret false; }
             val m: res[filesystem.Metadata, io_error.Error] = filesystem.metadata_link(child.ok);
-            if (sel m.err) { ret false; }
+            if (sel m.err) {
+                if (out_err != nil && @out_err == nil) { @out_err = say_stage_err(a, "could not inspect workspace path while staging: ", rel); }
+                ret false;
+            }
             if (m.ok.kind == filesystem.KIND_DIR) {
                 val dst_dir: res[str, A.Error] = pathx.native(a, dst_root, rel);
                 if (sel dst_dir.err) { ret false; }
                 val mkd: err[filesystem.FsError] = filesystem.create_dir_all(a, dst_dir.ok, 493);
                 if (sel mkd.err) { ret false; }
-                if (!copy_workspace_dir(a, src_root, dst_root, rel, depth + 1, files_seen, bytes_seen)) { ret false; }
+                if (!copy_workspace_dir(a, src_root, dst_root, rel, depth + 1, files_seen, bytes_seen, out_err)) { ret false; }
             }
             or (m.ok.kind == filesystem.KIND_FILE) {
                 @files_seen = @files_seen + 1;
-                if (@files_seen > 16384 || m.ok.size > 33554432) { ret false; }
-                if (@bytes_seen + m.ok.size > 268435456) { ret false; }
+                if (@files_seen > 16384) {
+                    if (out_err != nil && @out_err == nil) { @out_err = "workspace exceeds maximum staged file count (16384 files)"; }
+                    ret false;
+                }
+                if (m.ok.size > 33554432) {
+                    if (out_err != nil && @out_err == nil) { @out_err = say_stage_err(a, "workspace file exceeds 32 MiB staging limit: ", rel); }
+                    ret false;
+                }
+                if (@bytes_seen + m.ok.size > 268435456) {
+                    if (out_err != nil && @out_err == nil) { @out_err = "workspace exceeds 256 MiB total staging budget"; }
+                    ret false;
+                }
                 @bytes_seen = @bytes_seen + m.ok.size;
                 val dst_file: res[str, A.Error] = pathx.native(a, dst_root, rel);
                 if (sel dst_file.err) { ret false; }
@@ -843,7 +928,10 @@ fun copy_workspace_dir(a: *A.Allocator, src_root: str, dst_root: str, dir_rel: s
                 val mkp: err[filesystem.FsError] = filesystem.create_dir_all(a, pr.ok, 493);
                 if (sel mkp.err) { ret false; }
                 val got: res[vector.Vector[u8], filesystem.FsError] = filesystem.read_bytes(a, child.ok);
-                if (sel got.err) { ret false; }
+                if (sel got.err) {
+                    if (out_err != nil && @out_err == nil) { @out_err = say_stage_err(a, "could not read workspace file while staging: ", rel); }
+                    ret false;
+                }
                 var datap: *u8 = got.ok.data;
                 if (datap == nil) { datap = ""; }
                 var perm: i32 = (m.ok.mode & 511)::i32;
@@ -852,6 +940,7 @@ fun copy_workspace_dir(a: *A.Allocator, src_root: str, dst_root: str, dir_rel: s
                 if (sel wr.err) { ret false; }
             }
             or {
+                if (out_err != nil && @out_err == nil) { @out_err = say_stage_err(a, "workspace contains a symbolic link or special file that cannot be staged: ", rel); }
                 ret false;
             }
         }
@@ -861,12 +950,16 @@ fun copy_workspace_dir(a: *A.Allocator, src_root: str, dst_root: str, dir_rel: s
 }
 
 # build an isolated disposable staging tree with the workspace + candidate changes
-fun make_stage_tree(a: *A.Allocator, root: str, set: *commit.Set) str {
+fun make_stage_tree(a: *A.Allocator, root: str, set: *commit.Set, out_err: *str) str {
+    if (out_err != nil) { @out_err = nil; }
     val stage_dir: str = make_temp_dir(a, "qark_stage");
-    if (stage_dir == nil) { ret nil; }
+    if (stage_dir == nil) {
+        if (out_err != nil) { @out_err = "could not create temporary staging directory"; }
+        ret nil;
+    }
     var files_seen: i64 = 0;
     var bytes_seen: usize = 0;
-    if (!copy_workspace_dir(a, root, stage_dir, "", 0, ?files_seen, ?bytes_seen)) {
+    if (!copy_workspace_dir(a, root, stage_dir, "", 0, ?files_seen, ?bytes_seen, out_err)) {
         filesystem.remove_all(a, stage_dir);
         ret nil;
     }
@@ -1259,7 +1352,10 @@ pub fun run(a: *A.Allocator, keep: *A.Allocator, root: str, set: *commit.Set, to
             }
         }
         if (r.started) { finish_run(a, set, r); }
-        if (r.preview != nil) { filesystem.remove_all(a, r.preview); }
+        if (r.preview != nil) {
+            verify_staged_candidates(a, r.preview, set, ?r.items);
+            filesystem.remove_all(a, r.preview);
+        }
         k = k + 1;
     }
 }
@@ -1278,11 +1374,13 @@ pub fun run_staged(a: *A.Allocator, root: str, set: *commit.Set, timeout_ms: i64
     var probe_runs: vector.Vector[Run] = vector.init[Run](a);
     queue_project_checks(a, root, root, set, ?probe_runs, true);
     if (probe_runs.len == 0) { ret; }
-    val stage_dir: str = make_stage_tree(a, root, set);
+    var stage_err: str = nil;
+    val stage_dir: str = make_stage_tree(a, root, set, ?stage_err);
     if (stage_dir == nil) {
+        if (stage_err == nil) { stage_err = "the project checker could not stage the workspace files"; }
         var f: usize = 0;
         for (f < probe_runs.len) {
-            error_all(a, set, ?probe_runs.data[f], "stage_error", "the project checker could not stage the workspace files", -1, nil);
+            error_all(a, set, ?probe_runs.data[f], "stage_error", stage_err, -1, nil);
             f = f + 1;
         }
         ret;
@@ -1301,6 +1399,7 @@ pub fun run_staged(a: *A.Allocator, root: str, set: *commit.Set, timeout_ms: i64
         if (r.started) { finish_run(a, set, r); }
         k = k + 1;
     }
+    verify_staged_candidates(a, stage_dir, set, nil);
     filesystem.remove_all(a, stage_dir);
 }
 
@@ -1449,10 +1548,12 @@ pub fun run_project_validation(a: *A.Allocator, root: str, set: *commit.Set, val
         mark_project_failed(set, @out_msg, 0, 0, true);
         ret false;
     }
-    val stage_dir: str = make_stage_tree(a, root, set);
+    var stage_err: str = nil;
+    val stage_dir: str = make_stage_tree(a, root, set, ?stage_err);
     if (stage_dir == nil) {
         @ran = true;
-        @out_msg = "project validator could not stage workspace files";
+        if (stage_err != nil) { @out_msg = stage_err; }
+        or { @out_msg = "project validator could not stage workspace files"; }
         mark_project_failed(set, @out_msg, 0, 0, true);
         ret false;
     }
@@ -1512,6 +1613,7 @@ pub fun run_project_validation(a: *A.Allocator, root: str, set: *commit.Set, val
         ret false;
     }
     val done: res[runner.RunResult, exec.Error] = runner.finish(a, ?job);
+    val candidates_intact: bool = verify_staged_candidates(a, stage_dir, set, nil);
     filesystem.remove_all(a, stage_dir);
     if (sel done.err) {
         @out_msg = "project validator failed to run";
@@ -1533,6 +1635,11 @@ pub fun run_project_validation(a: *A.Allocator, root: str, set: *commit.Set, val
         var col: i64 = 0;
         parse_colon_loc(diag, ?ln, ?col);
         mark_project_failed(set, @out_msg, ln, col, false);
+        ret false;
+    }
+    if (!candidates_intact) {
+        @out_msg = "project validator modified a staged candidate file during validation";
+        mark_project_failed(set, @out_msg, 0, 0, true);
         ret false;
     }
     @out_msg = "ok";

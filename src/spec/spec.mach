@@ -741,7 +741,6 @@ fun parse_file_check(a: *A.Allocator, fv: *json.Value, fi: usize, deleting: bool
     }
     if (deleting) {
         @io_lang = nil;
-        @out_policy = commit.CP_OFF;
     }
     ret true;
 }
@@ -1266,11 +1265,12 @@ fun compile_one(sp: *Spec, fv: *json.Value, fi: usize, item: *json.Value, k: i64
     # Enforce method/symbol/line scope contracts if present on spec or file entry (intersecting both)
     var file_c: *json.Value = nil;
     val fc_f: opt[*json.Value] = json.value_find(fv, "contract");
-    if (sel fc_f.some) { file_c = fc_f.some; }
-    or {
-        val sc_f: opt[*json.Value] = json.value_find(fv, "scope");
-        if (sel sc_f.some) { file_c = sc_f.some; }
+    val sc_f: opt[*json.Value] = json.value_find(fv, "scope");
+    if (sel fc_f.some && sel sc_f.some) {
+        ret fail(e, "contract_bad", "cannot specify both contract and scope on the same entry", at(a, fi, "scope"));
     }
+    if (sel fc_f.some) { file_c = fc_f.some; }
+    or (sel sc_f.some) { file_c = sc_f.some; }
     if (file_c != nil) {
         var ce_syn: edit.Err;
         if (!edit.validate_contract_syntax(a, file_c, ?ce_syn)) {
@@ -1380,11 +1380,12 @@ fun compile_glob(sp: *Spec, fv: *json.Value, fi: usize, glob_pat: str, e: *Err) 
     }
     var file_c: *json.Value = nil;
     val fc_f: opt[*json.Value] = json.value_find(fv, "contract");
-    if (sel fc_f.some) { file_c = fc_f.some; }
-    or {
-        val sc_f: opt[*json.Value] = json.value_find(fv, "scope");
-        if (sel sc_f.some) { file_c = sc_f.some; }
+    val sc_f: opt[*json.Value] = json.value_find(fv, "scope");
+    if (sel fc_f.some && sel sc_f.some) {
+        ret fail(e, "contract_bad", "cannot specify both contract and scope on the same entry", at(a, fi, "scope"));
     }
+    if (sel fc_f.some) { file_c = fc_f.some; }
+    or (sel sc_f.some) { file_c = sc_f.some; }
     if (file_c != nil) {
         var ce_syn: edit.Err;
         if (!edit.validate_contract_syntax(a, file_c, ?ce_syn)) {
@@ -1882,8 +1883,13 @@ pub fun compile(sp: *Spec, a: *A.Allocator, root: str, args: *json.Value, raw: *
     sp.rebase = fbool(args, "rebase") == 1;
     sp.best_effort = fbool(args, "best_effort") == 1;
     sp.contract = nil;
-    var top_c: opt[*json.Value] = json.value_find(args, "contract");
-    if (!sel top_c.some) { top_c = json.value_find(args, "scope"); }
+    val top_cf: opt[*json.Value] = json.value_find(args, "contract");
+    val top_sf: opt[*json.Value] = json.value_find(args, "scope");
+    if (sel top_cf.some && sel top_sf.some) {
+        ret fail(e, "contract_bad", "cannot specify both contract and scope on the same spec", "scope");
+    }
+    var top_c: opt[*json.Value] = top_cf;
+    if (!sel top_c.some) { top_c = top_sf; }
     if (sel top_c.some) {
         if (!json.value_is_object(top_c.some)) { ret fail(e, "contract_bad", "contract must be an object", "contract"); }
         var ce_top: edit.Err;

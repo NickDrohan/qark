@@ -48,7 +48,7 @@ function parseDiag(raw, text, lineOffset) {
 function resolvePackageMode(relName, wsRoot, pkgMap) {
   const baseRoot = wsRoot || WORKSPACE_ROOT;
   let dir = path.dirname(path.resolve(baseRoot, relName || 'index.js'));
-  for (let depth = 0; depth < 32; depth++) {
+  while (true) {
     const pkgPath = path.join(dir, 'package.json');
     const key = normKey(pkgPath);
     let raw = null;
@@ -68,6 +68,9 @@ function resolvePackageMode(relName, wsRoot, pkgMap) {
       }
     }
     if (found) {
+      if (typeof raw === 'string' && raw.charCodeAt(0) === 0xfeff) {
+        raw = raw.slice(1);
+      }
       let pkg;
       try {
         pkg = JSON.parse(raw);
@@ -78,7 +81,10 @@ function resolvePackageMode(relName, wsRoot, pkgMap) {
         return { mode: 'invalid', msg: 'SyntaxError: Invalid package.json root' };
       }
       if (pkg.type === undefined) {
-        return { mode: 'untyped' };
+        return { mode: 'untyped', pkgText: raw };
+      }
+      if (typeof pkg.type !== 'string') {
+        return { mode: 'invalid', msg: 'SyntaxError: Invalid package.json "type" value' };
       }
       if (pkg.type === 'module') {
         return { mode: 'module' };
@@ -86,13 +92,14 @@ function resolvePackageMode(relName, wsRoot, pkgMap) {
       if (pkg.type === 'commonjs') {
         return { mode: 'commonjs' };
       }
-      return { mode: 'invalid', msg: 'SyntaxError: Invalid package.json "type" value' };
+      return { mode: 'untyped', pkgText: raw };
     }
+    if (path.basename(dir).toLowerCase() === 'node_modules') break;
     const parent = path.dirname(dir);
     if (!parent || parent === dir) break;
     dir = parent;
   }
-  return { mode: 'untyped' };
+  return { mode: 'untyped', pkgText: '{}' };
 }
 
 function checkModule(name, text) {
@@ -111,7 +118,7 @@ function checkModule(name, text) {
   }
 }
 
-function checkUntypedJS(name, text) {
+function checkUntypedJS(name, text, pkgText) {
   const cjsRes = checkCommonJS(name, text);
   if (cjsRes.ok) return cjsRes;
   const esmRes = checkModule(name, text);
@@ -122,7 +129,7 @@ function checkUntypedJS(name, text) {
       fs.chmodSync(tmpDir, 0o700);
     } catch (_) {}
     const pkgFile = path.join(tmpDir, 'package.json');
-    fs.writeFileSync(pkgFile, '{}', { encoding: 'utf8', mode: 0o600, flag: 'wx' });
+    fs.writeFileSync(pkgFile, pkgText || '{}', { encoding: 'utf8', mode: 0o600, flag: 'wx' });
     const tmpFile = path.join(tmpDir, 'candidate.js');
     fs.writeFileSync(tmpFile, text, { encoding: 'utf8', mode: 0o600, flag: 'wx' });
     const r = spawnSync(process.execPath, ['--check', tmpFile], { encoding: 'utf8' });
@@ -164,7 +171,7 @@ function check(name, source, wsRoot, pkgMap) {
   if (pkgMode.mode === 'commonjs') {
     return checkCommonJS(name, text);
   }
-  return checkUntypedJS(name, text);
+  return checkUntypedJS(name, text, pkgMode.pkgText);
 }
 
 function buildPkgMap(files, wsRoot) {

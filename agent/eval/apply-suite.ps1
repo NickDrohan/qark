@@ -758,11 +758,14 @@ function QAdv([string]$op, $argsObj) {
 [System.IO.File]::WriteAllText((Join-Path $advRoot "wal_existing.txt"), "partial-new`n", $utf8)
 [System.IO.File]::WriteAllText((Join-Path $advRoot "wal_created.txt"), "orphan-created`n", $utf8)
 New-Item -ItemType Directory -Force -Path (Join-Path $advRoot ".qark\undo") | Out-Null
+$walCreatedSha = ([System.BitConverter]::ToString([System.Security.Cryptography.SHA256]::Create().ComputeHash($utf8.GetBytes("orphan-created`n")))).Replace("-", "").ToLower()
+$walExistingNewSha = ([System.BitConverter]::ToString([System.Security.Cryptography.SHA256]::Create().ComputeHash($utf8.GetBytes("partial-new`n")))).Replace("-", "").ToLower()
+$walExistingOldSha = ([System.BitConverter]::ToString([System.Security.Cryptography.SHA256]::Create().ComputeHash($utf8.GetBytes("original-clean`n")))).Replace("-", "").ToLower()
 $walSnap = @{
     txn = "deadbeef12345678"
     files = @(
-        @{ path = "wal_existing.txt"; status = "replaced"; old_text = "original-clean`n"; old_perm = 420 },
-        @{ path = "wal_created.txt"; status = "created"; new_text = "orphan-created`n" }
+        @{ path = "wal_existing.txt"; status = "replaced"; old_text = "original-clean`n"; prev_sha256 = $walExistingOldSha; sha256 = $walExistingNewSha; old_perm = 420 },
+        @{ path = "wal_created.txt"; status = "created"; new_text = "orphan-created`n"; sha256 = $walCreatedSha }
     )
 } | ConvertTo-Json -Compress -Depth 10
 [System.IO.File]::WriteAllText((Join-Path $advRoot ".qark\undo\deadbeef12345678.json"), $walSnap, $utf8)
@@ -956,6 +959,128 @@ Remove-Item -Force (Join-Path $advRoot ".qark\wal.json")
 Remove-Item -Force (Join-Path $advRoot ".qark\undo\cafebabedeadbeef.json")
 Check "R2-01 (external edit guard): recover_wal refuses to overwrite post-crash user edits when disk hash matches neither prev_sha256 nor sha256" ((-not $rExtWal.ok) -and $rExtWal.error.code -eq "recovery_required" -and $extStillIntact) @{ res = $rExtWal; intact = $extStillIntact }
 
+# R3-01 / R3-02 / R3-03: WAL committed journal + idempotency finalization and missing replaced file guard
+$r3MissingSnap = @{
+    txn = "feedface12345678"
+    files = @(
+        @{ path = "wal_missing_target.txt"; status = "replaced"; old_text = "old`n"; prev_sha256 = $oldSha; sha256 = $newSha }
+    )
+} | ConvertTo-Json -Compress -Depth 10
+[System.IO.File]::WriteAllText((Join-Path $advRoot ".qark\undo\feedface12345678.json"), $r3MissingSnap, $utf8)
+[System.IO.File]::WriteAllText((Join-Path $advRoot ".qark\wal.json"), '{"txn":"feedface12345678","state":"publishing"}', $utf8)
+$r3WalMissingTarget = QAdv "apply" @{ path = "wal_after_missing.txt"; text = "blocked`n" }
+Remove-Item -Force (Join-Path $advRoot ".qark\wal.json")
+Remove-Item -Force (Join-Path $advRoot ".qark\undo\feedface12345678.json")
+$r3SpecSha = ([System.BitConverter]::ToString([System.Security.Cryptography.SHA256]::Create().ComputeHash($utf8.GetBytes('{"idempotency_key":"r3-wal-idem","path":"r3_wal_idem.txt","text":"ok\n"}')))).Replace("-", "").ToLower()
+$r3IdemKeySha = ([System.BitConverter]::ToString([System.Security.Cryptography.SHA256]::Create().ComputeHash($utf8.GetBytes("r3-wal-idem")))).Replace("-", "").ToLower()
+$r3JournalLine = '{"txn":"1122334455667788","prev_txn":"","op":"apply","files":[{"path":"r3_wal_idem.txt","status":"created","sha256":"' + $newSha + '","bytes":3,"lines":1}]}' + "`n"
+$r3IdemBuf = '{"spec_sha256":"' + $r3SpecSha + '","result":{"txn":"1122334455667788","ready":true,"applied":true,"dry_run":false,"validation":"ok","validation_complete":false,"summary":{"total":1,"created":1,"replaced":0,"unchanged":0,"deleted":0,"bytes":3},"checks":{"ok":0,"skipped":1,"failed":0,"errors":0},"files":[{"path":"r3_wal_idem.txt","status":"created","bytes":3,"lines":1,"sha256":"' + $newSha + '"}]}}'
+[System.IO.File]::WriteAllText((Join-Path $advRoot ".qark\undo\1122334455667788.json"), '{"txn":"1122334455667788","prev_txn":"","files":[{"path":"r3_wal_idem.txt","status":"created","sha256":"' + $newSha + '"}]}', $utf8)
+$r3CommittedWal = @{
+    txn = "1122334455667788"
+    state = "committed"
+    journal_line = $r3JournalLine
+    idem_rel = ".qark/idempotency/$r3IdemKeySha.json"
+    idem_buf = $r3IdemBuf
+} | ConvertTo-Json -Compress -Depth 10
+[System.IO.File]::AppendAllText((Join-Path $advRoot ".qark\journal.ndjson"), $r3JournalLine, $utf8)
+[System.IO.File]::WriteAllText((Join-Path $advRoot ".qark\wal.json"), $r3CommittedWal, $utf8)
+$r3AfterCommitted = QAdv "apply" @{ path = "r3_trigger.txt"; text = "go`n" }
+$journalContent = [System.IO.File]::ReadAllText((Join-Path $advRoot ".qark\journal.ndjson"))
+$txnMatches = ([regex]::Matches($journalContent, '"txn":"1122334455667788"')).Count
+$idemPersisted = Test-Path (Join-Path $advRoot ".qark\idempotency\$r3IdemKeySha.json")
+Check "R3-01/R3-02/R3-03: recover_wal refuses missing replaced target, deduplicates committed journal line, and persists committed idempotency receipt" ((-not $r3WalMissingTarget.ok) -and $r3WalMissingTarget.error.code -eq "recovery_required" -and $r3AfterCommitted.ok -and $txnMatches -eq 1 -and $idemPersisted) @{ miss = $r3WalMissingTarget; after = $r3AfterCommitted; matches = $txnMatches; idem = $idemPersisted }
+
+# R3-04: custom .qark/checks.json failure on .json/.toml is never overwritten by native JSON/TOML checker
+[System.IO.File]::WriteAllText((Join-Path $advRoot ".qark\checks.json"), '{"json":["node","-e","process.exit(1)"]}', $utf8)
+$r3CustomJsonFail = QAdv "apply" @{ path = "strict_cfg.json"; text = '{"valid":true}' + "`n" }
+Remove-Item -Force (Join-Path $advRoot ".qark\checks.json")
+Check "R3-04: custom .qark/checks.json failure on .json is not overwritten by native JSON checker" ((-not $r3CustomJsonFail.ok) -and $r3CustomJsonFail.error.code -eq "check_failed") $r3CustomJsonFail
+
+# R3-05: delete-only batch under strict policy reports validation_complete: true
+[void](QAdv "apply" @{ path = "del_complete.py"; text = "x = 1`n" })
+$r3DelComplete = QAdv "apply" @{ path = "del_complete.py"; delete = $true }
+Check "R3-05: delete-only batch under strict check policy reports validation_complete:true" ($r3DelComplete.ok -and $r3DelComplete.result.validation_complete -eq $true) $r3DelComplete
+
+# R3-06 & R3-13: multi-step undo/redo stack, out-of-order undo refusal without force, steps bounds, and force_delete composition
+$r3A = QAdv "apply" @{ path = "seq_a.txt"; text = "A1`n" }
+$r3B = QAdv "apply" @{ path = "seq_b.txt"; text = "B1`n" }
+$r3OutOrder = QAdv "undo" @{ txn = $r3A.result.txn }
+$r3BadSteps = QAdv "undo" @{ steps = 99 }
+$r3UndoB = QAdv "undo" @{}
+$r3UndoA = QAdv "undo" @{}
+$r3RedoA = QAdv "redo" @{}
+$r3RedoB = QAdv "redo" @{}
+$seqAOk = (Test-Path (Join-Path $advRoot "seq_a.txt")) -and ([System.IO.File]::ReadAllText((Join-Path $advRoot "seq_a.txt")) -eq "A1`n")
+$seqBOk = (Test-Path (Join-Path $advRoot "seq_b.txt")) -and ([System.IO.File]::ReadAllText((Join-Path $advRoot "seq_b.txt")) -eq "B1`n")
+[void](QAdv "apply" @{ path = "force_ephemeral.txt"; text = "v1`n" })
+[void](QAdv "apply" @{ path = "force_ephemeral.txt"; delete = $true })
+$r3ForceUndo2 = QAdv "undo" @{ steps = 2; force = $true }
+$forceEphAbsent = -not (Test-Path (Join-Path $advRoot "force_ephemeral.txt"))
+Check "R3-06/R3-13: multi-step undo/redo stack preserves both transactions, out-of-order undo requires force, steps>32 fails with spec_range, and force undo(steps:2) across create->delete leaves file absent" ((-not $r3OutOrder.ok) -and $r3OutOrder.error.code -eq "undo_not_latest" -and (-not $r3BadSteps.ok) -and $r3BadSteps.error.code -eq "spec_range" -and $r3UndoB.ok -and $r3UndoA.ok -and $r3RedoA.ok -and $r3RedoB.ok -and $seqAOk -and $seqBOk -and $r3ForceUndo2.ok -and $forceEphAbsent) @{ outOrder = $r3OutOrder; badSteps = $r3BadSteps; uB = $r3UndoB; uA = $r3UndoA; rA = $r3RedoA; rB = $r3RedoB; fU2 = $r3ForceUndo2; absent = $forceEphAbsent }
+
+# R3-07: validator that mutates staged candidate file fails closed with checker_error
+$r3MutateStage = QAdv "apply" @{
+    path = "mutated_candidate.py"
+    text = "x = 1`n"
+    validate = @("python", "-c", "open('mutated_candidate.py', 'w').write('x = 999\n')")
+}
+Check "R3-07: validator mutating staged candidate file fails closed with checker_error" ((-not $r3MutateStage.ok) -and $r3MutateStage.error.code -eq "checker_error") $r3MutateStage
+
+# R3-08: JS regex after return, Python default argument value, and whole-symbol replacement with trailing code
+[void](QAdv "apply" @{
+    path = "js/r3_regex.js"
+    mode = "upsert"
+    text = "function target(s) {`n  return /target/.test(s) ? target(s.slice(1)) : 0;`n}`nfunction repMe() { return 1; } const keep = 2;`n"
+})
+$r3JsEdit = QAdv "apply" @{
+    path = "js/r3_regex.js"
+    edits = @(
+        @{ symbol = "target"; rename = "checkStr" },
+        @{ symbol = "repMe"; replace = "function repMe() { return 42; }" }
+    )
+}
+$r3JsText = [System.IO.File]::ReadAllText((Join-Path $advRoot "js\r3_regex.js"))
+[void](QAdv "apply" @{
+    path = "py_default.py"
+    mode = "upsert"
+    text = "def target(x):`n    return x + 1`n`ndef wrapper(cb=target):`n    return cb(target(2))`n"
+})
+$r3PyRename = QAdv "apply" @{ path = "py_default.py"; symbol = "target"; rename = "compute" }
+$r3PyText = [System.IO.File]::ReadAllText((Join-Path $advRoot "py_default.py"))
+Check "R3-08: JS rename skips regex after return, whole-symbol replace preserves trailing code on line, and Python rename updates default arg references" ($r3JsEdit.ok -and $r3JsText.Contains("return /target/.test(s) ? checkStr(") -and $r3JsText.Contains("const keep = 2;") -and $r3PyRename.ok -and $r3PyText.Contains("def wrapper(cb=compute):") -and $r3PyText.Contains("return cb(compute(2))")) @{ jsEdit = $r3JsEdit; jsText = $r3JsText; pyRename = $r3PyRename; pyText = $r3PyText }
+
+# R3-09: UTF-8 BOM in package.json is respected by check.cjs
+$r3BomEsm = QAdv "apply" @{
+    files = @(
+        @{ path = "bom_pkg/package.json"; text = ([char]0xFEFF) + '{"type":"module"}' + "`n" },
+        @{ path = "bom_pkg/index.js"; text = "if (require.main === module) { return; }`n" }
+    )
+}
+Check "R3-09: UTF-8 BOM in package.json is stripped so type:module is enforced" ((-not $r3BomEsm.ok) -and $r3BomEsm.error.code -eq "check_failed") $r3BomEsm
+
+# R3-11: impact template literal tail after ${...}, same-line recursive call, and directory index import
+[void](QAdv "apply" @{
+    files = @(
+        @{ path = "imp2/lib/index.mjs"; mode = "upsert"; text = "export function f(n) { return n ? f(n - 1) : 0; }`n" },
+        @{ path = "imp2/caller.mjs"; mode = "upsert"; text = "import { f } from './lib';`nexport const msg = ``${1} f is not a call here`` + f(3);`n" }
+    )
+})
+$r3Imp = QAdv "impact" @{ symbol = "f"; path = "imp2/lib/index.mjs" }
+$impCallerRefs = @($r3Imp.result.references | Where-Object { $_.path -eq "imp2/caller.mjs" })
+$impSelfRefs = @($r3Imp.result.references | Where-Object { $_.path -eq "imp2/lib/index.mjs" })
+Check "R3-11: impact ignores word in template literal text after `${...}, records same-line recursive ref, and resolves ./lib to lib/index.mjs" ($r3Imp.ok -and $impSelfRefs.Count -eq 1 -and $impCallerRefs.Count -eq 2 -and ($r3Imp.result.dependents -contains "imp2/caller.mjs")) @{ imp = $r3Imp; self = $impSelfRefs; caller = $impCallerRefs }
+
+# R3-12: conflicting edit operations or contract+scope keys fail closed
+$r3ConflictEdit = QAdv "apply" @{ path = "py_default.py"; edits = @(@{ find = "compute"; replace = "c"; lines = "1:1" }) }
+$r3ConflictSym = QAdv "apply" @{ path = "py_default.py"; edits = @(@{ symbol = "compute"; rename = "c2"; body = "return 0" }) }
+$r3ConflictContractScope = QAdv "apply" @{ path = "py_default.py"; contract = @{ max_lines_changed = 5 }; scope = @{ max_lines_changed = 5 }; edits = @(@{ find = "compute"; replace = "c" }) }
+Check "R3-12: conflicting edit operations fail with edit_bad and simultaneous contract+scope fails with contract_bad" ((-not $r3ConflictEdit.ok) -and $r3ConflictEdit.error.code -eq "edit_bad" -and (-not $r3ConflictSym.ok) -and $r3ConflictSym.error.code -eq "edit_bad" -and (-not $r3ConflictContractScope.ok) -and $r3ConflictContractScope.error.code -eq "contract_bad") @{ e1 = $r3ConflictEdit; e2 = $r3ConflictSym; cs = $r3ConflictContractScope }
+
+# R3-14: template.define with persist:true and dry_run:true fails with dry_run_persist
+$r3DryPersist = QAdv "template.define" @{ name = "no_persist"; text = "hi {{x}}`n"; persist = $true; dry_run = $true }
+Check "R3-14: template.define rejects persist:true with dry_run:true (dry_run_persist)" ((-not $r3DryPersist.ok) -and $r3DryPersist.error.code -eq "dry_run_persist") $r3DryPersist
+
 $wadv.StandardInput.Close()
 [void]$wadv.WaitForExit(5000)
 
@@ -967,7 +1092,7 @@ $wreq.StandardInput.Close()
 [void]$wreq.WaitForExit(5000)
 Check "R2-07: --require-check refuses per-file check:false bypass" ((-not $rReqBypass.ok) -and $rReqBypass.error.code -eq "check_unavailable") $rReqBypass
 
-# Q32: Official QarkSession client rejects in-flight requests immediately on unexpected child exit
+# Q32 & R3-10: Official QarkSession client backpressure listener cleanup and clean child exit rejection
 $clientTestScript = Join-Path $advRoot "test-client.mjs"
 $qarkSessionUrl = ([System.Uri](Join-Path $Repo "scripts\client\qark-session.mjs")).AbsoluteUri
 [System.IO.File]::WriteAllText($clientTestScript, @"
@@ -975,6 +1100,9 @@ import { QarkSession } from '$qarkSessionUrl';
 const session = new QarkSession({ bin: $(ConvertTo-Json $Qark), root: $(ConvertTo-Json $advRoot) });
 const info = await session.info();
 if (!info || info.protocol !== 2) process.exit(2);
+const pad = 'x'.repeat(32768);
+await Promise.all(Array.from({ length: 20 }, () => session.request('session.info', { pad })));
+if (session.proc.listenerCount('exit') > 2 || session.proc.stdin.listenerCount('drain') > 1) process.exit(5);
 session.proc.kill();
 try {
   await session.request('ping', {});
@@ -988,7 +1116,7 @@ try {
 }
 "@, $utf8)
 $clientOut = & node $clientTestScript 2>&1
-Check "Q32: official QarkSession client connects and rejects requests cleanly on child exit" ($LASTEXITCODE -eq 0 -and ($clientOut -join "`n").Contains("CLIENT_OK")) $clientOut
+Check "Q32/R3-10: official QarkSession client bounds listeners under backpressure and rejects requests cleanly on child exit" ($LASTEXITCODE -eq 0 -and ($clientOut -join "`n").Contains("CLIENT_OK")) $clientOut
 
 Remove-Item -Recurse -Force $root
 Write-Host ""

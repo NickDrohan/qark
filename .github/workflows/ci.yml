@@ -19,7 +19,7 @@ jobs:
         with:
           node-version: '24'
 
-      - name: Run 12-case JavaScript checker differential suite
+      - name: Run JavaScript checker differential suite against real node --check oracle
         shell: node {0}
         run: |
           import { spawnSync } from 'node:child_process';
@@ -28,6 +28,7 @@ jobs:
           import path from 'node:path';
 
           const helper = path.resolve('scripts/checkers/check.cjs');
+          const deepPrefix = Array.from({ length: 36 }, (_, i) => `d${i}`).join('/');
           const cases = [
             ['explicit_cjs_export', { 'package.json': '{"type":"commonjs"}' }, {}, 'a.js', 'export const x=1;\n', false],
             ['cjs_require', {}, {}, 'a.cjs', 'const require=1;\n', false],
@@ -41,19 +42,43 @@ jobs:
             ['no_type_await', { 'package.json': '{}' }, {}, 'a.js', 'await Promise.resolve(1);\n', true],
             ['no_type_binding', { 'package.json': '{}' }, {}, 'a.js', 'const require=1;\n', true],
             ['malformed_package', { 'package.json': '{oops' }, {}, 'a.js', 'const x=1;\n', false],
+            ['bom_package_esm', { 'package.json': '\uFEFF{"type":"module"}' }, {}, 'a.js', 'if (require.main === module) { return; }\n', false],
+            ['deep_dir_esm', { 'package.json': '{"type":"module"}' }, {}, `${deepPrefix}/a.js`, 'if (require.main === module) { return; }\n', false],
+            ['unknown_string_type', { 'package.json': '{"type":"custom-mode"}' }, {}, 'a.js', 'const require=1;\n', true],
           ];
 
           for (const [label, diskFiles, overlayFiles, relPath, text, expectedOk] of cases) {
             const root = fs.mkdtempSync(path.join(os.tmpdir(), 'qark-ci-chk-'));
+            const oracleRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'qark-ci-oracle-'));
             try {
               for (const [k, v] of Object.entries(diskFiles)) {
-                const full = path.join(root, k);
-                fs.mkdirSync(path.dirname(full), { recursive: true });
-                fs.writeFileSync(full, v, 'utf8');
+                for (const base of [root, oracleRoot]) {
+                  const full = path.join(base, k);
+                  fs.mkdirSync(path.dirname(full), { recursive: true });
+                  fs.writeFileSync(full, v, 'utf8');
+                }
               }
               const packages = Object.entries(overlayFiles).map(([p, t]) =>
                 t === null ? { name: p, deleted: true } : { name: p, text: t }
               );
+              for (const [p, t] of Object.entries(overlayFiles)) {
+                const full = path.join(oracleRoot, p);
+                if (t === null) {
+                  fs.rmSync(full, { force: true });
+                } else {
+                  fs.mkdirSync(path.dirname(full), { recursive: true });
+                  fs.writeFileSync(full, t, 'utf8');
+                }
+              }
+              const oracleTarget = path.join(oracleRoot, relPath);
+              fs.mkdirSync(path.dirname(oracleTarget), { recursive: true });
+              fs.writeFileSync(oracleTarget, text, 'utf8');
+              const oracleRes = spawnSync(process.execPath, ['--check', oracleTarget], { encoding: 'utf8' });
+              const oracleOk = oracleRes.status === 0;
+              if (oracleOk !== expectedOk) {
+                throw new Error(`${label}: real node --check returned ok=${oracleOk} (expected ${expectedOk}): ${oracleRes.stderr}`);
+              }
+
               const payload = JSON.stringify([{ root, packages, name: relPath, text }]);
               const res = spawnSync(process.execPath, [helper], { input: payload, encoding: 'utf8' });
               if (res.status !== 0) {
@@ -63,9 +88,10 @@ jobs:
               if (!Array.isArray(parsed) || parsed.length !== 1 || Boolean(parsed[0].ok) !== expectedOk) {
                 throw new Error(`${label}: expected ok=${expectedOk}, got ${res.stdout}`);
               }
-              console.log(`PASS ${label}: ok=${parsed[0].ok}`);
+              console.log(`PASS ${label}: ok=${parsed[0].ok} (matches real node --check)`);
             } finally {
               fs.rmSync(root, { recursive: true, force: true });
+              fs.rmSync(oracleRoot, { recursive: true, force: true });
             }
           }
 
@@ -134,7 +160,28 @@ jobs:
                 throw new Error('ignoreterm worker was still alive after close(60)');
               }
             }
-            console.log('PASS all 4 QarkSession client lifecycle cases');
+
+            // 5. Backpressure listener cleanup and strict envelope validation (R3-10)
+            {
+              const w = writeWorker(
+                'backpressure.mjs',
+                'import readline from "node:readline"; const rl = readline.createInterface({ input: process.stdin }); rl.on("line", (l) => { const m = JSON.parse(l); if (m.op === "bad_ok") { process.stdout.write(JSON.stringify({ id: m.id, ok: true }) + "\\n"); } else { process.stdout.write(JSON.stringify({ id: m.id, ok: true, result: { n: m.id } }) + "\\n"); } });'
+              );
+              const s = new QarkSession({ bin: process.execPath, args: [w] });
+              const big = 'x'.repeat(65536);
+              const reqs = Array.from({ length: 30 }, () => s.request('ping', { pad: big }));
+              await Promise.all(reqs);
+              if (s.proc.listenerCount('exit') > 2 || s.proc.stdin.listenerCount('drain') > 1) {
+                throw new Error(`listener leak: exit=${s.proc.listenerCount('exit')}, drain=${s.proc.stdin.listenerCount('drain')}`);
+              }
+              let badCode = null;
+              try { await s.request('bad_ok', {}); } catch (e) { badCode = e.code; }
+              await s.close(60);
+              if (badCode !== 'QARK_BAD_PROTOCOL') {
+                throw new Error(`expected QARK_BAD_PROTOCOL on ok:true without result, got ${badCode}`);
+              }
+            }
+            console.log('PASS all 5 QarkSession client lifecycle & backpressure cases');
           } finally {
             fs.rmSync(tmp, { recursive: true, force: true });
           }

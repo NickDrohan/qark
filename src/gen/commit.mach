@@ -84,6 +84,9 @@ pub rec Entry {
     must_be_absent: bool;
     exec:           bool;
     target_perm:    u32;
+    force_replace:  bool;
+    force_delete:   bool;
+    pre_existed:    bool;
     existed:        bool;
     old:            *u8;
     old_len:        usize;
@@ -331,6 +334,10 @@ fun conflict(e: *Entry, why: str) {
 fun decide(e: *Entry) {
     if (e.must_be_absent) {
         if (e.existed) {
+            if (e.force_delete) {
+                e.status = ST_DELETE;
+                ret;
+            }
             conflict(e, "exists");
             ret;
         }
@@ -339,6 +346,10 @@ fun decide(e: *Entry) {
     }
     if (e.mode == MODE_DELETE) {
         if (!e.existed) {
+            if (e.force_delete) {
+                e.status = ST_UNCHANGED;
+                ret;
+            }
             conflict(e, "missing");
             ret;
         }
@@ -358,8 +369,17 @@ fun decide(e: *Entry) {
         ret;
     }
     if (util.eq(?e.sha[0], ?e.old_sha[0])) {
-        e.status = ST_UNCHANGED;
-        ret;
+        var perm_changed: bool = e.force_replace;
+        if (e.target_perm != 0 && (e.target_perm & 511) != (e.old_perm & 511)) {
+            perm_changed = true;
+        }
+        or (e.exec && (e.old_perm & 73) == 0) {
+            perm_changed = true;
+        }
+        if (!perm_changed) {
+            e.status = ST_UNCHANGED;
+            ret;
+        }
     }
     if (e.mode == MODE_CREATE) {
         conflict(e, "exists");
