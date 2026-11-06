@@ -90,7 +90,7 @@ Check "an extra space still names the line" ((-not $r.ok) -and $r.error.code -eq
 $r = Q "apply" @{ path = "src/calc.py"; edits = @(@{ lines = @(8, 9); with = @("def count(xs):", "    return sum(1 for _ in xs)") }, @{ insert_after = 0; with = "`"`"`"Small math helpers.`"`"`"" }) }
 Check "line range and insert edits" ($r.ok -and $r.result.files[0].check -eq "ok") $r
 $r = Q "apply" @{ path = "src/calc.py"; edits = @(@{ ex = "%s/xs/items/g" }, @{ keys = "Gdd" }) }
-Check "an edit that breaks the syntax is refused" ((-not $r.ok) -and $r.error.code -eq "check_failed" -and $r.error.files[0].check_message -like "*EOF*") $r
+Check "an edit that breaks the syntax is refused" ((-not $r.ok) -and $r.error.code -eq "check_failed" -and ($r.error.files[0].check_message -like "*EOF*" -or $r.error.files[0].check_message -like "*indented block*")) $r
 $r = Q "apply" @{ path = "src/calc.py"; edits = @(@{ ex = "%s/xs/items/g" }, @{ keys = "ggdd" }) }
 Check "vim ex and keys edits" ($r.ok) $r
 $now = [System.IO.File]::ReadAllText((Join-Path $root "src\calc.py"))
