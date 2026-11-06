@@ -1197,7 +1197,8 @@ fun compile_one(sp: *Spec, fv: *json.Value, fi: usize, item: *json.Value, k: i64
         commit.hash_hex(data, dn, ?edit_hash[0]);
         var gxp: *u8 = nil;
         var gxn: usize = 0;
-        if (fstr(a, fv, "expect", ?gxp, ?gxn) == 1 && !util.eq(gxp, ?edit_hash[0])) {
+        val has_move_exp: bool = fstr(a, fv, "expect", ?gxp, ?gxn) == 1;
+        if (has_move_exp && !util.eq(gxp, ?edit_hash[0])) {
             e.code = "stale";
             e.msg = cat3(a, "the move source changed since expect was read; its sha256 is now ", ?edit_hash[0], "");
             e.field = at(a, fi, "expect");
@@ -1205,7 +1206,9 @@ fun compile_one(sp: *Spec, fv: *json.Value, fi: usize, item: *json.Value, k: i64
         }
         val del_added: res[usize, A.Error] = commit.add(?sp.set, mrel.ok, nil, 0, commit.MODE_DELETE);
         if (sel del_added.err) { ret fail(e, "oom", "out of memory", at(a, fi, "move")); }
-        commit.set_expect(commit.entry(?sp.set, del_added.ok), ?edit_hash[0]);
+        val del_ent: *commit.Entry = commit.entry(?sp.set, del_added.ok);
+        commit.set_expect(del_ent, ?edit_hash[0]);
+        del_ent.user_expect = has_move_exp;
         moved = true;
         moved_rel = mrel.ok;
     }
@@ -1352,8 +1355,14 @@ fun compile_one(sp: *Spec, fv: *json.Value, fi: usize, item: *json.Value, k: i64
     if (sel added.err) { ret fail(e, "oom", "out of memory", at(a, fi, nil)); }
     val ent: *commit.Entry = commit.entry(?sp.set, added.ok);
 
-    if (edited) { commit.set_expect(ent, ?edit_hash[0]); }
-    or (file_rebased) { commit.set_expect(ent, ?edit_hash[0]); }
+    if (edited) {
+        commit.set_expect(ent, ?edit_hash[0]);
+        ent.user_expect = xs == 1;
+    }
+    or (file_rebased) {
+        commit.set_expect(ent, ?edit_hash[0]);
+        ent.user_expect = xs == 1;
+    }
     or (xs == 1 && !moved) {
         if (!commit.set_expect(ent, xp)) { ret fail(e, "spec_expect", "expect must be 64 hex digits, the sha256 that read or a receipt reported", at(a, fi, "expect")); }
     }
@@ -1543,6 +1552,7 @@ fun compile_glob(sp: *Spec, fv: *json.Value, fi: usize, glob_pat: str, e: *Err) 
                     var edit_hash: [65]u8;
                     commit.hash_hex(cp, cn, ?edit_hash[0]);
                     commit.set_expect(ent, ?edit_hash[0]);
+                    ent.user_expect = false;
                     ent.lang = glang;
                     ent.check_policy = g_policy;
                     ent.edited = true;

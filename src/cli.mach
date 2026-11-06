@@ -53,12 +53,12 @@ fun value_after(argc: i64, argv: **u8, flag: str) str {
 }
 
 fun help() {
-    print.println("qark 0.3.0 - the write layer for agents, and a modal editor");
-    print.println("  qark mcp [--root DIR] [--lock-root] [--require-check]");
+    print.println("qark 0.3.1 - the write layer for agents, and a modal editor");
+    print.println("  qark mcp [--root DIR] [--lock-root] [--require-check] [--require-expect] [--durable]");
     print.println("                                         model context protocol server on stdio");
-    print.println("  qark --headless --stdio [--root DIR] [--lock-root] [--require-check]");
+    print.println("  qark --headless --stdio [--root DIR] [--lock-root] [--require-check] [--require-expect] [--durable]");
     print.println("                                         ndjson worker on stdio");
-    print.println("  qark apply SPEC|- [--dry-run] [--root DIR] [--lock-root] [--require-check]");
+    print.println("  qark apply SPEC|- [--dry-run] [--root DIR] [--lock-root] [--require-check] [--require-expect] [--durable]");
     print.println("                                         apply a json spec ('-' reads stdin); prints the receipt");
     print.println("  qark undo [TXN] [--steps N] [--dry-run] [--force] [--root DIR]");
     print.println("                                         revert transactions using .qark/undo/<txn>.json");
@@ -265,6 +265,7 @@ pub fun run(argc: i64, argv: **u8) i64 {
     }
     if (has(argc, argv, "--lock-root")) { s.lock_root = true; }
     if (has(argc, argv, "--require-check")) { s.require_check = true; }
+    if (has(argc, argv, "--require-expect")) { s.require_expect = true; }
     if (has(argc, argv, "--no-custom-exec")) { s.no_custom_exec = true; }
     if (has(argc, argv, "--strict-spec")) { s.strict_spec = true; }
     if (has(argc, argv, "--durable")) {

@@ -204,3 +204,65 @@ jobs:
             throw new Error('qark_check must have readOnlyHint: false and idempotentHint: false');
           }
           console.log('PASS MCP tool schemas and annotations');
+
+  native-build-and-suite:
+    name: Native Mach Build, Unit Tests & Integration Suite (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ ubuntu-latest, windows-latest ]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Mach compiler (v6.10.1) on Linux
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSL https://github.com/briar-systems/mach/releases/download/v6.10.1/mach-6.10.1-x86_64-linux.tar.gz -o /tmp/mach.tar.gz
+          mkdir -p "$HOME/.local/bin"
+          tar -xzf /tmp/mach.tar.gz -C "$HOME/.local/bin"
+          chmod +x "$HOME/.local/bin/mach"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/mach" --version
+
+      - name: Install Mach compiler (v6.10.1) on Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $zipPath = Join-Path $env:TEMP "mach.zip"
+          $destDir = Join-Path $env:TEMP "mach-bin"
+          Invoke-WebRequest -Uri "https://github.com/briar-systems/mach/releases/download/v6.10.1/mach-6.10.1-x86_64-windows.zip" -OutFile $zipPath
+          Expand-Archive -Path $zipPath -DestinationPath $destDir -Force
+          $machExe = Get-ChildItem -Path $destDir -Filter "mach.exe" -Recurse | Select-Object -First 1
+          if (-not $machExe) { throw "mach.exe not found in archive" }
+          $machExe.DirectoryName | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          & $machExe.FullName --version
+
+      - name: Build and run POSIX unit, smoke, permission, torn-journal, and SIGKILL suite (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sed -i 's/\r$//' ./build.sh
+          sh ./build.sh
+          node ./scripts/ci/posix-suite.mjs
+
+      - name: Build and run full unit + apply-suite.ps1 integration suite (Windows)
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          & .\build.ps1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

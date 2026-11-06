@@ -987,25 +987,11 @@ fun make_stage_tree(a: *A.Allocator, root: str, set: *commit.Set, out_err: *str)
                 if (e.status == commit.ST_REPLACE) {
                     filesystem.remove_file(dst.ok);
                 }
-                var cperm: i32 = 420;
-                if (e.has_target_perm || e.target_perm != 0) {
-                    cperm = (e.target_perm & 511)::i32;
-                }
-                or (e.exec) {
-                    if (e.existed && e.has_old_perm) {
-                        cperm = ((e.old_perm | 73) & 511)::i32;
-                    }
-                    or {
-                        cperm = 493;
-                    }
-                }
-                or (e.existed && (e.has_old_perm || (e.old_perm & 511) != 0)) {
-                    cperm = (e.old_perm & 511)::i32;
-                }
+                val cperm: i32 = commit.perm_for(e);
                 var datap: *u8 = e.data;
                 if (datap == nil) { datap = ""; }
                 val wr: err[filesystem.FsError] = filesystem.write_bytes(dst.ok, datap, e.len, cperm);
-                if (sel wr.err) {
+                if (sel wr.err || !commit.apply_file_mode(dst.ok, cperm)) {
                     filesystem.remove_all(a, stage_dir);
                     ret nil;
                 }
