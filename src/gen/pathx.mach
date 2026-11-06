@@ -143,7 +143,7 @@ pub fun message(r: i64) str {
 }
 
 # if p begins with the workspace root directory, return the relative suffix after it
-pub fun strip_root(root: str, p: str) str {
+pub fun strip_root_mode(root: str, p: str, fold_case: bool) str {
     if (root == nil || p == nil || root[0] == 0 || p[0] == 0) { ret p; }
     var rn: usize = str_len(root);
     for (rn > 0 && (root[rn - 1] == '/' || root[rn - 1] == '\\')) { rn = rn - 1; }
@@ -160,7 +160,12 @@ pub fun strip_root(root: str, p: str) str {
             i = i + 1;
             cnt;
         }
-        if (lower(rc) != lower(pc)) { ret p; }
+        if (fold_case) {
+            if (lower(rc) != lower(pc)) { ret p; }
+        }
+        or {
+            if (rc != pc) { ret p; }
+        }
         i = i + 1;
     }
     if (i == pn) { ret "."; }
@@ -168,6 +173,15 @@ pub fun strip_root(root: str, p: str) str {
     for (i < pn && (p[i] == '/' || p[i] == '\\')) { i = i + 1; }
     if (i == pn) { ret "."; }
     ret (p::usize + i)::*u8;
+}
+
+pub fun strip_root(root: str, p: str) str {
+    $if ($mach.build.os == $mach.os.windows) {
+        ret strip_root_mode(root, p, true);
+    }
+    $if ($mach.build.os != $mach.os.windows) {
+        ret strip_root_mode(root, p, false);
+    }
 }
 
 # a copy with every '\' turned into '/'
@@ -260,9 +274,11 @@ $if (capability.HOSTED) {
         if (check(".gitignore") != P_OK) { ret 20; }
         if (check("console.log") != P_OK) { ret 21; }
         if (check("com10.txt") != P_OK) { ret 22; }
-        if (!util.eq(strip_root("D:\\Dev\\Qark", "d:/dev/qark/src/cli.mach"), "src/cli.mach")) { ret 23; }
-        if (!util.eq(strip_root("D:\\Dev\\Qark\\", "D:\\Dev\\Qark"), ".")) { ret 24; }
-        if (!util.eq(strip_root("D:\\Dev\\Qark", "D:\\Dev\\Qark2\\x.txt"), "D:\\Dev\\Qark2\\x.txt")) { ret 25; }
+        if (!util.eq(strip_root_mode("D:\\Dev\\Qark", "d:/dev/qark/src/cli.mach", true), "src/cli.mach")) { ret 23; }
+        if (!util.eq(strip_root_mode("D:\\Dev\\Qark\\", "D:\\Dev\\Qark", true), ".")) { ret 24; }
+        if (!util.eq(strip_root_mode("D:\\Dev\\Qark", "D:\\Dev\\Qark2\\x.txt", true), "D:\\Dev\\Qark2\\x.txt")) { ret 25; }
+        if (!util.eq(strip_root_mode("/work/Repo", "/work/repo/src/a.py", false), "/work/repo/src/a.py")) { ret 26; }
+        if (!util.eq(strip_root_mode("/work/Repo", "/work/Repo/src/a.py", false), "src/a.py")) { ret 27; }
         ret 0;
     }
 }

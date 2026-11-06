@@ -129,6 +129,10 @@ pub rec Spec {
     rebase:       bool;
     best_effort:  bool;
     contract:     *json.Value;
+    durable:      bool;
+    strict_spec:  bool;
+    unknown_key:  str;
+    unknown_fld:  str;
 }
 
 fun fail(e: *Err, code: str, msg: str, field: str) bool {
@@ -621,9 +625,19 @@ fun key_matches(k: str, klen: usize, lit: str) bool {
     ret lit[klen] == 0;
 }
 
+fun is_safety_typo(k: str, kn: usize) bool {
+    val typos: [12]str = [12]str{"expct", "expec", "expected", "require_expct", "rebse", "cntract", "check_polcy", "idempotency", "expect_sig", "expect_sha256", "sha256_expect", "forbid_deletes"};
+    var i: usize = 0;
+    for (i < 12) {
+        if (key_matches(k, kn, typos[i])) { ret true; }
+        i = i + 1;
+    }
+    ret false;
+}
+
 # push one warning per object key not in the allowed list; prefix says where it was seen
-fun key_warns(sp: *Spec, obj: *json.Value, allowed: *str, n_allowed: usize, prefix: str, out: *vector.Vector[str]) {
-    if (!json.value_is_object(obj)) { ret; }
+fun key_warns(sp: *Spec, obj: *json.Value, allowed: *str, n_allowed: usize, prefix: str, out: *vector.Vector[str], e: *Err) bool {
+    if (!json.value_is_object(obj)) { ret true; }
     var i: usize = 0;
     for (i < json.value_count(obj)) {
         val k: opt[str] = json.value_key(obj, i);
@@ -636,28 +650,44 @@ fun key_warns(sp: *Spec, obj: *json.Value, allowed: *str, n_allowed: usize, pref
                 j = j + 1;
             }
             if (!ok) {
+                val must_fail: bool = sp.strict_spec || is_safety_typo(k.some, kn);
                 var w: jw.Jw = jw.init(sp.a);
                 jw.raw(?w, prefix);
                 jw.raw(?w, ": unrecognized key \"");
                 jw.bytes(?w, k.some, kn);
-                jw.raw(?w, "\"; ignored");
-                if (!w.failed && w.buf != nil) { vector.push[str](out, w.buf); }
+                if (must_fail) {
+                    jw.raw(?w, "\"");
+                }
+                or {
+                    jw.raw(?w, "\"; ignored");
+                }
+                if (!w.failed && w.buf != nil) {
+                    if (sp.unknown_key == nil) {
+                        sp.unknown_key = w.buf;
+                        sp.unknown_fld = prefix;
+                    }
+                    if (must_fail) {
+                        ret fail(e, "spec_unknown_key", w.buf, prefix);
+                    }
+                    vector.push[str](out, w.buf);
+                }
             }
         }
         i = i + 1;
     }
+    ret true;
 }
 
 # warn about misspelled or unexpected top-level spec keys
-fun top_key_warns(sp: *Spec, args: *json.Value) {
-    val allowed: [62]str = [62]str{"files", "path", "glob", "text", "lines", "tmpl", "template", "json", "edits", "move", "delete", "mode", "expect", "check", "each", "with", "executable", "job", "dest", "dry_run", "prune", "durable", "diff", "tag", "run", "vars", "templates", "expand", "contract", "scope", "rebase", "base_text", "validate", "project_check", "require_expect", "idempotency_key", "best_effort", "expect_signature", "stream", "impact", "semantic", "preview", "symbol", "body", "signature", "rename", "find", "find_re", "replace", "insert_before", "insert_after", "auto_indent", "append", "prepend", "ex", "keys", "within", "occurrence", "all", "count", "root", "timeout_ms"};
-    key_warns(sp, args, ?allowed[0], 62, "spec", ?sp.warns);
+fun top_key_warns(sp: *Spec, args: *json.Value, e: *Err) bool {
+    val allowed: [64]str = [64]str{"files", "path", "glob", "text", "lines", "tmpl", "template", "json", "edits", "move", "delete", "mode", "expect", "check", "each", "with", "executable", "perm", "job", "dest", "dry_run", "prune", "durable", "strict_spec", "diff", "tag", "run", "vars", "templates", "expand", "contract", "scope", "rebase", "base_text", "validate", "project_check", "require_expect", "idempotency_key", "best_effort", "expect_signature", "stream", "impact", "semantic", "preview", "symbol", "body", "signature", "rename", "find", "find_re", "replace", "insert_before", "insert_after", "auto_indent", "append", "prepend", "ex", "keys", "within", "occurrence", "all", "count", "root", "timeout_ms"};
+    ret key_warns(sp, args, ?allowed[0], 64, "spec", ?sp.warns, e);
 }
 
 # warn about misspelled or unexpected keys on a file entry and on each of its edits
-fun file_key_warns(sp: *Spec, fv: *json.Value, rel: str, out: *vector.Vector[str]) {
-    val fkeys: [60]str = [60]str{"path", "glob", "text", "lines", "tmpl", "template", "json", "edits", "move", "delete", "mode", "expect", "check", "each", "with", "executable", "contract", "scope", "rebase", "base_text", "best_effort", "expect_signature", "symbol", "body", "signature", "rename", "find", "find_re", "replace", "insert_before", "insert_after", "auto_indent", "append", "prepend", "ex", "keys", "within", "occurrence", "all", "count", "dry_run", "diff", "preview", "stream", "validate", "project_check", "require_expect", "idempotency_key", "tag", "durable", "root", "timeout_ms", "vars", "templates", "job", "dest", "prune", "run", "expand", "semantic"};
-    key_warns(sp, fv, ?fkeys[0], 60, rel, out);
+fun file_key_warns(sp: *Spec, fv: *json.Value, rel: str, out: *vector.Vector[str], e: *Err) bool {
+    val fkeys: [62]str = [62]str{"path", "glob", "text", "lines", "tmpl", "template", "json", "edits", "move", "delete", "mode", "expect", "check", "each", "with", "executable", "perm", "contract", "scope", "rebase", "base_text", "best_effort", "expect_signature", "symbol", "body", "signature", "rename", "find", "find_re", "replace", "insert_before", "insert_after", "auto_indent", "append", "prepend", "ex", "keys", "within", "occurrence", "all", "count", "dry_run", "diff", "preview", "stream", "validate", "project_check", "require_expect", "idempotency_key", "tag", "durable", "strict_spec", "root", "timeout_ms", "vars", "templates", "job", "dest", "prune", "run", "expand", "semantic"};
+    if (!key_warns(sp, fv, ?fkeys[0], 62, rel, out, e)) { ret false; }
     val ef: opt[*json.Value] = json.value_find(fv, "edits");
     if (sel ef.some) {
         val ekeys: [21]str = [21]str{"find", "find_re", "replace", "lines", "with", "insert_before", "insert_after", "append", "prepend", "ex", "keys", "occurrence", "all", "count", "within", "symbol", "auto_indent", "body", "signature", "rename", "expect_signature"};
@@ -665,14 +695,17 @@ fun file_key_warns(sp: *Spec, fv: *json.Value, rel: str, out: *vector.Vector[str
             var i: usize = 0;
             for (i < json.value_count(ef.some)) {
                 val g: opt[*json.Value] = json.value_get(ef.some, i);
-                if (sel g.some) { key_warns(sp, g.some, ?ekeys[0], 21, rel, out); }
+                if (sel g.some) {
+                    if (!key_warns(sp, g.some, ?ekeys[0], 21, rel, out, e)) { ret false; }
+                }
                 i = i + 1;
             }
         }
         or (json.value_is_object(ef.some)) {
-            key_warns(sp, ef.some, ?ekeys[0], 21, rel, out);
+            if (!key_warns(sp, ef.some, ?ekeys[0], 21, rel, out, e)) { ret false; }
         }
     }
+    ret true;
 }
 
 fun check_contract_one(a: *A.Allocator, rel: str, old_p: *u8, old_n: usize, new_p: *u8, new_n: usize, deleting: bool, moved: bool, contract: *json.Value, fi: usize, e: *Err) bool {
@@ -1340,10 +1373,22 @@ fun compile_one(sp: *Spec, fv: *json.Value, fi: usize, item: *json.Value, k: i64
     ent.lang = lang;
     ent.check_policy = f_policy;
     ent.exec = fbool(fv, "executable") == 1 || (dn >= 2 && data[0] == '#' && data[1] == '!');
+    val perm_f: opt[*json.Value] = json.value_find(fv, "perm");
+    if (sel perm_f.some) {
+        if (!json.value_is_number(perm_f.some) || json.value_is_float(perm_f.some)) {
+            ret fail(e, "spec_type", "perm must be an integer between 0 and 511", at(a, fi, "perm"));
+        }
+        val pval: i64 = json.value_number(perm_f.some);
+        if (pval < 0 || pval > 511) {
+            ret fail(e, "spec_type", "perm must be an integer between 0 and 511", at(a, fi, "perm"));
+        }
+        ent.has_target_perm = true;
+        ent.target_perm = pval::u32;
+    }
     ent.edited = edited;
     if (normed) { commit.note(ent, "line endings normalized to match the file's; the find text applied as given"); }
     if (mixed) { commit.note(ent, "the file has mixed line endings; find text matched byte-exact with no normalization"); }
-    file_key_warns(sp, fv, rel.ok, ?ent.notes);
+    if (!file_key_warns(sp, fv, rel.ok, ?ent.notes, e)) { ret false; }
     sp.files = sp.files + 1;
     ret true;
 }
@@ -1503,7 +1548,7 @@ fun compile_glob(sp: *Spec, fv: *json.Value, fi: usize, glob_pat: str, e: *Err) 
                     ent.edited = true;
                     if (normed) { commit.note(ent, "line endings normalized to match the file's; the find text applied as given"); }
                     if (mixed) { commit.note(ent, "the file has mixed line endings; find text matched byte-exact with no normalization"); }
-                    file_key_warns(sp, fv, cand_rel, ?ent.notes);
+                    if (!file_key_warns(sp, fv, cand_rel, ?ent.notes, e)) { ret false; }
                     sp.files = sp.files + 1;
                     matched_files = matched_files + 1;
                 }
@@ -1808,6 +1853,10 @@ pub fun compile(sp: *Spec, a: *A.Allocator, root: str, args: *json.Value, raw: *
     sp.dest = "";
     sp.empty.kind = json.OBJECT;
     sp.vars = ?sp.empty;
+    sp.durable = false;
+    sp.strict_spec = false;
+    sp.unknown_key = nil;
+    sp.unknown_fld = nil;
     commit.hash_hex(raw, raw_n, ?sp.sha[0]);
     e.code = nil;
     e.msg = nil;
@@ -1876,7 +1925,12 @@ pub fun compile(sp: *Spec, a: *A.Allocator, root: str, args: *json.Value, raw: *
     if (sp.prune && js != 1) { ret fail(e, "spec_prune", "prune only applies to a job", "prune"); }
     val durable: i64 = fbool(args, "durable");
     if (durable == -1) { ret fail(e, "spec_type", "durable must be a boolean", "durable"); }
-    sp.set.durable = durable == 1;
+    sp.durable = durable == 1;
+    sp.set.durable = sp.durable;
+    val sspec: i64 = fbool(args, "strict_spec");
+    if (sspec == -1) { ret fail(e, "spec_type", "strict_spec must be a boolean", "strict_spec"); }
+    sp.strict_spec = sspec == 1;
+    if (!top_key_warns(sp, args, e)) { ret false; }
     val difff: i64 = fbool(args, "diff");
     if (difff == -1) { ret fail(e, "spec_type", "diff must be a boolean", "diff"); }
     sp.diff = difff == 1;
@@ -1972,7 +2026,6 @@ pub fun compile(sp: *Spec, a: *A.Allocator, root: str, args: *json.Value, raw: *
     if (commit.count(?sp.set) == 0 && !sp.prune) {
         ret fail(e, "spec_files", "the spec lists no files; give files, path with text, or an expand table", "files");
     }
-    top_key_warns(sp, args);
     if (js == 1) {
         if (sp.prune && !prune_old(sp, e)) { ret false; }
         if (!add_manifest(sp, e)) { ret false; }

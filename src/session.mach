@@ -49,9 +49,12 @@ pub rec Session {
     lock_ms:       i64;
     applies:       i64;
     written:       i64;
-    force_dry:     bool;
-    lock_root:     bool;
-    require_check: bool;
+    force_dry:      bool;
+    lock_root:      bool;
+    require_check:  bool;
+    no_custom_exec: bool;
+    strict_spec:    bool;
+    durable:        bool;
 }
 
 fun api_cur(ctx: *u8) i64 {
@@ -160,8 +163,9 @@ pub fun set_root(s: *Session, root: str) bool {
     }
     val cleaned: res[str, A.Error] = path.clean(s.a, abs);
     if (sel cleaned.err) { ret false; }
-    val is_dir: res[bool, io_error.Error] = filesystem.is_dir(cleaned.ok);
-    if (!(sel is_dir.ok && is_dir.ok)) { ret false; }
+    val m: res[filesystem.Metadata, io_error.Error] = filesystem.metadata_link(cleaned.ok);
+    if (sel m.err) { ret false; }
+    if (m.ok.kind != filesystem.KIND_DIR) { ret false; }
     val changed: bool = s.root == nil || !util.eq(s.root, cleaned.ok);
     if (s.lock_root && changed) { ret false; }
     if (changed) {
