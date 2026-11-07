@@ -78,9 +78,12 @@ pub rec Entry {
     data:           *u8;
     len:            usize;
     sha:            [65]u8;
-    mode:           u8;
-    has_expect:     bool;
-    expect:         [65]u8;
+    mode:            u8;
+    has_expect:      bool;
+    user_expect:     bool;
+    expect:          [65]u8;
+    has_expect_perm: bool;
+    expect_perm:     u32;
     must_be_absent:  bool;
     exec:            bool;
     has_target_perm: bool;
@@ -118,10 +121,15 @@ pub rec Entry {
 
 # a change set; every string and buffer it holds comes from `a`
 pub rec Set {
-    a:       *A.Allocator;
-    root:    str;
-    items:   vector.Vector[Entry];
-    durable: bool;
+    a:                           *A.Allocator;
+    root:                        str;
+    items:                       vector.Vector[Entry];
+    durable:                     bool;
+    fail_chmod:                  bool;
+    fail_sync:                   bool;
+    fail_publish_at:             i64;
+    mutate_before_rollback_idx:  i64;
+    mutate_before_rollback_perm: i32;
 }
 
 # what publish achieved
@@ -214,6 +222,11 @@ pub fun init(a: *A.Allocator, root: str) Set {
     s.root = root;
     s.items = vector.init[Entry](a);
     s.durable = false;
+    s.fail_chmod = false;
+    s.fail_sync = false;
+    s.fail_publish_at = -1;
+    s.mutate_before_rollback_idx = -1;
+    s.mutate_before_rollback_perm = -1;
     ret s;
 }
 
@@ -259,6 +272,7 @@ pub fun set_expect(e: *Entry, hex: str) bool {
     }
     e.expect[64] = 0;
     e.has_expect = true;
+    e.user_expect = true;
     ret true;
 }
 
@@ -274,7 +288,7 @@ fun probe(p: str, perm: *u32) i64 {
         if (m.err.kind == io_error.NOT_FOUND || m.err.kind == io_error.NOT_DIRECTORY) { ret 0; }
         ret -1;
     }
-    if (perm != nil) { @perm = m.ok.mode; }
+    if (perm != nil) { @perm = (m.ok.mode & 511); }
     if (m.ok.kind == filesystem.KIND_FILE) { ret 1; }
     if (m.ok.kind == filesystem.KIND_DIR) { ret 2; }
     ret 3;
@@ -343,6 +357,38 @@ fun conflict(e: *Entry, why: str) {
     e.reason = why;
 }
 
+pub fun mode_supported_on_host(mode: i32) bool {
+    if (mode < 0 || mode > 511) { ret false; }
+    $if ($mach.build.os == $mach.os.windows) {
+        ret (mode & 63) == 0;
+    }
+    ret true;
+}
+
+pub fun perm_for(e: *Entry) i32 {
+    if (e.has_target_perm) {
+        ret (e.target_perm & 511)::i32;
+    }
+    if (e.target_perm != 0) {
+        val tp: i32 = (e.target_perm & 511)::i32;
+        if (tp != 0) { ret tp; }
+    }
+    if (e.exec) {
+        if (e.existed && (e.has_old_perm || (e.old_perm & 511) != 0)) {
+            ret ((e.old_perm & 511) | 73)::i32;
+        }
+        ret 493;
+    }
+    if (e.existed) {
+        if (e.has_old_perm) {
+            ret (e.old_perm & 511)::i32;
+        }
+        val p: i32 = (e.old_perm & 511)::i32;
+        if (p != 0) { ret p; }
+    }
+    ret 420;
+}
+
 fun decide(e: *Entry) {
     if (e.must_be_absent) {
         if (e.existed) {
@@ -369,6 +415,12 @@ fun decide(e: *Entry) {
             conflict(e, "stale");
             ret;
         }
+        if (e.has_expect_perm && e.has_old_perm && mode_supported_on_host((e.expect_perm & 511)::i32)) {
+            if ((e.old_perm & 511) != (e.expect_perm & 511)) {
+                conflict(e, "stale");
+                ret;
+            }
+        }
         e.status = ST_DELETE;
         ret;
     }
@@ -384,15 +436,19 @@ fun decide(e: *Entry) {
         conflict(e, "stale");
         ret;
     }
+    if (e.has_expect_perm && e.has_old_perm && mode_supported_on_host((e.expect_perm & 511)::i32)) {
+        if ((e.old_perm & 511) != (e.expect_perm & 511)) {
+            conflict(e, "stale");
+            ret;
+        }
+    }
     if (util.eq(?e.sha[0], ?e.old_sha[0])) {
         var perm_changed: bool = e.force_replace;
-        if (e.has_target_perm || e.target_perm != 0) {
-            if (!e.has_old_perm || (e.target_perm & 511) != (e.old_perm & 511)) {
+        if (e.has_target_perm || e.target_perm != 0 || e.exec) {
+            val want_p: u32 = (perm_for(e)::u32 & 511);
+            if (!e.has_old_perm || want_p != (e.old_perm & 511)) {
                 perm_changed = true;
             }
-        }
-        or (e.exec && (e.old_perm & 73) == 0) {
-            perm_changed = true;
         }
         if (!perm_changed) {
             e.status = ST_UNCHANGED;
@@ -404,24 +460,6 @@ fun decide(e: *Entry) {
         ret;
     }
     e.status = ST_REPLACE;
-}
-
-pub fun read_file_bytes(a: *A.Allocator, root: str, rel: str, full: str, mode: u32) res[vector.Vector[u8], filesystem.FsError] {
-    val r1: res[vector.Vector[u8], filesystem.FsError] = filesystem.read_bytes(a, full);
-    if (sel r1.ok) { ret r1; }
-    if ((mode & 256) == 0 && root != nil && rel != nil) {
-        var rdir: usize = os.INVALID_HANDLE;
-        if (os.open(os.working_dir(), root, os.O_RDONLY | os.O_DIRECTORY, 0, ?rdir) >= 0) {
-            var r2: res[vector.Vector[u8], filesystem.FsError] = r1;
-            if (os.set_mode_at(rdir, rel, ((mode & 511) | 256)::i32) == 0) {
-                r2 = filesystem.read_bytes(a, full);
-                os.set_mode_at(rdir, rel, (mode & 511)::i32);
-            }
-            os.close(rdir);
-            ret r2;
-        }
-    }
-    ret r1;
 }
 
 # read the disk for every entry and decide what publishing it would do
@@ -446,7 +484,7 @@ pub fun observe(set: *Set) {
             or (k == -1) { conflict(e, "path_unreadable"); }
             or {
                 if (k == 1) {
-                    val got: res[vector.Vector[u8], filesystem.FsError] = read_file_bytes(set.a, set.root, e.rel, e.full, perm);
+                    val got: res[vector.Vector[u8], filesystem.FsError] = filesystem.read_bytes(set.a, e.full);
                     if (sel got.ok) {
                         e.existed = true;
                         e.old = got.ok.data;
@@ -589,28 +627,62 @@ fun temp_beside(set: *Set, full: str) res[str, A.Error] {
     ret path.join(set.a, parent.ok, ?name[0]);
 }
 
-fun perm_for(e: *Entry) i32 {
-    if (e.has_target_perm) {
-        ret (e.target_perm & 511)::i32;
+pub fun apply_file_mode(p: str, mode: i32) bool {
+    if (!mode_supported_on_host(mode)) { ret true; }
+    var set_ok: bool = false;
+    if (os.set_mode_at(os.working_dir(), p, mode) == 0) {
+        set_ok = true;
     }
-    if (e.target_perm != 0) {
-        val tp: i32 = (e.target_perm & 511)::i32;
-        if (tp != 0) { ret tp; }
-    }
-    if (e.exec) {
-        if (e.existed && e.has_old_perm && (e.old_perm & 511) != 0) {
-            ret ((e.old_perm & 511) | 73)::i32;
+    or {
+        var h: usize = os.INVALID_HANDLE;
+        if (os.open(os.working_dir(), p, os.O_RDONLY, 0, ?h) >= 0) {
+            if (os.set_mode(h, mode) == 0) { set_ok = true; }
+            os.close(h);
         }
-        ret 493;
     }
-    if (e.existed) {
-        if (e.has_old_perm) {
-            ret (e.old_perm & 511)::i32;
+    if (!set_ok) { ret false; }
+    var actual_pm: u32 = 0;
+    if (probe(p, ?actual_pm) != 1) { ret false; }
+    ret (actual_pm & 511) == (mode::u32 & 511);
+}
+
+pub fun sync_file(p: str) bool {
+    var h: usize = os.INVALID_HANDLE;
+    val raw: i64 = os.open(os.working_dir(), p, os.O_WRONLY | os.O_APPEND, 384, ?h);
+    if (raw < 0) { ret false; }
+    val sy: err[io_error.Error] = filesystem.sync(filesystem.File{handle: io_handle.FileHandle{value: h}});
+    os.close(h);
+    if (sel sy.err) { ret false; }
+    ret true;
+}
+
+pub fun sync_dir(p: str) bool {
+    if (p == nil || p[0] == 0) { ret false; }
+    var h: usize = os.INVALID_HANDLE;
+    val raw: i64 = os.open(os.working_dir(), p, os.O_RDONLY | os.O_DIRECTORY, 0, ?h);
+    if (raw < 0) {
+        val k: u8 = os.error_kind(raw);
+        if (k == io_error.UNSUPPORTED || k == io_error.INVALID || k == io_error.IS_DIRECTORY || k == io_error.PERMISSION) {
+            ret true;
         }
-        val p: i32 = (e.old_perm & 511)::i32;
-        if (p != 0) { ret p; }
+        ret false;
     }
-    ret 420;
+    val sy: i64 = os.sync_fd(h);
+    os.close(h);
+    if (sy < 0) {
+        val sk: u8 = os.error_kind(sy);
+        if (sk == io_error.UNSUPPORTED || sk == io_error.INVALID) {
+            ret true;
+        }
+        ret false;
+    }
+    ret true;
+}
+
+pub fun sync_parent_dir(a: *A.Allocator, file_path: str) bool {
+    val parent: res[str, A.Error] = path.parent(a, file_path);
+    if (sel parent.err) { ret false; }
+    ret sync_dir(parent.ok);
 }
 
 fun stage(set: *Set, e: *Entry) bool {
@@ -620,24 +692,42 @@ fun stage(set: *Set, e: *Entry) bool {
     val made: err[filesystem.FsError] = filesystem.create_dir_all(set.a, parent.ok, 493);
     if (sel made.err) { ret false; }
     if (ancestry(set, e.rel) != nil) { ret false; }
+    val want_perm: i32 = perm_for(e);
     var attempt: i64 = 0;
     for (attempt < 8) {
         val tmp: res[str, A.Error] = temp_beside(set, e.full);
         if (sel tmp.err) { ret false; }
         var h: usize = os.INVALID_HANDLE;
-        val raw: i64 = os.open(os.working_dir(), tmp.ok, os.O_CREAT | os.O_EXCL | os.O_WRONLY, perm_for(e), ?h);
+        val raw: i64 = os.open(os.working_dir(), tmp.ok, os.O_CREAT | os.O_EXCL | os.O_WRONLY, want_perm, ?h);
         if (raw >= 0) {
             val wrote: bool = write_all(h, e.data, e.len);
-            if (wrote && e.has_target_perm) {
-                os.set_mode(h, perm_for(e));
+            var mode_ok: bool = wrote;
+            if (mode_ok && set.fail_chmod) {
+                mode_ok = false;
             }
-            var synced: bool = true;
-            if (wrote && set.durable) {
-                val sy: err[io_error.Error] = filesystem.sync(filesystem.File{handle: io_handle.FileHandle{value: h}});
-                if (sel sy.err) { synced = false; }
+            if (mode_ok && mode_supported_on_host(want_perm)) {
+                if (os.set_mode(h, want_perm) != 0) {
+                    mode_ok = false;
+                }
+                or {
+                    var st: os.stat_t;
+                    if (os.stat(h, ?st) < 0 || (st.st_mode & 511) != (want_perm::u32 & 511)) {
+                        mode_ok = false;
+                    }
+                }
+            }
+            var synced: bool = mode_ok;
+            if (synced && set.durable) {
+                if (set.fail_sync) {
+                    synced = false;
+                }
+                or {
+                    val sy: err[io_error.Error] = filesystem.sync(filesystem.File{handle: io_handle.FileHandle{value: h}});
+                    if (sel sy.err) { synced = false; }
+                }
             }
             os.close(h);
-            if (!wrote || !synced) {
+            if (!wrote || !mode_ok || !synced) {
                 filesystem.remove_file(tmp.ok);
                 ret false;
             }
@@ -667,7 +757,11 @@ fun restore(set: *Set, e: *Entry) bool {
     if (e.status == ST_CREATE) {
         var cur_pm: u32 = 0;
         if (probe(e.full, ?cur_pm) != 1) { ret false; }
-        val cur_b: res[vector.Vector[u8], filesystem.FsError] = read_file_bytes(set.a, set.root, e.rel, e.full, cur_pm);
+        val want_pm: i32 = perm_for(e);
+        if (mode_supported_on_host(want_pm) && (cur_pm & 511) != (want_pm::u32 & 511)) {
+            ret false;
+        }
+        val cur_b: res[vector.Vector[u8], filesystem.FsError] = filesystem.read_bytes(set.a, e.full);
         if (sel cur_b.err) { ret false; }
         var cur_sha: [65]u8;
         hash_hex(cur_b.ok.data, cur_b.ok.len, ?cur_sha[0]);
@@ -675,13 +769,18 @@ fun restore(set: *Set, e: *Entry) bool {
         val rm: err[io_error.Error] = filesystem.remove_file(e.full);
         if (sel rm.err) { ret false; }
         if (probe(e.full, nil) != 0) { ret false; }
+        if (set.durable && !sync_parent_dir(set.a, e.full)) { ret false; }
         ret true;
     }
     if (e.status == ST_REPLACE || e.status == ST_DELETE) {
         if (e.status == ST_REPLACE) {
             var cur_pm2: u32 = 0;
             if (probe(e.full, ?cur_pm2) != 1) { ret false; }
-            val cur_b2: res[vector.Vector[u8], filesystem.FsError] = read_file_bytes(set.a, set.root, e.rel, e.full, cur_pm2);
+            val want_pm2: i32 = perm_for(e);
+            if (mode_supported_on_host(want_pm2) && (cur_pm2 & 511) != (want_pm2::u32 & 511)) {
+                ret false;
+            }
+            val cur_b2: res[vector.Vector[u8], filesystem.FsError] = filesystem.read_bytes(set.a, e.full);
             if (sel cur_b2.err) { ret false; }
             var cur_sha2: [65]u8;
             hash_hex(cur_b2.ok.data, cur_b2.ok.len, ?cur_sha2[0]);
@@ -699,11 +798,19 @@ fun restore(set: *Set, e: *Entry) bool {
         }
         val r: err[filesystem.FsError] = filesystem.replace_bytes_atomic(set.a, e.full, e.old, e.old_len, perm, 493);
         if (sel r.err) { ret false; }
-        val ver_b: res[vector.Vector[u8], filesystem.FsError] = read_file_bytes(set.a, set.root, e.rel, e.full, perm::u32);
-        if (sel ver_b.err) { ret false; }
-        var ver_sha: [65]u8;
-        hash_hex(ver_b.ok.data, ver_b.ok.len, ?ver_sha[0]);
-        if (!util.eq(?ver_sha[0], ?e.old_sha[0])) { ret false; }
+        var ver_pm: u32 = 0;
+        if (probe(e.full, ?ver_pm) != 1) { ret false; }
+        if (mode_supported_on_host(perm) && (ver_pm & 511) != (perm::u32 & 511)) {
+            ret false;
+        }
+        if ((perm & 256) != 0) {
+            val ver_b: res[vector.Vector[u8], filesystem.FsError] = filesystem.read_bytes(set.a, e.full);
+            if (sel ver_b.err) { ret false; }
+            var ver_sha: [65]u8;
+            hash_hex(ver_b.ok.data, ver_b.ok.len, ?ver_sha[0]);
+            if (!util.eq(?ver_sha[0], ?e.old_sha[0])) { ret false; }
+        }
+        if (set.durable && !sync_parent_dir(set.a, e.full)) { ret false; }
         ret true;
     }
     ret true;
@@ -745,14 +852,30 @@ pub fun publish(set: *Set) Outcome {
     for (i < set.items.len) {
         val e: *Entry = ?set.items.data[i];
         var broke: bool = false;
-        if (e.status == ST_CREATE || e.status == ST_REPLACE) {
+        if (set.fail_publish_at >= 0 && i::i64 == set.fail_publish_at) {
+            broke = true;
+        }
+        or (e.status == ST_CREATE || e.status == ST_REPLACE) {
             if (ancestry(set, e.rel) != nil || probe(e.full, nil) == 3) {
                 broke = true;
             }
             or {
                 val mv: err[io_error.Error] = filesystem.rename(e.temp, e.full);
                 if (sel mv.err) { broke = true; }
-                or { e.done = true; }
+                or {
+                    e.done = true;
+                    var pub_pm: u32 = 0;
+                    val want_pm: i32 = perm_for(e);
+                    if (probe(e.full, ?pub_pm) != 1) {
+                        broke = true;
+                    }
+                    or (mode_supported_on_host(want_pm) && (pub_pm & 511) != (want_pm::u32 & 511)) {
+                        broke = true;
+                    }
+                    or (set.durable && (set.fail_sync || !sync_parent_dir(set.a, e.full))) {
+                        broke = true;
+                    }
+                }
             }
         }
         or (e.status == ST_DELETE) {
@@ -762,12 +885,26 @@ pub fun publish(set: *Set) Outcome {
             or {
                 val rm: err[io_error.Error] = filesystem.remove_file(e.full);
                 if (sel rm.err) { broke = true; }
-                or { e.done = true; }
+                or {
+                    e.done = true;
+                    if (set.durable && (set.fail_sync || !sync_parent_dir(set.a, e.full))) {
+                        broke = true;
+                    }
+                }
             }
         }
         if (broke) {
+            if (set.mutate_before_rollback_idx >= 0 && set.mutate_before_rollback_idx::usize < set.items.len) {
+                val me: *Entry = ?set.items.data[set.mutate_before_rollback_idx::usize];
+                if (set.mutate_before_rollback_perm >= 0) {
+                    apply_file_mode(me.full, set.mutate_before_rollback_perm);
+                }
+                or {
+                    filesystem.replace_bytes_atomic(set.a, me.full, "EXTERNAL_RACE\n", 14, 420, 493);
+                }
+            }
             var rb_failed: bool = false;
-            var j: usize = i;
+            var j: usize = i + 1;
             for (j > 0) {
                 j = j - 1;
                 val d: *Entry = ?set.items.data[j];
@@ -801,16 +938,6 @@ pub fun publish(set: *Set) Outcome {
     ret ok;
 }
 
-pub fun sync_file(p: str) bool {
-    var h: usize = os.INVALID_HANDLE;
-    val raw: i64 = os.open(os.working_dir(), p, os.O_WRONLY | os.O_APPEND, 384, ?h);
-    if (raw < 0) { ret false; }
-    val sy: err[io_error.Error] = filesystem.sync(filesystem.File{handle: io_handle.FileHandle{value: h}});
-    os.close(h);
-    if (sel sy.err) { ret false; }
-    ret true;
-}
-
 # append one line to .qark/journal.ndjson under the held lock; returns the byte offset it starts at, or -1
 pub fun journal(set: *Set, line: *u8, n: usize) i64 {
     val p: res[str, A.Error] = pathx.native(set.a, set.root, ".qark/journal.ndjson");
@@ -825,11 +952,17 @@ pub fun journal(set: *Set, line: *u8, n: usize) i64 {
     val ok: bool = write_all(h, line, n);
     var synced: bool = true;
     if (ok && set.durable) {
-        val sy: err[io_error.Error] = filesystem.sync(filesystem.File{handle: io_handle.FileHandle{value: h}});
-        if (sel sy.err) { synced = false; }
+        if (set.fail_sync) {
+            synced = false;
+        }
+        or {
+            val sy: err[io_error.Error] = filesystem.sync(filesystem.File{handle: io_handle.FileHandle{value: h}});
+            if (sel sy.err) { synced = false; }
+        }
     }
     os.close(h);
     if (!ok || !synced) { ret -1; }
+    if (set.durable && !sync_parent_dir(set.a, p.ok)) { ret -1; }
     ret offset;
 }
 
@@ -952,6 +1085,119 @@ $if (capability.HOSTED) {
         # R08: negative timeout_ms is rejected immediately
         var l_neg: Lock;
         if (bad == 0 && lock_with_clock(?s6, -1, false, ?l_neg) != 2) { bad = 18; }
+
+        # F03: perm_for & decide preserve 000 (+x -> 0111 = 73) and 0740 (+x -> 0751 = 489) on same-content and changed-content
+        var e_zero: Entry;
+        e_zero.existed = true;
+        e_zero.has_old_perm = true;
+        e_zero.old_perm = 0;
+        e_zero.exec = true;
+        if (bad == 0 && perm_for(?e_zero) != 73) { bad = 19; }
+
+        var e_740: Entry;
+        e_740.existed = true;
+        e_740.has_old_perm = true;
+        e_740.old_perm = 480;
+        e_740.exec = true;
+        e_740.mode = MODE_UPSERT;
+        hash_hex("same\n", 5, ?e_740.sha[0]);
+        hash_hex("same\n", 5, ?e_740.old_sha[0]);
+        if (bad == 0 && perm_for(?e_740) != 489) { bad = 20; }
+        decide(?e_740);
+        if (bad == 0 && e_740.status != ST_REPLACE) { bad = 21; }
+
+        # F01 & F03: create a 000 file; verify disk mode is 0 and subsequent observe fails closed with path_unreadable without widening mode
+        var s_zero: Set = init(?a, root);
+        add(?s_zero, "locked_zero.txt", "secret\n", 7, MODE_CREATE);
+        val ez0: *Entry = entry(?s_zero, 0);
+        ez0.has_target_perm = true;
+        ez0.target_perm = 0;
+        observe(?s_zero);
+        if (bad == 0 && lock(?s_zero, 2000, ?l) == 0) {
+            val oz: Outcome = publish(?s_zero);
+            if (!oz.ok) { bad = 22; }
+            unlock(?l);
+        }
+        var z_pm: u32 = 999;
+        if (bad == 0 && (probe(ez0.full, ?z_pm) != 1 || (z_pm & 511) != 0)) { bad = 23; }
+        var s_zero_obs: Set = init(?a, root);
+        add(?s_zero_obs, "locked_zero.txt", "next\n", 5, MODE_UPSERT);
+        observe(?s_zero_obs);
+        val ez_obs: *Entry = entry(?s_zero_obs, 0);
+        val z_read_probe: res[vector.Vector[u8], filesystem.FsError] = filesystem.read_bytes(?a, ez0.full);
+        if (sel z_read_probe.err) {
+            if (bad == 0 && (ez_obs.status != ST_CONFLICT || !util.eq(ez_obs.reason, "path_unreadable"))) { bad = 24; }
+        }
+        var z_pm_after: u32 = 999;
+        if (bad == 0 && (probe(ez0.full, ?z_pm_after) != 1 || (z_pm_after & 511) != 0)) { bad = 25; }
+        os.set_mode_at(os.working_dir(), ez0.full, 384);
+
+        # F02 & F03: fail_chmod and fail_sync fault injection fail closed without mutating target
+        var s_fc: Set = init(?a, root);
+        s_fc.fail_chmod = true;
+        add(?s_fc, "b.txt", "NO_CHMOD\n", 9, MODE_REPLACE);
+        observe(?s_fc);
+        if (bad == 0 && lock(?s_fc, 2000, ?l) == 0) {
+            val ofc: Outcome = publish(?s_fc);
+            if (ofc.ok || !util.eq(ofc.code, "io_stage")) { bad = 26; }
+            unlock(?l);
+        }
+        var s_fs: Set = init(?a, root);
+        s_fs.durable = true;
+        s_fs.fail_sync = true;
+        add(?s_fs, "b.txt", "NO_SYNC\n", 8, MODE_REPLACE);
+        observe(?s_fs);
+        if (bad == 0 && lock(?s_fs, 2000, ?l) == 0) {
+            val ofs: Outcome = publish(?s_fs);
+            if (ofs.ok || !util.eq(ofs.code, "io_stage")) { bad = 27; }
+            if (journal(?s_fs, "{}\n", 3) != -1) { bad = 28; }
+            unlock(?l);
+        }
+
+        # F05: full multi-file publish() rollback loop (clean rollback, external content race, external permission race)
+        var s_rb1: Set = init(?a, root);
+        s_rb1.fail_publish_at = 1;
+        add(?s_rb1, "rb_a.txt", "FIRST_A\n", 8, MODE_CREATE);
+        add(?s_rb1, "rb_b.txt", "FIRST_B\n", 8, MODE_CREATE);
+        observe(?s_rb1);
+        if (bad == 0 && lock(?s_rb1, 2000, ?l) == 0) {
+            val orb1: Outcome = publish(?s_rb1);
+            if (orb1.ok || orb1.rollback_failed || entry(?s_rb1, 0).rollback_state != RB_RESTORED) { bad = 29; }
+            unlock(?l);
+        }
+        if (bad == 0 && probe(entry(?s_rb1, 0).full, nil) != 0) { bad = 30; }
+
+        var s_rb2: Set = init(?a, root);
+        s_rb2.fail_publish_at = 1;
+        s_rb2.mutate_before_rollback_idx = 0;
+        add(?s_rb2, "rb_race.txt", "OUR_WRITE\n", 10, MODE_CREATE);
+        add(?s_rb2, "rb_fail.txt", "FAIL\n", 5, MODE_CREATE);
+        observe(?s_rb2);
+        if (bad == 0 && lock(?s_rb2, 2000, ?l) == 0) {
+            val orb2: Outcome = publish(?s_rb2);
+            if (orb2.ok || !orb2.rollback_failed || !orb2.recovery_required || entry(?s_rb2, 0).rollback_state != RB_FAILED) { bad = 31; }
+            unlock(?l);
+        }
+        val race_txt: res[str, filesystem.FsError] = filesystem.read_string(?a, entry(?s_rb2, 0).full);
+        if (bad == 0 && !(sel race_txt.ok && str_equals(race_txt.ok, "EXTERNAL_RACE\n"))) { bad = 32; }
+
+        var s_rb3: Set = init(?a, root);
+        s_rb3.fail_publish_at = 1;
+        s_rb3.mutate_before_rollback_idx = 0;
+        s_rb3.mutate_before_rollback_perm = 384;
+        add(?s_rb3, "rb_perm.txt", "PERM_TEST\n", 10, MODE_CREATE);
+        add(?s_rb3, "rb_perm_fail.txt", "FAIL\n", 5, MODE_CREATE);
+        val ep0: *Entry = entry(?s_rb3, 0);
+        ep0.has_target_perm = true;
+        ep0.target_perm = 448;
+        observe(?s_rb3);
+        if (bad == 0 && lock(?s_rb3, 2000, ?l) == 0) {
+            val orb3: Outcome = publish(?s_rb3);
+            if (orb3.ok || !orb3.rollback_failed || !orb3.recovery_required || entry(?s_rb3, 0).rollback_state != RB_FAILED) { bad = 33; }
+            unlock(?l);
+        }
+        var pm_race: u32 = 0;
+        if (bad == 0 && (probe(ep0.full, ?pm_race) != 1 || (pm_race & 511) != 384)) { bad = 34; }
 
         filesystem.remove_all(?a, root);
         ret bad;

@@ -2,8 +2,8 @@
 # build both profiles and test on a posix host. the binary name has no .exe there.
 set -e
 cd "$(dirname "$0")"
-mach build .
-mach build . --profile release
+mach build . -a qark -a qa
+mach build . -a qark -a qa --profile release
 mach test .
 qark="./out/linux-x86_64/release/bin/qark"
 if [ ! -x "$qark" ]; then

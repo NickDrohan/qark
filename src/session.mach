@@ -52,6 +52,7 @@ pub rec Session {
     force_dry:      bool;
     lock_root:      bool;
     require_check:  bool;
+    require_expect: bool;
     no_custom_exec: bool;
     strict_spec:    bool;
     durable:        bool;
