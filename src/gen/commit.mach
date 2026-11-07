@@ -57,6 +57,10 @@ pub val RB_NONE:       u8 = 0;
 pub val RB_RESTORED:   u8 = 1;
 pub val RB_FAILED:     u8 = 2;
 
+pub val DIR_SYNC_OK:          i64 = 0;
+pub val DIR_SYNC_UNSUPPORTED: i64 = 1;
+pub val DIR_SYNC_FAILED:      i64 = -1;
+
 # one file in a change set
 # ---
 # rel:      canonical relative path, '/' separated
@@ -127,6 +131,7 @@ pub rec Set {
     durable:                     bool;
     fail_chmod:                  bool;
     fail_sync:                   bool;
+    fail_sync_unsupported:       bool;
     fail_publish_at:             i64;
     mutate_before_rollback_idx:  i64;
     mutate_before_rollback_perm: i32;
@@ -224,6 +229,7 @@ pub fun init(a: *A.Allocator, root: str) Set {
     s.durable = false;
     s.fail_chmod = false;
     s.fail_sync = false;
+    s.fail_sync_unsupported = false;
     s.fail_publish_at = -1;
     s.mutate_before_rollback_idx = -1;
     s.mutate_before_rollback_perm = -1;
@@ -656,33 +662,62 @@ pub fun sync_file(p: str) bool {
     ret true;
 }
 
-pub fun sync_dir(p: str) bool {
-    if (p == nil || p[0] == 0) { ret false; }
+pub fun sync_dir_status(p: str) i64 {
+    if (p == nil || p[0] == 0) { ret DIR_SYNC_FAILED; }
     var h: usize = os.INVALID_HANDLE;
     val raw: i64 = os.open(os.working_dir(), p, os.O_RDONLY | os.O_DIRECTORY, 0, ?h);
     if (raw < 0) {
-        val k: u8 = os.error_kind(raw);
-        if (k == io_error.UNSUPPORTED || k == io_error.INVALID || k == io_error.IS_DIRECTORY || k == io_error.PERMISSION) {
-            ret true;
+        if (os.error_kind(raw) == io_error.UNSUPPORTED) {
+            ret DIR_SYNC_UNSUPPORTED;
         }
-        ret false;
+        ret DIR_SYNC_FAILED;
     }
     val sy: i64 = os.sync_fd(h);
-    os.close(h);
+    val cl: i64 = os.close(h);
     if (sy < 0) {
-        val sk: u8 = os.error_kind(sy);
-        if (sk == io_error.UNSUPPORTED || sk == io_error.INVALID) {
-            ret true;
+        if (os.error_kind(sy) == io_error.UNSUPPORTED) {
+            ret DIR_SYNC_UNSUPPORTED;
         }
-        ret false;
+        ret DIR_SYNC_FAILED;
     }
-    ret true;
+    if (cl < 0) { ret DIR_SYNC_FAILED; }
+    ret DIR_SYNC_OK;
+}
+
+pub fun sync_dir(p: str) bool {
+    ret sync_dir_status(p) == DIR_SYNC_OK;
 }
 
 pub fun sync_parent_dir(a: *A.Allocator, file_path: str) bool {
     val parent: res[str, A.Error] = path.parent(a, file_path);
     if (sel parent.err) { ret false; }
     ret sync_dir(parent.ok);
+}
+
+# Synchronize the workspace root and every intermediate directory along `rel`
+# (for example `root`, `root/a`, `root/a/b` for `rel = "a/b/file.txt"`) so
+# newly created directory ancestry is persisted to disk.
+pub fun sync_ancestry_dirs(a: *A.Allocator, root: str, rel: str) bool {
+    if (root == nil || root[0] == 0) { ret false; }
+    if (!sync_dir(root)) { ret false; }
+    if (rel == nil || rel[0] == 0) { ret true; }
+    val n: usize = str_len(rel);
+    var i: usize = 0;
+    for (i < n) {
+        if (rel[i] == '/' || rel[i] == '\\') {
+            if (i > 0) {
+                val pref: res[str, A.Error] = util.dup_n(a, rel, i);
+                if (sel pref.err) { ret false; }
+                val dir_full: res[str, A.Error] = pathx.native(a, root, pref.ok);
+                if (sel dir_full.err) { ret false; }
+                if (probe(dir_full.ok, nil) == 2) {
+                    if (!sync_dir(dir_full.ok)) { ret false; }
+                }
+            }
+        }
+        i = i + 1;
+    }
+    ret true;
 }
 
 fun stage(set: *Set, e: *Entry) bool {
@@ -769,7 +804,7 @@ fun restore(set: *Set, e: *Entry) bool {
         val rm: err[io_error.Error] = filesystem.remove_file(e.full);
         if (sel rm.err) { ret false; }
         if (probe(e.full, nil) != 0) { ret false; }
-        if (set.durable && !sync_parent_dir(set.a, e.full)) { ret false; }
+        if (set.durable && (set.fail_sync || set.fail_sync_unsupported || !sync_ancestry_dirs(set.a, set.root, e.rel))) { ret false; }
         ret true;
     }
     if (e.status == ST_REPLACE || e.status == ST_DELETE) {
@@ -810,7 +845,7 @@ fun restore(set: *Set, e: *Entry) bool {
             hash_hex(ver_b.ok.data, ver_b.ok.len, ?ver_sha[0]);
             if (!util.eq(?ver_sha[0], ?e.old_sha[0])) { ret false; }
         }
-        if (set.durable && !sync_parent_dir(set.a, e.full)) { ret false; }
+        if (set.durable && (set.fail_sync || set.fail_sync_unsupported || !sync_ancestry_dirs(set.a, set.root, e.rel))) { ret false; }
         ret true;
     }
     ret true;
@@ -872,7 +907,7 @@ pub fun publish(set: *Set) Outcome {
                     or (mode_supported_on_host(want_pm) && (pub_pm & 511) != (want_pm::u32 & 511)) {
                         broke = true;
                     }
-                    or (set.durable && (set.fail_sync || !sync_parent_dir(set.a, e.full))) {
+                    or (set.durable && (set.fail_sync || set.fail_sync_unsupported || !sync_ancestry_dirs(set.a, set.root, e.rel))) {
                         broke = true;
                     }
                 }
@@ -887,7 +922,7 @@ pub fun publish(set: *Set) Outcome {
                 if (sel rm.err) { broke = true; }
                 or {
                     e.done = true;
-                    if (set.durable && (set.fail_sync || !sync_parent_dir(set.a, e.full))) {
+                    if (set.durable && (set.fail_sync || set.fail_sync_unsupported || !sync_ancestry_dirs(set.a, set.root, e.rel))) {
                         broke = true;
                     }
                 }
@@ -962,7 +997,7 @@ pub fun journal(set: *Set, line: *u8, n: usize) i64 {
     }
     os.close(h);
     if (!ok || !synced) { ret -1; }
-    if (set.durable && !sync_parent_dir(set.a, p.ok)) { ret -1; }
+    if (set.durable && (set.fail_sync || set.fail_sync_unsupported || !sync_ancestry_dirs(set.a, set.root, ".qark/journal.ndjson"))) { ret -1; }
     ret offset;
 }
 
@@ -1198,6 +1233,36 @@ $if (capability.HOSTED) {
         }
         var pm_race: u32 = 0;
         if (bad == 0 && (probe(ep0.full, ?pm_race) != 1 || (pm_race & 511) != 384)) { bad = 34; }
+
+        # P1 #1 & P1 #2: sync_dir_status outcomes, fail_sync_unsupported fails closed, and newly created ancestry persistence
+        if (bad == 0 && sync_dir_status(root) != DIR_SYNC_OK) { bad = 35; }
+        if (bad == 0 && (sync_dir_status(nil) != DIR_SYNC_FAILED || sync_dir_status("") != DIR_SYNC_FAILED)) { bad = 36; }
+        if (bad == 0 && sync_dir_status(entry(?s4, 0).full) != DIR_SYNC_FAILED) { bad = 37; }
+        if (bad == 0 && sync_dir_status(entry(?s4, 1).full) != DIR_SYNC_FAILED) { bad = 38; }
+
+        var s_fsu: Set = init(?a, root);
+        s_fsu.durable = true;
+        s_fsu.fail_sync_unsupported = true;
+        add(?s_fsu, "unsup_new.txt", "UNSUPPORTED_SYNC\n", 17, MODE_CREATE);
+        observe(?s_fsu);
+        if (bad == 0 && lock(?s_fsu, 2000, ?l) == 0) {
+            val ofsu: Outcome = publish(?s_fsu);
+            if (ofsu.ok || !ofsu.recovery_required || !util.eq(ofsu.code, "io_commit_rollback_failed")) { bad = 39; }
+            if (journal(?s_fsu, "{}\n", 3) != -1) { bad = 40; }
+            unlock(?l);
+        }
+        filesystem.remove_file(entry(?s_fsu, 0).full);
+
+        var s_anc: Set = init(?a, root);
+        s_anc.durable = true;
+        add(?s_anc, "deep/a/b/c/file.txt", "ANCESTRY\n", 9, MODE_CREATE);
+        observe(?s_anc);
+        if (bad == 0 && lock(?s_anc, 2000, ?l) == 0) {
+            val oanc: Outcome = publish(?s_anc);
+            if (!oanc.ok) { bad = 41; }
+            unlock(?l);
+        }
+        if (bad == 0 && !sync_ancestry_dirs(?a, root, "deep/a/b/c/file.txt")) { bad = 42; }
 
         filesystem.remove_all(?a, root);
         ret bad;

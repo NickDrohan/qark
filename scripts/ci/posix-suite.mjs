@@ -314,7 +314,220 @@ try {
   assert(!fs.existsSync(partialPath), "publishing WAL created file was rolled back");
   assert(!fs.existsSync(walPath), "WAL was cleared after recovery");
 
-  console.log("PASS all POSIX permission, umask, torn-journal byte-prefix, and SIGKILL recovery checks");
+  // 7. P1 #3: Real in-flight transaction SIGKILL at deterministic barriers (apply, undo, redo x publishing, committed)
+  async function killAtBarrier(stage, op, args) {
+    const worker = spawn(qarkBin, ["--headless", "--stdio", "--root", ws, "--pause-at", stage], {
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    let stderrBuf = "";
+    await new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error(`timeout waiting for barrier ${stage}; stderr=${stderrBuf}`)), 15000);
+      worker.stderr.on("data", (chunk) => {
+        stderrBuf += chunk.toString("utf8");
+        if (stderrBuf.includes(`"barrier":"${stage}"`)) {
+          clearTimeout(timer);
+          resolve();
+        }
+      });
+      worker.on("error", (err) => {
+        clearTimeout(timer);
+        reject(err);
+      });
+      worker.on("exit", (code, sig) => {
+        clearTimeout(timer);
+        reject(new Error(`worker exited early (${code}/${sig}) before barrier ${stage}; stderr=${stderrBuf}`));
+      });
+      worker.stdin.write(JSON.stringify({ id: 1, op, args }) + "\n");
+    });
+
+    // Verify WAL exists in expected state AND that the paused worker holds .qark/lock
+    assert(fs.existsSync(walPath), `WAL must exist while paused at ${stage}`);
+    const walDoc = JSON.parse(fs.readFileSync(walPath, "utf8"));
+    const expectedState = stage.endsWith("_publishing") ? "publishing" : "committed";
+    assert(walDoc.state === expectedState, `WAL state at ${stage} must be ${expectedState}`, walDoc);
+
+    const contender = callOne(
+      ws,
+      "apply",
+      { path: "lock_probe.txt", mode: "upsert", text: "contend\n" },
+      ["--lock-timeout-ms", "50"]
+    );
+    assert(
+      !contender.ok && contender.error.code === "locked",
+      `competing worker must be rejected with locked while paused at ${stage}`,
+      contender
+    );
+
+    worker.kill("SIGKILL");
+    await new Promise((resolve) => worker.once("exit", resolve));
+  }
+
+  // 7a. apply_publishing barrier: kill in-flight, restart twice, retry with original idempotency_key
+  const applyPubSpec = {
+    idempotency_key: "idem-inflight-apply-pub",
+    durable: true,
+    files: [
+      { path: "inflight/a/b/file1.txt", mode: "create", perm: 0o640, text: "inflight-v1\n" },
+      { path: "inflight/a/b/file2.txt", mode: "create", perm: 0o750, text: "#!/bin/sh\necho v1\n" },
+    ],
+  };
+  await killAtBarrier("apply_publishing", "apply", applyPubSpec);
+  assert(fs.existsSync(path.join(ws, "inflight/a/b/file1.txt")), "file1 exists at apply_publishing barrier");
+  // Restart 1: retry with original idempotency_key -> rolls back interrupted publishing WAL and executes apply cleanly
+  const rApplyPubRetry1 = callOne(ws, "apply", applyPubSpec);
+  assert(
+    rApplyPubRetry1.ok && !rApplyPubRetry1.result.replayed && rApplyPubRetry1.result.created === 2,
+    "restart 1 after apply_publishing SIGKILL rolls back partial txn and applies cleanly",
+    rApplyPubRetry1
+  );
+  // Restart 2: retry with original idempotency_key -> replays committed receipt
+  const rApplyPubRetry2 = callOne(ws, "apply", applyPubSpec);
+  assert(
+    rApplyPubRetry2.ok && rApplyPubRetry2.result.replayed === true && rApplyPubRetry2.result.txn === rApplyPubRetry1.result.txn,
+    "restart 2 after apply_publishing SIGKILL replays idempotent receipt",
+    rApplyPubRetry2
+  );
+
+  // 7b. apply_committed barrier: kill in-flight, restart twice, retry with original idempotency_key
+  const applyComSpec = {
+    idempotency_key: "idem-inflight-apply-com",
+    durable: true,
+    files: [
+      { path: "inflight/a/b/file1.txt", mode: "replace", perm: 0o600, text: "inflight-v2\n" },
+    ],
+  };
+  await killAtBarrier("apply_committed", "apply", applyComSpec);
+  // Restart 1: retry with original idempotency_key -> rolls forward committed WAL (including idempotency record) and replays receipt!
+  const rApplyComRetry1 = callOne(ws, "apply", applyComSpec);
+  assert(
+    rApplyComRetry1.ok && rApplyComRetry1.result.replayed === true && rApplyComRetry1.result.replaced === 1,
+    "restart 1 after apply_committed SIGKILL rolls forward committed WAL and replays idempotent receipt",
+    rApplyComRetry1
+  );
+  // Restart 2: retry with original idempotency_key -> still replays same receipt
+  const rApplyComRetry2 = callOne(ws, "apply", applyComSpec);
+  assert(
+    rApplyComRetry2.ok && rApplyComRetry2.result.replayed === true && rApplyComRetry2.result.txn === rApplyComRetry1.result.txn,
+    "restart 2 after apply_committed SIGKILL replays identical receipt",
+    rApplyComRetry2
+  );
+  assert(fs.readFileSync(path.join(ws, "inflight/a/b/file1.txt"), "utf8") === "inflight-v2\n", "file1 has v2 content");
+  assert((fs.statSync(path.join(ws, "inflight/a/b/file1.txt")).mode & 0o777) === 0o600, "file1 has 0600 mode");
+
+  // 7c. undo_publishing barrier: kill in-flight, restart twice
+  await killAtBarrier("undo_publishing", "undo", { durable: true });
+  // Restart 1: run undo -> first recovers (rolls back the interrupted undo back to v2), then executes undo to v1
+  const rUndoPubRetry1 = callOne(ws, "undo", { durable: true });
+  assert(rUndoPubRetry1.ok && rUndoPubRetry1.result.replaced === 1, "restart 1 after undo_publishing recovers and undoes to v1", rUndoPubRetry1);
+  assert(fs.readFileSync(path.join(ws, "inflight/a/b/file1.txt"), "utf8") === "inflight-v1\n", "file1 restored to v1");
+  assert((fs.statSync(path.join(ws, "inflight/a/b/file1.txt")).mode & 0o777) === 0o640, "file1 mode restored to 0640");
+  // Redo back to v2 to prepare for undo_committed test
+  const rRedoPrep = callOne(ws, "redo", { durable: true });
+  assert(rRedoPrep.ok, "redo back to v2 before undo_committed test", rRedoPrep);
+
+  // 7d. undo_committed barrier: kill in-flight, restart twice
+  await killAtBarrier("undo_committed", "undo", { durable: true });
+  const rUndoComRec1 = callOne(ws, "apply", { path: "inflight/noop.txt", mode: "upsert", text: "ok\n" });
+  assert(rUndoComRec1.ok, "restart 1 after undo_committed finalizes committed undo WAL", rUndoComRec1);
+  assert(fs.readFileSync(path.join(ws, "inflight/a/b/file1.txt"), "utf8") === "inflight-v1\n", "file1 is v1 after undo_committed recovery");
+  const rReapplyV2 = callOne(ws, "apply", {
+    durable: true,
+    files: [{ path: "inflight/a/b/file1.txt", mode: "replace", perm: 0o600, text: "inflight-v2\n" }],
+  });
+  assert(rReapplyV2.ok, "re-apply v2 for redo barrier tests", rReapplyV2);
+  const rCleanUndo = callOne(ws, "undo", { durable: true });
+  assert(rCleanUndo.ok, "clean undo of v2", rCleanUndo);
+
+  // 7e. redo_publishing barrier: kill in-flight, restart twice
+  await killAtBarrier("redo_publishing", "redo", { durable: true });
+  const rRedoPubRetry1 = callOne(ws, "redo", { durable: true });
+  assert(rRedoPubRetry1.ok && rRedoPubRetry1.result.replaced === 1, "restart 1 after redo_publishing recovers and redoes to v2", rRedoPubRetry1);
+  assert(fs.readFileSync(path.join(ws, "inflight/a/b/file1.txt"), "utf8") === "inflight-v2\n", "file1 redone to v2");
+
+  // 7f. redo_committed barrier: undo v2, then kill redo at redo_committed, restart twice
+  assert(callOne(ws, "undo", { durable: true }).ok, "undo v2 before redo_committed test");
+  await killAtBarrier("redo_committed", "redo", { durable: true });
+  const rRedoComRec1 = callOne(ws, "apply", { path: "inflight/noop.txt", mode: "upsert", text: "ok\n" });
+  assert(rRedoComRec1.ok, "restart 1 after redo_committed finalizes committed redo WAL", rRedoComRec1);
+  assert(fs.readFileSync(path.join(ws, "inflight/a/b/file1.txt"), "utf8") === "inflight-v2\n", "file1 is v2 after redo_committed recovery");
+
+  // 8. P2 #4: Glob edits with per-path expect map under --require-expect
+  const g1 = callOne(ws, "apply", {
+    files: [
+      { path: "glob_exp/x.py", mode: "create", text: "val = 1\n" },
+      { path: "glob_exp/y.py", mode: "create", text: "val = 1\n" },
+    ],
+  });
+  assert(g1.ok, "seed glob_exp files", g1);
+  const shaX = g1.result.files[0].sha256;
+  const shaY = g1.result.files[1].sha256;
+
+  // Without expect map under --require-expect -> expect_required
+  const gNoExp = callOne(
+    ws,
+    "apply",
+    {
+      files: [{ glob: "glob_exp/*.py", edits: [{ find: "val = 1", replace: "val = 2" }] }],
+    },
+    ["--require-expect"]
+  );
+  assert(!gNoExp.ok && gNoExp.error.code === "expect_required", "glob without expect rejected under --require-expect", gNoExp);
+
+  // Partial expect map (missing y.py) under --require-expect -> expect_required
+  const gPartExp = callOne(
+    ws,
+    "apply",
+    {
+      files: [
+        {
+          glob: "glob_exp/*.py",
+          expect: { "glob_exp/x.py": shaX },
+          edits: [{ find: "val = 1", replace: "val = 2" }],
+        },
+      ],
+    },
+    ["--require-expect"]
+  );
+  assert(!gPartExp.ok && gPartExp.error.code === "expect_required", "glob with partial expect map rejected under --require-expect", gPartExp);
+
+  // Stale hash in expect map -> stale
+  const gStaleExp = callOne(
+    ws,
+    "apply",
+    {
+      files: [
+        {
+          glob: "glob_exp/*.py",
+          expect: {
+            "glob_exp/x.py": shaX,
+            "glob_exp/y.py": "0000000000000000000000000000000000000000000000000000000000000000",
+          },
+          edits: [{ find: "val = 1", replace: "val = 2" }],
+        },
+      ],
+    },
+    ["--require-expect"]
+  );
+  assert(!gStaleExp.ok && gStaleExp.error.code === "stale", "glob with stale per-path expect rejected with stale", gStaleExp);
+
+  // Complete per-path expect map under --require-expect -> succeeds!
+  const gOkExp = callOne(
+    ws,
+    "apply",
+    {
+      files: [
+        {
+          glob: "glob_exp/*.py",
+          expect: { "glob_exp/x.py": shaX, "glob_exp/y.py": shaY },
+          edits: [{ find: "val = 1", replace: "val = 2" }],
+        },
+      ],
+    },
+    ["--require-expect"]
+  );
+  assert(gOkExp.ok && gOkExp.result.replaced === 2, "glob with per-path expect map succeeds under --require-expect", gOkExp);
+
+  console.log("PASS all POSIX permission, umask, torn-journal byte-prefix, in-flight SIGKILL barrier, and glob expect checks");
 } finally {
   fs.rmSync(ws, { recursive: true, force: true });
 }
