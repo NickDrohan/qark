@@ -1411,16 +1411,79 @@ fun same_bytes(a: *u8, b: *u8, n: usize) bool {
     ret true;
 }
 
+fun lookup_glob_expect(a: *A.Allocator, root: str, exp_map: *json.Value, cand_rel: str, out_hex: **u8) bool {
+    if (exp_map == nil) { ret false; }
+    var xp: *u8 = nil;
+    var xn: usize = 0;
+    if (fstr(a, exp_map, cand_rel, ?xp, ?xn) == 1) {
+        @out_hex = xp;
+        ret true;
+    }
+    var i: usize = 0;
+    val cnt: usize = json.value_count(exp_map);
+    for (i < cnt) {
+        val kopt: opt[str] = json.value_key(exp_map, i);
+        val klen: usize = json.value_key_len(exp_map, i);
+        if (sel kopt.some) {
+            if (klen > 0) {
+                val kd: res[str, A.Error] = util.dup_n(a, kopt.some, klen);
+                if (sel kd.ok) {
+                    val stripped: str = pathx.strip_root(root, kd.ok);
+                    val canon: res[str, A.Error] = pathx.canonical(a, stripped);
+                    if (sel canon.ok) {
+                        if (util.eq(canon.ok, cand_rel)) {
+                            val gv: opt[*json.Value] = json.value_get(exp_map, i);
+                            if (sel gv.some) {
+                                if (decode_value(a, gv.some, ?xp, ?xn)) {
+                                    @out_hex = xp;
+                                    ret true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        i = i + 1;
+    }
+    ret false;
+}
+
 fun compile_glob(sp: *Spec, fv: *json.Value, fi: usize, glob_pat: str, e: *Err) bool {
     val a: *A.Allocator = sp.a;
-    val bad_keys: [7]str = [7]str{"expect", "rebase", "base_text", "move", "delete", "path", "each"};
+    val bad_keys: [6]str = [6]str{"rebase", "base_text", "move", "delete", "path", "each"};
     var bki: usize = 0;
-    for (bki < 7) {
+    for (bki < 6) {
         val bf: opt[*json.Value] = json.value_find(fv, bad_keys[bki]);
         if (sel bf.some) {
-            ret fail(e, "spec_glob_unsupported", "glob entries do not support expect, rebase, base_text, move, delete, path, or each", at(a, fi, bad_keys[bki]));
+            ret fail(e, "spec_glob_unsupported", "glob entries do not support a single expect string, rebase, base_text, move, delete, path, or each", at(a, fi, bad_keys[bki]));
         }
         bki = bki + 1;
+    }
+    var exp_map: *json.Value = nil;
+    val exp_f: opt[*json.Value] = json.value_find(fv, "expect");
+    if (sel exp_f.some) {
+        if (!json.value_is_object(exp_f.some)) {
+            ret fail(e, "spec_glob_unsupported", "glob entries do not support a single expect string; pass an object mapping relative paths to sha256 hashes or expand into files entries", at(a, fi, "expect"));
+        }
+        exp_map = exp_f.some;
+        var emi: usize = 0;
+        for (emi < json.value_count(exp_map)) {
+            val emg: opt[*json.Value] = json.value_get(exp_map, emi);
+            var valid_em: bool = false;
+            if (sel emg.some) {
+                var em_val: *u8 = nil;
+                var em_n: usize = 0;
+                var dummy_e: commit.Entry;
+                if (json.value_is_string(emg.some) && decode_value(a, emg.some, ?em_val, ?em_n) && commit.set_expect(?dummy_e, em_val)) {
+                    valid_em = true;
+                }
+            }
+            if (!valid_em) {
+                ret fail(e, "spec_expect", "every value in a glob expect map must be 64 hex digits", at(a, fi, "expect"));
+            }
+            emi = emi + 1;
+        }
     }
     var edits_v: *json.Value = nil;
     val edits_f: opt[*json.Value] = json.value_find(fv, "edits");
@@ -1505,6 +1568,21 @@ fun compile_glob(sp: *Spec, fv: *json.Value, fi: usize, glob_pat: str, e: *Err) 
         if (sel cur.ok) {
             val cp: *u8 = cur.ok.data;
             val cn: usize = cur.ok.len;
+            var edit_hash: [65]u8;
+            commit.hash_hex(cp, cn, ?edit_hash[0]);
+            var user_exp_hex: *u8 = nil;
+            val has_user_exp: bool = lookup_glob_expect(a, sp.root, exp_map, cand_rel, ?user_exp_hex);
+            if (has_user_exp) {
+                var chk_ent: commit.Entry;
+                commit.set_expect(?chk_ent, user_exp_hex);
+                if (!util.eq(?chk_ent.expect[0], ?edit_hash[0])) {
+                    e.path = cand_rel;
+                    e.code = "stale";
+                    e.msg = cat3(a, "the file changed since expect was read; its sha256 is now ", ?edit_hash[0], "");
+                    e.field = at(a, fi, "expect");
+                    ret false;
+                }
+            }
             var src: *u8 = cp;
             if (src == nil) { src = ""; }
             var data: *u8 = nil;
@@ -1549,10 +1627,14 @@ fun compile_glob(sp: *Spec, fv: *json.Value, fi: usize, glob_pat: str, e: *Err) 
                     val added: res[usize, A.Error] = commit.add(?sp.set, cand_rel, data, dn, commit.MODE_REPLACE);
                     if (sel added.err) { ret fail(e, "oom", "out of memory", at(a, fi, "glob")); }
                     val ent: *commit.Entry = commit.entry(?sp.set, added.ok);
-                    var edit_hash: [65]u8;
-                    commit.hash_hex(cp, cn, ?edit_hash[0]);
-                    commit.set_expect(ent, ?edit_hash[0]);
-                    ent.user_expect = false;
+                    if (has_user_exp) {
+                        commit.set_expect(ent, user_exp_hex);
+                        ent.user_expect = true;
+                    }
+                    or {
+                        commit.set_expect(ent, ?edit_hash[0]);
+                        ent.user_expect = false;
+                    }
                     ent.lang = glang;
                     ent.check_policy = g_policy;
                     ent.edited = true;

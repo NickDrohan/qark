@@ -13,6 +13,7 @@ use std.data.json;
 use std.filesystem;
 use io_error: std.io.error;
 use std.process.env;
+use std.system.os;
 use std.text.utf8;
 use std.types.bool.bool;
 use std.types.bool.false;
@@ -933,7 +934,7 @@ fun ensure_journal_line(a: *A.Allocator, root: str, set: *commit.Set, txn: *u8, 
     buf.ok[total_n] = 0;
     val wr_rep: err[filesystem.FsError] = filesystem.replace_bytes_atomic(a, jfull.ok, buf.ok, total_n, 384, 448);
     if (sel wr_rep.err) { ret false; }
-    if (set.durable && (set.fail_sync || !sync_path(jfull.ok) || !commit.sync_parent_dir(a, jfull.ok))) { ret false; }
+    if (set.durable && (set.fail_sync || !sync_path(jfull.ok) || !commit.sync_ancestry_dirs(a, root, ".qark/journal.ndjson"))) { ret false; }
     @out_off = valid_end::i64;
     ret true;
 }
@@ -1056,7 +1057,7 @@ fun write_undo_snapshot(s: *session.Session, sp: *spec.Spec, txn: *u8) bool {
     if (sel snap_full.err) { ret false; }
     val wrote: err[filesystem.FsError] = filesystem.replace_bytes_atomic(a, snap_full.ok, w.buf, w.len, 384, 448);
     if (sel wrote.err) { ret false; }
-    if (sp.set.durable && !commit.sync_parent_dir(a, snap_full.ok)) { ret false; }
+    if (sp.set.durable && !commit.sync_ancestry_dirs(a, s.root, jw.text(?pw))) { ret false; }
     ret true;
 }
 
@@ -1084,7 +1085,7 @@ fun remove_undo_snapshot(a: *A.Allocator, root: str, txn: *u8, durable: bool) {
     val snap_full: res[str, A.Error] = pathx.native(a, root, jw.text(?pw));
     if (sel snap_full.ok) {
         filesystem.remove_file(snap_full.ok);
-        if (durable) { commit.sync_parent_dir(a, snap_full.ok); }
+        if (durable) { commit.sync_ancestry_dirs(a, root, jw.text(?pw)); }
     }
 }
 
@@ -1108,7 +1109,7 @@ fun write_wal_publishing(a: *A.Allocator, root: str, op_name: str, txn: *u8, set
     if (sel wal_full.err) { ret false; }
     val wrote: err[filesystem.FsError] = filesystem.replace_bytes_atomic(a, wal_full.ok, w.buf, w.len, 384, 448);
     if (sel wrote.err) { ret false; }
-    if (set != nil && set.durable && !commit.sync_parent_dir(a, wal_full.ok)) { ret false; }
+    if (set != nil && set.durable && !commit.sync_ancestry_dirs(a, root, ".qark/wal.json")) { ret false; }
     ret true;
 }
 
@@ -1155,7 +1156,7 @@ fun write_wal_committed(a: *A.Allocator, root: str, op_name: str, txn: *u8, dura
     if (sel wal_full.err) { ret false; }
     val wrote: err[filesystem.FsError] = filesystem.replace_bytes_atomic(a, wal_full.ok, w.buf, w.len, 384, 448);
     if (sel wrote.err) { ret false; }
-    if (durable && !commit.sync_parent_dir(a, wal_full.ok)) { ret false; }
+    if (durable && !commit.sync_ancestry_dirs(a, root, ".qark/wal.json")) { ret false; }
     ret true;
 }
 
@@ -1166,7 +1167,7 @@ fun clear_wal(a: *A.Allocator, root: str, durable: bool) bool {
     if (sel rm.err) {
         if (rm.err.kind != io_error.NOT_FOUND) { ret false; }
     }
-    if (durable && !commit.sync_parent_dir(a, wal_full.ok)) { ret false; }
+    if (durable && !commit.sync_ancestry_dirs(a, root, ".qark/wal.json")) { ret false; }
     ret true;
 }
 
@@ -1183,12 +1184,12 @@ fun finalize_committed_wal(a: *A.Allocator, root: str, set: *commit.Set, txn: *u
         if (latest_p != nil && latest_n > 0) {
             val wr_lat: err[filesystem.FsError] = filesystem.replace_bytes_atomic(a, lat_full.ok, latest_p, latest_n, 384, 448);
             if (sel wr_lat.err) { ret false; }
-            if (set.durable && !commit.sync_parent_dir(a, lat_full.ok)) { ret false; }
+            if (set.durable && !commit.sync_ancestry_dirs(a, root, ".qark/undo/latest")) { ret false; }
         }
         or {
             val rm_lat: err[io_error.Error] = filesystem.remove_file(lat_full.ok);
             if (sel rm_lat.err && rm_lat.err.kind != io_error.NOT_FOUND) { ret false; }
-            if (set.durable && !commit.sync_parent_dir(a, lat_full.ok)) { ret false; }
+            if (set.durable && !commit.sync_ancestry_dirs(a, root, ".qark/undo/latest")) { ret false; }
         }
     }
     if (clear_redo || (has_redo && (redo_p == nil || redo_n == 0))) {
@@ -1196,14 +1197,14 @@ fun finalize_committed_wal(a: *A.Allocator, root: str, set: *commit.Set, txn: *u
         if (sel redo_full.err) { ret false; }
         val rm_redo: err[io_error.Error] = filesystem.remove_file(redo_full.ok);
         if (sel rm_redo.err && rm_redo.err.kind != io_error.NOT_FOUND) { ret false; }
-        if (set.durable && !commit.sync_parent_dir(a, redo_full.ok)) { ret false; }
+        if (set.durable && !commit.sync_ancestry_dirs(a, root, ".qark/undo/redo")) { ret false; }
     }
     or (has_redo && redo_p != nil && redo_n > 0) {
         val redo_full2: res[str, A.Error] = pathx.native(a, root, ".qark/undo/redo");
         if (sel redo_full2.err) { ret false; }
         val wr_redo: err[filesystem.FsError] = filesystem.replace_bytes_atomic(a, redo_full2.ok, redo_p, redo_n, 384, 448);
         if (sel wr_redo.err) { ret false; }
-        if (set.durable && !commit.sync_parent_dir(a, redo_full2.ok)) { ret false; }
+        if (set.durable && !commit.sync_ancestry_dirs(a, root, ".qark/undo/redo")) { ret false; }
     }
     if (idem_rel != nil && idem_buf != nil && idem_len > 0) {
         val irel_n: usize = str_len(idem_rel);
@@ -1214,10 +1215,26 @@ fun finalize_committed_wal(a: *A.Allocator, root: str, set: *commit.Set, txn: *u
         if (sel ifull.err) { ret false; }
         val wr_idem: err[filesystem.FsError] = filesystem.replace_bytes_atomic(a, ifull.ok, idem_buf, idem_len, 384, 448);
         if (sel wr_idem.err) { ret false; }
-        if (set.durable && !commit.sync_parent_dir(a, ifull.ok)) { ret false; }
+        if (set.durable && !commit.sync_ancestry_dirs(a, root, idem_rel)) { ret false; }
     }
     if (!clear_wal(a, root, set.durable)) { ret false; }
     ret true;
+}
+
+fun check_pause_barrier(s: *session.Session, stage: str) {
+    if (s == nil || s.pause_at == nil || !util.eq(s.pause_at, stage)) { ret; }
+    var bw: jw.Jw = jw.init(?s.ra);
+    jw.obj(?bw);
+    jw.f_str(?bw, "barrier", stage);
+    jw.obj_end(?bw);
+    jw.byte(?bw, '\n');
+    if (bw.buf != nil && bw.len > 0) {
+        filesystem.write(filesystem.STDERR, bw.buf, bw.len);
+        filesystem.sync(filesystem.STDERR);
+    }
+    for {
+        os.sleep(100000000);
+    }
 }
 
 fun has_pending_wal(a: *A.Allocator, root: str) bool {
@@ -1504,7 +1521,7 @@ fun recover_wal(a: *A.Allocator, root: str) i64 {
             if (sel m_after.err && m_after.err.kind != io_error.NOT_FOUND && m_after.err.kind != io_error.NOT_DIRECTORY) {
                 ret -1;
             }
-            if (w_durable && !commit.sync_parent_dir(a, ffull.ok)) { ret -1; }
+            if (w_durable && !commit.sync_ancestry_dirs(a, root, p)) { ret -1; }
         }
         or (util.eq(st, "replaced") || util.eq(st, "deleted")) {
             var old_b: *u8 = nil;
@@ -1555,7 +1572,7 @@ fun recover_wal(a: *A.Allocator, root: str) i64 {
                 commit.hash_hex(verify_b.ok.data, verify_b.ok.len, ?disk_sha[0]);
                 if (!util.eq(?disk_sha[0], ?expected_sha[0])) { ret -1; }
             }
-            if (w_durable && !commit.sync_parent_dir(a, ffull.ok)) { ret -1; }
+            if (w_durable && !commit.sync_ancestry_dirs(a, root, p)) { ret -1; }
         }
         or {
             ret -1;
@@ -1566,7 +1583,7 @@ fun recover_wal(a: *A.Allocator, root: str) i64 {
     if (!clear_wal(a, root, w_durable)) { ret -1; }
     if (has_snap_file && snap_path != nil && util.eq(wop, "apply")) {
         filesystem.remove_file(snap_path);
-        if (w_durable) { commit.sync_parent_dir(a, snap_path); }
+        if (w_durable) { commit.sync_ancestry_dirs(a, root, ".qark/undo/latest"); }
     }
     ret 0;
 }
@@ -2031,6 +2048,7 @@ pub fun redo(s: *session.Session, args: *json.Value, w: *jw.Jw) bool {
                 jw.obj_end(w);
                 ret false;
             }
+            check_pause_barrier(s, "redo_publishing");
         }
         val clr_redo: bool = update_redo_stack && rem_redo_n == 0;
         if (!write_wal_committed(a, s.root, "redo", ?rtxn[0], fwd_set.durable, update_redo_stack, last_txn, last_txn_n, update_redo_stack, rem_redo_p, rem_redo_n, clr_redo, rj_buf, rj_len, nil, nil, 0)) {
@@ -2041,6 +2059,7 @@ pub fun redo(s: *session.Session, args: *json.Value, w: *jw.Jw) bool {
             }
             ret simple_error(w, "journal_failed", "redo could not be committed in .qark/wal.json; changes were rolled back");
         }
+        check_pause_barrier(s, "redo_committed");
         var rj_off: i64 = -1;
         if (!finalize_committed_wal(a, s.root, ?fwd_set, ?rtxn[0], update_redo_stack, last_txn, last_txn_n, update_redo_stack, rem_redo_p, rem_redo_n, clr_redo, rj_buf, rj_len, nil, nil, 0, ?rj_off)) {
             if (recover_wal(a, s.root) < 0) {
@@ -2465,6 +2484,7 @@ pub fun undo(s: *session.Session, args: *json.Value, w: *jw.Jw) bool {
                 jw.obj_end(w);
                 ret false;
             }
+            check_pause_barrier(s, "undo_publishing");
         }
         if (!write_wal_committed(a, s.root, "undo", ?utxn[0], rev_set.durable, is_head_undo, prev_txn, prev_n, is_head_undo, redo_w.buf, redo_w.len, false, uj_buf, uj_len, nil, nil, 0)) {
             val r_st: i64 = recover_wal(a, s.root);
@@ -2474,6 +2494,7 @@ pub fun undo(s: *session.Session, args: *json.Value, w: *jw.Jw) bool {
             }
             ret simple_error(w, "journal_failed", "undo could not be committed in .qark/wal.json; changes were rolled back");
         }
+        check_pause_barrier(s, "undo_committed");
         var uj_off: i64 = -1;
         if (!finalize_committed_wal(a, s.root, ?rev_set, ?utxn[0], is_head_undo, prev_txn, prev_n, is_head_undo, redo_w.buf, redo_w.len, false, uj_buf, uj_len, nil, nil, 0, ?uj_off)) {
             if (recover_wal(a, s.root) < 0) {
@@ -2945,6 +2966,7 @@ pub fun apply(s: *session.Session, args: *json.Value, w: *jw.Jw) bool {
             jw.obj_end(w);
             ret false;
         }
+        check_pause_barrier(s, "apply_publishing");
         s.written = s.written + commit.tally(?sp.set, commit.ST_CREATE) + commit.tally(?sp.set, commit.ST_REPLACE);
     }
     s.applies = s.applies + 1;
@@ -3037,6 +3059,7 @@ pub fun apply(s: *session.Session, args: *json.Value, w: *jw.Jw) bool {
             }
             ret simple_error(w, "journal_failed", "transaction could not be committed in .qark/wal.json; changes were rolled back");
         }
+        check_pause_barrier(s, "apply_committed");
         if (!finalize_committed_wal(a, s.root, ?sp.set, ?txn[0], true, ?txn[0], str_len(?txn[0]), false, nil, 0, true, j_buf, j_len, idem_rel, idw_buf, idw_len, ?journal)) {
             if (recover_wal(a, s.root) < 0) {
                 commit.unlock(?held);
@@ -3059,7 +3082,7 @@ pub fun apply(s: *session.Session, args: *json.Value, w: *jw.Jw) bool {
             commit.unlock(?held);
             ret simple_error(w, "idempotency_failed", "could not persist .qark/idempotency record");
         }
-        if (sp.set.durable && (!commit.sync_file(ifull2.ok) || !commit.sync_parent_dir(a, ifull2.ok))) {
+        if (sp.set.durable && (!commit.sync_file(ifull2.ok) || !commit.sync_ancestry_dirs(a, s.root, idem_rel))) {
             commit.unlock(?held);
             ret simple_error(w, "idempotency_failed", "could not sync .qark/idempotency record");
         }
