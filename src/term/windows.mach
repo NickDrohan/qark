@@ -15,15 +15,15 @@ $or {
     $error("qark.term.windows needs windows");
 }
 
-#[library("kernel32.dll")]
+#[library("kernel32")]
 ext fun GetStdHandle(kind: u32) isize;
-#[library("kernel32.dll")]
+#[library("kernel32")]
 ext fun GetConsoleMode(handle: isize, mode: *u32) i32;
-#[library("kernel32.dll")]
+#[library("kernel32")]
 ext fun SetConsoleMode(handle: isize, mode: u32) i32;
-#[library("kernel32.dll")]
+#[library("kernel32")]
 ext fun GetConsoleScreenBufferInfo(handle: isize, info: *Screen) i32;
-#[library("kernel32.dll")]
+#[library("kernel32")]
 ext fun WriteFile(handle: isize, buf: *u8, n: u32, wrote: *u32, ov: *u8) i32;
 
 val STD_INPUT:  u32 = (0 - 10)::i32::u32;
