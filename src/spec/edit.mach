@@ -4,8 +4,8 @@
 # than it should is refused with the lines involved, and a line range outside
 # the file is refused with the file's length, so a stale edit never lands in
 # the wrong place. find_re matches the qark regex dialect and expands \0..\9
-# captures in the replacement. an edit's "within" limits where it looks — a
-# [first, last] line range, a string, or {find|find_re:..., occurrence:N} —
+# captures in the replacement. an edit's "within" limits where it looks - a
+# [first, last] line range, a string, or {find|find_re:..., occurrence:N} -
 # and "occurrence" picks one hit by number, negative from the end.
 
 use std.collections.vector;
@@ -765,7 +765,7 @@ fun expand_repl(w: *jw.Jw, p: *u8, r: *u8, rn: usize, m: *re.Match, base: usize)
     }
 }
 
-# find_re: the qark regex dialect — . [] () | * + ? {} ^ $ \< \> \d \w \s —
+# find_re: the qark regex dialect - . [] () | * + ? {} ^ $ \< \> \d \w \s -
 # with captures \0..\9 in the replacement and all/count/occurrence/within
 fun re_edit(a: *A.Allocator, t: *Text, obj: *json.Value, e: *Err) bool {
     var sa: usize = 0;
@@ -891,7 +891,7 @@ fun range_edit(a: *A.Allocator, t: *Text, obj: *json.Value, e: *Err) bool {
     }
     var ins: *u8 = nil;
     var insn: usize = 0;
-    if (!with_lines(a, t, obj, ?ins, ?insn)) { ret fail(e, "edit_bad", "a lines edit needs a with — a string or a list of strings", 0); }
+    if (!with_lines(a, t, obj, ?ins, ?insn)) { ret fail(e, "edit_bad", "a lines edit needs a with - a string or a list of strings", 0); }
     val from: usize = line_start(t, lo::usize);
     val to: usize = line_start(t, (hi + 1)::usize);
     if (to == t.n && t.n > 0 && t.p[t.n - 1] != '\n' && insn > 0) {
@@ -1032,7 +1032,7 @@ fun insert_edit(a: *A.Allocator, t: *Text, obj: *json.Value, after: bool, e: *Er
     }
     var ins: *u8 = nil;
     var insn: usize = 0;
-    if (!with_lines(a, t, obj, ?ins, ?insn)) { ret fail(e, "edit_bad", "insert_before and insert_after need a with — a string or a list of strings", 0); }
+    if (!with_lines(a, t, obj, ?ins, ?insn)) { ret fail(e, "edit_bad", "insert_before and insert_after need a with - a string or a list of strings", 0); }
     if (get_bool(obj, "auto_indent") && total >= 1 && insn > 0) {
         var ref_line: i64 = at_line;
         if (after && at_line > 1) { ref_line = at_line - 1; }

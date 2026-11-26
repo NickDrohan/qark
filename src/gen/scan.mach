@@ -557,7 +557,7 @@ fun py_step_triple(p: *u8, off: usize, n: usize, cur_triple: u8) u8 {
     ret st;
 }
 
-# python: [async] def name( / class name — indent ends the symbol; ignores triple-quoted strings
+# python: [async] def name( / class name - indent ends the symbol; ignores triple-quoted strings
 fun scan_python(p: *u8, lines: *vector.Vector[usize], out: *vector.Vector[Sym]) {
     val nl: usize = lines.len / 2;
     var i: usize = 0;
@@ -599,7 +599,7 @@ fun scan_python(p: *u8, lines: *vector.Vector[usize], out: *vector.Vector[Sym]) 
     }
 }
 
-# mach: [pub] fun|rec|test|val|var|tag|uni|def|ext|fwd name — keyword is kind
+# mach: [pub] fun|rec|test|val|var|tag|uni|def|ext|fwd name - keyword is kind
 fun scan_mach(p: *u8, lines: *vector.Vector[usize], out: *vector.Vector[Sym]) {
     val KEYWORDS: [10]str = [10]str{"fun", "rec", "test", "val", "var", "tag", "uni", "def", "ext", "fwd"};
     val nl: usize = lines.len / 2;
