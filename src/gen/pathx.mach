@@ -176,10 +176,10 @@ pub fun strip_root_mode(root: str, p: str, fold_case: bool) str {
 }
 
 pub fun strip_root(root: str, p: str) str {
-    $if ($mach.build.os == $mach.os.windows) {
+    $if ($mach.build.sys == $mach.sys.windows) {
         ret strip_root_mode(root, p, true);
     }
-    $if ($mach.build.os != $mach.os.windows) {
+    $if ($mach.build.sys != $mach.sys.windows) {
         ret strip_root_mode(root, p, false);
     }
 }
@@ -214,7 +214,7 @@ pub fun folded(a: *A.Allocator, rel: str) res[str, A.Error] {
 pub fun native(a: *A.Allocator, root: str, rel: str) res[str, A.Error] {
     val joined: res[str, A.Error] = path.join(a, root, rel);
     if (sel joined.err) { ret joined; }
-    $if ($mach.build.os == $mach.os.windows) {
+    $if ($mach.build.sys == $mach.sys.windows) {
         val p: *u8 = joined.ok;
         var i: usize = 0;
         for (p[i] != 0) {

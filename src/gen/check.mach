@@ -119,7 +119,7 @@ pub fun tool(a: *A.Allocator, t: *Tools, lang: str) str {
         ret t.pwsh;
     }
     if (!t.seen[3]) {
-        $if ($mach.build.os == $mach.os.windows) {
+        $if ($mach.build.sys == $mach.sys.windows) {
             t.bash = from_env(a, "QARK_BASH");
         }
         $or {

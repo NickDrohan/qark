@@ -8,7 +8,7 @@ use std.types.size.usize;
 
 use keys: qark.core.keys;
 
-$if ($mach.build.os == $mach.os.windows) {
+$if ($mach.build.sys == $mach.sys.windows) {
     use std.system.os;
 }
 $or {

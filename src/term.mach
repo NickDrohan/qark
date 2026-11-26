@@ -7,7 +7,7 @@ use std.types.option.opt;
 
 use keys: qark.core.keys;
 
-$if ($mach.build.os == $mach.os.windows) {
+$if ($mach.build.sys == $mach.sys.windows) {
     use impl: qark.term.windows;
 }
 $or {

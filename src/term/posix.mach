@@ -4,7 +4,7 @@ use std.types.bool.bool;
 use std.types.bool.true;
 use std.types.size.usize;
 
-$if ($mach.build.os == $mach.os.windows) {
+$if ($mach.build.sys == $mach.sys.windows) {
     $error("qark.term.posix is not the windows console");
 }
 

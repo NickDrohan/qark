@@ -365,7 +365,7 @@ fun conflict(e: *Entry, why: str) {
 
 pub fun mode_supported_on_host(mode: i32) bool {
     if (mode < 0 || mode > 511) { ret false; }
-    $if ($mach.build.os == $mach.os.windows) {
+    $if ($mach.build.sys == $mach.sys.windows) {
         ret (mode & 63) == 0;
     }
     ret true;
