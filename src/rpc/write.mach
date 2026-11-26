@@ -39,7 +39,7 @@ use tmpl: qark.spec.tmpl;
 use session: qark.session;
 use util: qark.util;
 
-pub val READ_MAX: usize = 262144;
+pub val READ_MAX: usize = 524288;
 
 fun truncate_utf8_len(p: *u8, n: usize, max: usize) usize {
     if (n <= max) { ret n; }
@@ -760,7 +760,8 @@ fun validate_journal_record(a: *A.Allocator, doc: *json.Value, out_txn: **u8, ou
         }
     }
     or {
-        val ts1: *json.Value = find_val(doc, "ts");
+        var ts1: *json.Value = find_val(doc, "ts");
+        if (ts1 == nil) { ts1 = find_val(doc, "ts_ms"); }
         if (ts1 == nil || !json.value_is_number(ts1) || json.value_is_float(ts1)) {
             ret false;
         }
@@ -881,7 +882,7 @@ fun ensure_journal_line(a: *A.Allocator, root: str, set: *commit.Set, txn: *u8, 
                 has_torn_tail = true;
                 brk;
             }
-            ret false;
+valid_end = nl + 1; pos = nl + 1; cnt;
         }
         var si: usize = 0;
         for (si < seen_txns.len) {
@@ -2796,7 +2797,7 @@ pub fun apply(s: *session.Session, args: *json.Value, w: *jw.Jw) bool {
     }
 
     if (sp.dry) {
-        if (has_pending_wal(a, s.root)) {
+        if (has_pending_wal(a, s.root) && recover_wal(a, s.root) < 0) {
             commit.unlock(?held);
             ret recovery_error(w, "an interrupted transaction requires workspace recovery before previewing changes");
         }
