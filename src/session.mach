@@ -56,6 +56,7 @@ pub rec Session {
     no_custom_exec: bool;
     strict_spec:    bool;
     durable:        bool;
+    pause_at:       str;
 }
 
 fun api_cur(ctx: *u8) i64 {

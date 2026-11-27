@@ -809,7 +809,7 @@ fun make_temp_dir(a: *A.Allocator, prefix: str) str {
 
 fun skip_stage_dir(name: str) bool {
     if (name == nil || name[0] == 0) { ret true; }
-    ret util.eq(name, ".qark");
+    ret util.eq(name, ".qark") || util.eq(name, ".git") || util.eq(name, "out") || util.eq(name, "node_modules");
 }
 
 fun say_stage_err(a: *A.Allocator, prefix: str, rel: str) str {

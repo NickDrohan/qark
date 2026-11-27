@@ -271,6 +271,24 @@ pub fun run(argc: i64, argv: **u8) i64 {
     if (has(argc, argv, "--durable")) {
         s.durable = true;
     }
+    val pause_stage: str = value_after(argc, argv, "--pause-at");
+    if (pause_stage != nil && pause_stage[0] != 0) {
+        s.pause_at = pause_stage;
+    }
+    val lock_ms_str: str = value_after(argc, argv, "--lock-timeout-ms");
+    if (lock_ms_str != nil && lock_ms_str[0] != 0) {
+        var parsed_ms: i64 = 0;
+        var k: usize = 0;
+        val ln: usize = str_len(lock_ms_str);
+        var valid_ms: bool = ln > 0;
+        for (k < ln) {
+            val ch: u8 = lock_ms_str[k];
+            if (ch < '0' || ch > '9') { valid_ms = false; }
+            or { parsed_ms = parsed_ms * 10 + (ch - '0')::i64; }
+            k = k + 1;
+        }
+        if (valid_ms) { s.lock_ms = parsed_ms; }
+    }
     if (s.no_custom_exec) {
         s.tools.no_custom_exec = true;
     }

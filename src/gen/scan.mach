@@ -1096,6 +1096,7 @@ pub fun outline_lang(rel: str) str {
     if (has_ext(rel, ".toml")) { ret "toml"; }
     if (has_ext(rel, ".rs")) { ret "rust"; }
     if (has_ext(rel, ".go")) { ret "go"; }
+    if (has_ext(rel, ".ex") || has_ext(rel, ".exs")) { ret "elixir"; }
     ret nil;
 }
 
@@ -1371,6 +1372,38 @@ fun refine_brace_sym(p: *u8, lines: *vector.Vector[usize], s: *Sym, max_end: i64
     if (end < s.line) { end = s.line; }
     s.end = end;
 }
+pub fun scan_elixir(p: *u8, lines: *vector.Vector[usize], out: *vector.Vector[Sym]) {
+    val nl: usize = lines.len / 2;
+    var i: usize = 0;
+    for (i < nl) {
+        val off: usize = lines.data[i * 2];
+        val n: usize = lines.data[i * 2 + 1];
+        var j: usize = 0;
+        for (j < n && (p[off + j] == ' ' || p[off + j] == '\t')) { j = j + 1; }
+        val ind: i64 = j::i64;
+        var k: usize = off + j;
+        var kind: str = nil;
+        var kn: usize = kw(p, off + n, k, "defmodule");
+        if (kn > 0) { kind = "class"; }
+        or {
+            kn = kw(p, off + n, k, "def");
+            if (kn == 0) { kn = kw(p, off + n, k, "defp"); }
+            if (kn == 0) { kn = kw(p, off + n, k, "defmacro"); }
+            if (kn == 0) { kn = kw(p, off + n, k, "defmacrop"); }
+            if (kn > 0) { kind = "function"; }
+        }
+        if (kind != nil) {
+            k = skip_ws_fwd(p, off + n, k + kn);
+            var wl: usize = word_len(p, off + n, k);
+            if (wl > 0) {
+                for (k + wl < off + n && (p[k + wl] == '.' || ident_byte(p[k + wl]) || p[k + wl] == '?' || p[k + wl] == '!')) { wl = wl + 1; }
+                val dup_clause: bool = out.len > 0 && out.data[out.len - 1].indent == ind && bytes_eq(out.data[out.len - 1].name, out.data[out.len - 1].name_n, (p::usize + k)::*u8, wl);
+                if (!dup_clause) { push_sym(out, p, k, wl, kind, (i + 1)::i64, ind); }
+            }
+        }
+        i = i + 1;
+    }
+}
 
 pub fun collect_symbols(a: *A.Allocator, lang: str, p: *u8, n: usize, syms: *vector.Vector[Sym]) {
     var lines: vector.Vector[usize] = vector.init[usize](a);
@@ -1383,9 +1416,10 @@ pub fun collect_symbols(a: *A.Allocator, lang: str, p: *u8, n: usize, syms: *vec
     or (util.eq(lang, "toml")) { scan_toml(p, ?lines, syms); }
     or (util.eq(lang, "rust")) { scan_rust(p, ?lines, syms); }
     or (util.eq(lang, "go")) { scan_go(p, ?lines, syms); }
+    or (util.eq(lang, "elixir")) { scan_elixir(p, ?lines, syms); }
     val nl: i64 = (lines.len / 2)::i64;
     val is_py: bool = util.eq(lang, "python");
-    val is_toml: bool = util.eq(lang, "toml");
+    val is_toml: bool = util.eq(lang, "toml") || util.eq(lang, "elixir");
     val hash_cmt: bool = util.eq(lang, "mach") || util.eq(lang, "powershell") || util.eq(lang, "bash");
     var i: usize = 0;
     for (i < syms.len) {

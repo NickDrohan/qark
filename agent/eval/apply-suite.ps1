@@ -1167,8 +1167,115 @@ $r5EditsNoExpect = QAdv "apply" @{ require_expect = $true; path = "req_exp_targe
 $r5MoveNoExpect = QAdv "apply" @{ require_expect = $true; path = "req_exp_moved.txt"; move = "req_exp_target.txt" }
 Check "F05: require_expect:true rejects edits and move without caller-supplied expect" ((-not $r5EditsNoExpect.ok) -and $r5EditsNoExpect.error.code -eq "expect_required" -and (-not $r5MoveNoExpect.ok) -and $r5MoveNoExpect.error.code -eq "expect_required") @{ edits = $r5EditsNoExpect; move = $r5MoveNoExpect }
 
+# P2 #4: glob with per-path expect map satisfies require_expect, while missing/partial/stale expect maps fail closed
+$gSeed = QAdv "apply" @{ files = @(
+    @{ path = "gexp/one.py"; mode = "create"; text = "k = 1`n" },
+    @{ path = "gexp/two.py"; mode = "create"; text = "k = 1`n" }
+) }
+$shaOne = $gSeed.result.files[0].sha256
+$shaTwo = $gSeed.result.files[1].sha256
+$gNoExp = QAdv "apply" @{ require_expect = $true; files = @(@{ glob = "gexp/*.py"; edits = @(@{ find = "k = 1"; replace = "k = 2" }) }) }
+$gPartExp = QAdv "apply" @{ require_expect = $true; files = @(@{ glob = "gexp/*.py"; expect = @{ "gexp/one.py" = $shaOne }; edits = @(@{ find = "k = 1"; replace = "k = 2" }) }) }
+$gStaleExp = QAdv "apply" @{ require_expect = $true; files = @(@{ glob = "gexp/*.py"; expect = @{ "gexp/one.py" = $shaOne; "gexp/two.py" = ("0" * 64) }; edits = @(@{ find = "k = 1"; replace = "k = 2" }) }) }
+$gOkExp = QAdv "apply" @{ require_expect = $true; files = @(@{ glob = "gexp/*.py"; expect = @{ "gexp/one.py" = $shaOne; "gexp/two.py" = $shaTwo }; edits = @(@{ find = "k = 1"; replace = "k = 2" }) }) }
+Check "P2 #4: glob per-path expect map satisfies require_expect while missing, partial, or stale expect maps fail closed" ($gSeed.ok -and (-not $gNoExp.ok) -and $gNoExp.error.code -eq "expect_required" -and (-not $gPartExp.ok) -and $gPartExp.error.code -eq "expect_required" -and (-not $gStaleExp.ok) -and $gStaleExp.error.code -eq "stale" -and $gOkExp.ok -and $gOkExp.result.replaced -eq 2) @{ noExp = $gNoExp; partExp = $gPartExp; staleExp = $gStaleExp; okExp = $gOkExp }
+
 $wadv.StandardInput.Close()
 [void]$wadv.WaitForExit(5000)
+
+# P1 #3: Real in-flight transaction kill at deterministic barriers (apply_publishing, apply_committed, undo_publishing, undo_committed, redo_publishing, redo_committed), proving lock contention and double-restart idempotent recovery
+$barrierScript = Join-Path $advRoot "test-barriers.mjs"
+[System.IO.File]::WriteAllText($barrierScript, @"
+import { spawn, spawnSync } from 'node:child_process';
+import fs from 'node:fs';
+import path from 'node:path';
+
+const qarkBin = $(ConvertTo-Json $Qark);
+const ws = $(ConvertTo-Json $advRoot);
+const walPath = path.join(ws, '.qark', 'wal.json');
+
+function callOne(op, args, extra = []) {
+  const res = spawnSync(qarkBin, ['--headless', '--stdio', '--root', ws, ...extra], {
+    input: JSON.stringify({ id: 1, op, args }) + '\n',
+    encoding: 'utf8',
+    timeout: 20000,
+  });
+  if (res.status !== 0) throw new Error('exit ' + res.status + ': ' + res.stderr);
+  return JSON.parse(res.stdout.trim().split(/\r?\n/)[0]);
+}
+
+async function killAtBarrier(stage, op, args) {
+  const child = spawn(qarkBin, ['--headless', '--stdio', '--root', ws, '--pause-at', stage], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+  });
+  let errBuf = '';
+  await new Promise((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error('timeout at ' + stage + ': ' + errBuf)), 15000);
+    child.stderr.on('data', (c) => {
+      errBuf += c.toString('utf8');
+      if (errBuf.includes('"barrier":"' + stage + '"')) {
+        clearTimeout(t);
+        resolve();
+      }
+    });
+    child.on('error', (e) => { clearTimeout(t); reject(e); });
+    child.stdin.write(JSON.stringify({ id: 1, op, args }) + '\n');
+  });
+  if (!fs.existsSync(walPath)) throw new Error('missing wal at ' + stage);
+  const wal = JSON.parse(fs.readFileSync(walPath, 'utf8'));
+  const wantState = stage.endsWith('_publishing') ? 'publishing' : 'committed';
+  if (wal.state !== wantState) throw new Error('bad wal state ' + wal.state);
+  const contend = callOne('apply', { path: 'contend.txt', mode: 'upsert', text: 'x\n' }, ['--lock-timeout-ms', '50']);
+  if (contend.ok || contend.error.code !== 'locked') throw new Error('expected locked at ' + stage);
+  child.kill('SIGKILL');
+  await new Promise((resolve) => child.once('exit', resolve));
+}
+
+const specPub = {
+  idempotency_key: 'ps-inflight-pub',
+  durable: true,
+  files: [{ path: 'inflight_ps/nested/a.txt', mode: 'create', text: 'v1\n' }],
+};
+await killAtBarrier('apply_publishing', 'apply', specPub);
+const rPub1 = callOne('apply', specPub);
+const rPub2 = callOne('apply', specPub);
+if (!rPub1.ok || rPub1.result.replayed || !rPub2.ok || !rPub2.result.replayed) throw new Error('apply_publishing retry failed');
+
+const specCom = {
+  idempotency_key: 'ps-inflight-com',
+  durable: true,
+  files: [{ path: 'inflight_ps/nested/a.txt', mode: 'replace', text: 'v2\n' }],
+};
+await killAtBarrier('apply_committed', 'apply', specCom);
+const rCom1 = callOne('apply', specCom);
+const rCom2 = callOne('apply', specCom);
+if (!rCom1.ok || !rCom1.result.replayed || !rCom2.ok || !rCom2.result.replayed) throw new Error('apply_committed retry failed');
+
+await killAtBarrier('undo_publishing', 'undo', { durable: true });
+const rUndoPub = callOne('undo', { durable: true });
+if (!rUndoPub.ok || fs.readFileSync(path.join(ws, 'inflight_ps/nested/a.txt'), 'utf8') !== 'v1\n') throw new Error('undo_publishing failed');
+if (!callOne('redo', { durable: true }).ok) throw new Error('redo prep failed');
+
+await killAtBarrier('undo_committed', 'undo', { durable: true });
+if (!callOne('apply', { path: 'inflight_ps/noop.txt', mode: 'upsert', text: 'ok\n' }).ok) throw new Error('undo_committed rec failed');
+if (fs.readFileSync(path.join(ws, 'inflight_ps/nested/a.txt'), 'utf8') !== 'v1\n') throw new Error('undo_committed content mismatch');
+
+if (!callOne('apply', { durable: true, files: [{ path: 'inflight_ps/nested/a.txt', mode: 'replace', text: 'v2\n' }] }).ok) throw new Error('reapply v2 failed');
+if (!callOne('undo', { durable: true }).ok) throw new Error('clean undo failed');
+
+await killAtBarrier('redo_publishing', 'redo', { durable: true });
+const rRedoPub = callOne('redo', { durable: true });
+if (!rRedoPub.ok || fs.readFileSync(path.join(ws, 'inflight_ps/nested/a.txt'), 'utf8') !== 'v2\n') throw new Error('redo_publishing failed');
+
+if (!callOne('undo', { durable: true }).ok) throw new Error('undo before redo_committed failed');
+await killAtBarrier('redo_committed', 'redo', { durable: true });
+if (!callOne('apply', { path: 'inflight_ps/noop.txt', mode: 'upsert', text: 'ok\n' }).ok) throw new Error('redo_committed rec failed');
+if (fs.readFileSync(path.join(ws, 'inflight_ps/nested/a.txt'), 'utf8') !== 'v2\n') throw new Error('redo_committed content mismatch');
+
+console.log('BARRIERS_OK');
+"@, $utf8)
+$barrierOut = & node $barrierScript 2>&1
+Check "P1 #3: in-flight SIGKILL across apply/undo/redo publishing and committed barriers proves lock contention, double-restart recovery, and idempotency_key replay" ($LASTEXITCODE -eq 0 -and ($barrierOut -join "`n").Contains("BARRIERS_OK")) $barrierOut
 
 # R09: --no-custom-exec refuses validate commands, project.validate, and .qark/checks.json custom checkers with exec_forbidden
 $wnoexec = Start-Worker @("--headless", "--stdio", "--root", "`"$advRoot`"", "--no-custom-exec")
