@@ -1,0 +1,944 @@
+# number parsing utilities
+# ---
+# parse integers and floats from strings with various bases and options. every
+# parser reports a ParseError: invalid syntax and overflow are distinct, and
+# both carry the byte offset at which the parse stopped.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.char.char_digit_val;
+use std.types.char.char_is_space;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+
+use std.math.bignum;
+use std.memory;
+
+# every way a number parse can fail
+# ---
+# empty:    nothing to parse (an empty string, or only whitespace)
+# syntax:   the byte at the payload offset is not part of a valid number
+# overflow: the value does not fit; payload is the offset at which the
+#           overflow was detected
+# base:     the requested base is outside 2..36; payload is that base
+pub tag ParseError: u8 {
+    empty;
+    syntax:   usize;
+    overflow: usize;
+    base:     u8;
+}
+
+# move a delegated parser's offset to the caller's string
+fun shifted(e: ParseError, by: usize) ParseError {
+    if (sel e.syntax)   { ret ParseError.syntax{e.syntax + by}; }
+    if (sel e.overflow) { ret ParseError.overflow{e.overflow + by}; }
+    ret e;
+}
+
+# parse an unsigned 64-bit integer prefix from a string
+#
+# stops at the first character that is not a valid digit for the given base,
+# returning the value parsed so far. use parse_u64_exact to require full
+# input consumption.
+# ---
+# s:    string to parse
+# base: numeric base (2-36), or 0 for auto-detect (0x, 0b, 0o prefixes)
+# ret:  the parsed value, or an error message
+pub fun parse_u64(s: str, base: u8) res[u64, ParseError] {
+    val len: usize = str_len(s);
+    if (len == 0) {
+        ret res[u64, ParseError].err{ParseError.empty{}};
+    }
+
+    var i:           usize = 0;
+    var actual_base: u8    = base;
+
+    # skip leading whitespace
+    for (i < len && char_is_space(s[i])) {
+        i = i + 1;
+    }
+
+    if (i >= len) {
+        ret res[u64, ParseError].err{ParseError.empty{}};
+    }
+
+    # auto-detect base if base == 0
+    if (actual_base == 0) {
+        if (s[i] == '0' && i + 1 < len) {
+            val next: u8 = s[i + 1];
+            if (next == 'x' || next == 'X') {
+                actual_base = 16;
+                i           = i + 2;
+            }
+            or (next == 'b' || next == 'B') {
+                actual_base = 2;
+                i           = i + 2;
+            }
+            or (next == 'o' || next == 'O') {
+                actual_base = 8;
+                i           = i + 2;
+            }
+            or {
+                actual_base = 10;
+            }
+        }
+        or {
+            actual_base = 10;
+        }
+    }
+
+    # validate base
+    if (actual_base < 2 || actual_base > 36) {
+        ret res[u64, ParseError].err{ParseError.base{actual_base}};
+    }
+
+    if (i >= len) {
+        ret res[u64, ParseError].err{ParseError.syntax{i}};
+    }
+
+    var result:    u64  = 0;
+    var has_digit: bool = false;
+    val base_u64:  u64  = actual_base::u64;
+
+    for (i < len) {
+        val c: u8 = s[i];
+
+        # allow underscore separators
+        if (c == '_') {
+            i = i + 1;
+            cnt;
+        }
+
+        val dv: i32 = char_digit_val(c);
+        if (dv < 0 || dv >= actual_base::u32::i32) {
+            # invalid character for this base
+            if (has_digit) {
+                # stop at first invalid char (might be end of number)
+                brk;
+            }
+            ret res[u64, ParseError].err{ParseError.syntax{i}};
+        }
+
+        val digit: u64 = (dv::u8)::u64;
+        has_digit = true;
+
+        # check for overflow before multiply
+        val max_before_mul: u64 = 18446744073709551615 / base_u64;
+        if (result > max_before_mul) {
+            ret res[u64, ParseError].err{ParseError.overflow{i}};
+        }
+
+        val new_result: u64 = result * base_u64;
+
+        # check for overflow before add
+        val max_add: u64 = 18446744073709551615 - new_result;
+        if (digit > max_add) {
+            ret res[u64, ParseError].err{ParseError.overflow{i}};
+        }
+
+        result = new_result + digit;
+        i      = i + 1;
+    }
+
+    if (!has_digit) {
+        ret res[u64, ParseError].err{ParseError.syntax{i}};
+    }
+
+    ret res[u64, ParseError].ok{result};
+}
+
+# parse an unsigned 64-bit integer from a string, requiring full consumption
+#
+# returns an error if there are any characters remaining after the number.
+# leading whitespace is also rejected.
+# ---
+# s:    string to parse
+# base: numeric base (2-36), or 0 for auto-detect (0x, 0b, 0o prefixes)
+# ret:  the parsed value, or an error message
+pub fun parse_u64_exact(s: str, base: u8) res[u64, ParseError] {
+    val len: usize = str_len(s);
+    if (len == 0) {
+        ret res[u64, ParseError].err{ParseError.empty{}};
+    }
+
+    var i:           usize = 0;
+    var actual_base: u8    = base;
+
+    if (actual_base == 0) {
+        if (s[i] == '0' && i + 1 < len) {
+            val next: u8 = s[i + 1];
+            if (next == 'x' || next == 'X') {
+                actual_base = 16;
+                i           = i + 2;
+            }
+            or (next == 'b' || next == 'B') {
+                actual_base = 2;
+                i           = i + 2;
+            }
+            or (next == 'o' || next == 'O') {
+                actual_base = 8;
+                i           = i + 2;
+            }
+            or {
+                actual_base = 10;
+            }
+        }
+        or {
+            actual_base = 10;
+        }
+    }
+
+    if (actual_base < 2 || actual_base > 36) {
+        ret res[u64, ParseError].err{ParseError.base{actual_base}};
+    }
+
+    if (i >= len) {
+        ret res[u64, ParseError].err{ParseError.syntax{i}};
+    }
+
+    var result:    u64  = 0;
+    var has_digit: bool = false;
+    val base_u64:  u64  = actual_base::u64;
+
+    for (i < len) {
+        val c: u8 = s[i];
+
+        if (c == '_') {
+            i = i + 1;
+            cnt;
+        }
+
+        val dv: i32 = char_digit_val(c);
+        if (dv < 0 || dv >= actual_base::u32::i32) {
+            ret res[u64, ParseError].err{ParseError.syntax{i}};
+        }
+
+        val digit: u64 = (dv::u8)::u64;
+        has_digit = true;
+
+        val max_before_mul: u64 = 18446744073709551615 / base_u64;
+        if (result > max_before_mul) {
+            ret res[u64, ParseError].err{ParseError.overflow{i}};
+        }
+
+        val new_result: u64 = result * base_u64;
+
+        val max_add: u64 = 18446744073709551615 - new_result;
+        if (digit > max_add) {
+            ret res[u64, ParseError].err{ParseError.overflow{i}};
+        }
+
+        result = new_result + digit;
+        i      = i + 1;
+    }
+
+    if (!has_digit) {
+        ret res[u64, ParseError].err{ParseError.syntax{i}};
+    }
+
+    ret res[u64, ParseError].ok{result};
+}
+
+# parse a signed 64-bit integer prefix from a string
+#
+# delegates to parse_u64 for the unsigned portion, so it inherits the same
+# prefix-parsing behavior. use parse_i64_exact to require full input
+# consumption.
+# ---
+# s:    string to parse
+# base: numeric base (2-36), or 0 for auto-detect (0x, 0b, 0o prefixes)
+# ret:  the parsed value, or an error message
+pub fun parse_i64(s: str, base: u8) res[i64, ParseError] {
+    val len: usize = str_len(s);
+    if (len == 0) {
+        ret res[i64, ParseError].err{ParseError.empty{}};
+    }
+
+    var i: usize = 0;
+
+    # skip leading whitespace
+    for (i < len && char_is_space(s[i])) {
+        i = i + 1;
+    }
+
+    if (i >= len) {
+        ret res[i64, ParseError].err{ParseError.empty{}};
+    }
+
+    # check for sign
+    var negative: bool = false;
+    if (s[i] == '-') {
+        negative = true;
+        i        = i + 1;
+    }
+    or (s[i] == '+') {
+        i = i + 1;
+    }
+
+    if (i >= len) {
+        ret res[i64, ParseError].err{ParseError.syntax{i}};
+    }
+
+    # parse remaining as unsigned using pointer arithmetic
+    val remaining: str                  = (?s[i])::str;
+    val u_result:  res[u64, ParseError] = parse_u64(remaining, base);
+
+    if (sel u_result.err) { ret res[i64, ParseError].err{shifted(u_result.err, i)}; }
+    val u_val: u64 = u_result.ok;
+
+    # i64 range: -9223372036854775808 to 9223372036854775807
+    if (negative) {
+        # for negative, magnitude can be up to 9223372036854775808
+        if (u_val > 9223372036854775808) {
+            ret res[i64, ParseError].err{ParseError.overflow{i}};
+        }
+        # special case: exactly i64 min
+        if (u_val == 9223372036854775808) {
+            ret res[i64, ParseError].ok{-9223372036854775808};
+        }
+        val signed: i64 = u_val::i64;
+        ret res[i64, ParseError].ok{-signed};
+    }
+
+    # for positive, max is 9223372036854775807
+    if (u_val > 9223372036854775807) {
+        ret res[i64, ParseError].err{ParseError.overflow{i}};
+    }
+    ret res[i64, ParseError].ok{u_val::i64};
+}
+
+# parse a signed 64-bit integer from a string, requiring full consumption
+#
+# returns an error if there are any characters remaining after the number.
+# leading whitespace is also rejected.
+# ---
+# s:    string to parse
+# base: numeric base (2-36), or 0 for auto-detect (0x, 0b, 0o prefixes)
+# ret:  the parsed value, or an error message
+pub fun parse_i64_exact(s: str, base: u8) res[i64, ParseError] {
+    val len: usize = str_len(s);
+    if (len == 0) {
+        ret res[i64, ParseError].err{ParseError.empty{}};
+    }
+
+    var i: usize = 0;
+
+    var negative: bool = false;
+    if (s[i] == '-') {
+        negative = true;
+        i        = i + 1;
+    }
+    or (s[i] == '+') {
+        i = i + 1;
+    }
+
+    if (i >= len) {
+        ret res[i64, ParseError].err{ParseError.syntax{i}};
+    }
+
+    val remaining: str                  = (?s[i])::str;
+    val u_result:  res[u64, ParseError] = parse_u64_exact(remaining, base);
+
+    if (sel u_result.err) { ret res[i64, ParseError].err{shifted(u_result.err, i)}; }
+    val u_val: u64 = u_result.ok;
+
+    if (negative) {
+        if (u_val > 9223372036854775808) {
+            ret res[i64, ParseError].err{ParseError.overflow{i}};
+        }
+        if (u_val == 9223372036854775808) {
+            ret res[i64, ParseError].ok{-9223372036854775808};
+        }
+        val signed: i64 = u_val::i64;
+        ret res[i64, ParseError].ok{-signed};
+    }
+
+    if (u_val > 9223372036854775807) {
+        ret res[i64, ParseError].err{ParseError.overflow{i}};
+    }
+    ret res[i64, ParseError].ok{u_val::i64};
+}
+
+# sign of (num/den - 2^p), comparing the rational num/den to 2^p
+fun cmp_ratio_pow2(num: *bignum.Big, den: *bignum.Big, p: i64) i64 {
+    var a: bignum.Big;
+    var b: bignum.Big;
+    bignum.copy(?a, num);
+    bignum.copy(?b, den);
+    if (p >= 0) { bignum.shl(?b, p::usize); }
+    or          { bignum.shl(?a, (0 - p)::usize); }
+    ret bignum.cmp(?a, ?b);
+}
+
+# nearest f64 bit pattern (sign excluded) to M * 10^D, round-to-
+# nearest-even, via exact bignum arithmetic. M is non-negative; the caller ORs in
+# the sign bit. handles subnormals, overflow (-> inf), and underflow (-> 0).
+fun decimal_to_f64(M: *bignum.Big, D: i64, trunc: bool) u64 {
+    if (bignum.is_zero(M)) { ret 0; }
+
+    # short-circuit clearly out-of-range magnitudes (keeps the bignum bounded).
+    val approx: i64 = D + (bignum.bitlen(M)::i64 * 1233) / 4096;
+    if (approx > 320)  { ret 0x7FF0000000000000; }
+    if (approx < -340) { ret 0; }
+
+    # exact rational num/den = M * 10^D.
+    var num: bignum.Big;
+    var den: bignum.Big;
+    bignum.copy(?num, M);
+    bignum.from_u64(?den, 1);
+    if (D >= 0) { bignum.mul_pow10(?num, D::usize); }
+    or          { bignum.mul_pow10(?den, (0 - D)::usize); }
+
+    # find e2 with 2^(e2+52) <= value < 2^(e2+53) (53-bit normal mantissa window).
+    var e2:   i64  = bignum.bitlen(?num)::i64 - bignum.bitlen(?den)::i64 - 53;
+    var done: bool = false;
+    for (!done) {
+        if (cmp_ratio_pow2(?num, ?den, e2 + 53) >= 0) {
+            e2 = e2 + 1;
+            cnt;
+        }
+        if (cmp_ratio_pow2(?num, ?den, e2 + 52) < 0) {
+            e2 = e2 - 1;
+            cnt;
+        }
+        done = true;
+    }
+
+    # clamp the mantissa LSB to the subnormal floor (2^-1074), a single rounding.
+    var lsb: i64 = e2;
+    if (lsb < -1074) { lsb = -1074; }
+
+    # nn/dd = value / 2^lsb.
+    var nn: bignum.Big;
+    var dd: bignum.Big;
+    bignum.copy(?nn, ?num);
+    bignum.copy(?dd, ?den);
+    if (lsb >= 0) { bignum.shl(?dd, lsb::usize); }
+    or            { bignum.shl(?nn, (0 - lsb)::usize); }
+
+    # q = floor(nn / dd) via binary long division; remainder left in rem.
+    var q:   u64 = 0;
+    var rem: bignum.Big;
+    bignum.copy(?rem, ?nn);
+    var b: i64 = 53;
+    for (b >= 0) {
+        var t: bignum.Big;
+        bignum.copy(?t, ?dd);
+        bignum.shl(?t, b::usize);
+        if (bignum.cmp(?rem, ?t) >= 0) {
+            bignum.sub(?rem, ?t);
+            q = q | (1::u64 << b::usize);
+        }
+        b = b - 1;
+    }
+
+    # round-to-nearest-even using 2*rem vs dd.
+    var rem2: bignum.Big;
+    bignum.copy(?rem2, ?rem);
+    bignum.shl(?rem2, 1);
+    val c: i64 = bignum.cmp(?rem2, ?dd);
+    if (c > 0) { q = q + 1; }
+    or (c == 0) {
+        # M*10^D sits exactly on the midpoint: dropped nonzero digits (trunc)
+        # push the true value above it, so round up instead of to-even.
+        if (trunc) { q = q + 1; }
+        or {
+            if ((q & 1) == 1) { q = q + 1; }
+        }
+    }
+
+    if (lsb == -1074) {
+        # subnormal regime (and the smallest normals): the bit pattern is q itself.
+        ret q;
+    }
+    var biased: i64 = e2 + 1075;
+    if (q == 0x20000000000000) {
+        q      = 0x10000000000000;
+        biased = biased + 1;
+    }
+    if (biased >= 2047) { ret 0x7FF0000000000000; }
+    ret (biased::u64 << 52) | (q & 0xFFFFFFFFFFFFF);
+}
+
+# scan integer + fractional digits from s at @i into M
+# (capped at 768 significant digits, well past what f64 rounding can use, so
+# excess digits are dropped without affecting the result). advances @i and writes
+# the decimal-exponent contribution to @out_dexp (value-so-far = M * 10^out_dexp).
+# returns true iff at least one digit was seen.
+fun collect_significand(s: str, len: usize, i: *usize, M: *bignum.Big, out_dexp: *i64, out_trunc: *bool) bool {
+    bignum.from_u64(M, 0);
+    var sig:       i64  = 0;
+    var dexp:      i64  = 0;
+    var seen:      bool = false;
+    var truncated: bool = false;
+    val MAXSIG:    i64  = 768;
+    for (@i < len) {
+        val c: u8 = s[@i];
+        if (c == '_') {
+            @i = @i + 1;
+            cnt;
+        }
+        if (c < '0' || c > '9') { brk; }
+        seen = true;
+        if (sig < MAXSIG) {
+            bignum.mul_small(M, 10);
+            bignum.add_small(M, (c - '0')::u32);
+            if (!bignum.is_zero(M)) { sig = sig + 1; }
+        }
+        or {
+            dexp = dexp + 1;
+            if (c != '0') { truncated = true; }
+        }
+        @i = @i + 1;
+    }
+    if (@i < len && s[@i] == '.') {
+        @i = @i + 1;
+        for (@i < len) {
+            val c: u8 = s[@i];
+            if (c == '_') {
+                @i = @i + 1;
+                cnt;
+            }
+            if (c < '0' || c > '9') { brk; }
+            seen = true;
+            if (sig < MAXSIG) {
+                bignum.mul_small(M, 10);
+                bignum.add_small(M, (c - '0')::u32);
+                if (!bignum.is_zero(M)) { sig = sig + 1; }
+                dexp = dexp - 1;
+            }
+            or {
+                if (c != '0') { truncated = true; }
+            }
+            @i = @i + 1;
+        }
+    }
+    @out_dexp  = dexp;
+    @out_trunc = truncated;
+    ret seen;
+}
+
+# stops at the first character that is not part of a valid float. use
+# parse_f64_exact to require full input consumption, or parse_f64_len for a span
+# that is not null-terminated.
+# ---
+# s:   string to parse
+# ret: the parsed value, or an error message
+pub fun parse_f64(s: str) res[f64, ParseError] {
+    ret parse_f64_len(s, str_len(s));
+}
+
+# parse a 64-bit floating point number prefix from the first `len` bytes of `s`
+#
+# like parse_f64 but bounded by an explicit length instead of a null terminator,
+# so it is safe on a byte span embedded in a larger buffer (e.g. a zero-copy
+# slice into a parse input). stops at the first byte that is not part of a valid
+# float, or at `len`.
+# ---
+# s:   the bytes to parse
+# len: the number of bytes available in s
+# ret: the parsed value, or an error message
+pub fun parse_f64_len(s: str, len: usize) res[f64, ParseError] {
+    if (len == 0) { ret res[f64, ParseError].err{ParseError.empty{}}; }
+
+    var i: usize = 0;
+
+    for (i < len && char_is_space(s[i])) {
+        i = i + 1;
+    }
+    if (i >= len) { ret res[f64, ParseError].err{ParseError.empty{}}; }
+
+    var sign: f64 = 1.0;
+    if (s[i] == '-') {
+        sign = 0.0 - 1.0;
+        i    = i + 1;
+    }
+    or (s[i] == '+') { i = i + 1; }
+
+    if (i >= len) { ret res[f64, ParseError].err{ParseError.syntax{i}}; }
+
+    # inf
+    if (i + 3 <= len && s[i] == 'i' && s[i + 1] == 'n' && s[i + 2] == 'f') {
+        var bits: u64 = 0x7FF0000000000000;
+        if (sign < 0.0) { bits = 0xFFF0000000000000; }
+        var inf_val: f64;
+        memory.raw_copy(?inf_val, ?bits, 8);
+        ret res[f64, ParseError].ok{inf_val};
+    }
+
+    # nan
+    if (i + 3 <= len && s[i] == 'n' && s[i + 1] == 'a' && s[i + 2] == 'n') {
+        val bits:    u64 = 0x7FF8000000000000;
+        var nan_val: f64;
+        memory.raw_copy(?nan_val, ?bits, 8);
+        ret res[f64, ParseError].ok{nan_val};
+    }
+
+    # significand digits and decimal exponent.
+    var M:     bignum.Big;
+    var dexp:  i64  = 0;
+    var trunc: bool = false;
+    if (!collect_significand(s, len, ?i, ?M, ?dexp, ?trunc)) {
+        ret res[f64, ParseError].err{ParseError.syntax{i}};
+    }
+
+    # exponent
+    var exp: i64 = 0;
+    if (i < len && (s[i] == 'e' || s[i] == 'E')) {
+        i = i + 1;
+        var exp_sign: i64 = 1;
+        if (i < len && s[i] == '+') { i = i + 1; }
+        or (i < len && s[i] == '-') {
+            exp_sign = -1;
+            i        = i + 1;
+        }
+
+        var has_exp: bool = false;
+        for (i < len) {
+            val c: u8 = s[i];
+            if (c == '_') {
+                i = i + 1;
+                cnt;
+            }
+            if (c < '0' || c > '9') { brk; }
+            has_exp = true;
+            exp     = exp * 10 + (c - '0')::u64::i64;
+            i       = i + 1;
+        }
+        if (!has_exp) { ret res[f64, ParseError].err{ParseError.syntax{i}}; }
+        exp = exp * exp_sign;
+    }
+
+    var bits: u64 = decimal_to_f64(?M, dexp + exp, trunc);
+    if (sign < 0.0) { bits = bits | 0x8000000000000000; }
+    var result: f64;
+    memory.raw_copy(?result, ?bits, 8);
+    ret res[f64, ParseError].ok{result};
+}
+
+# parse a 64-bit floating point number from a string, requiring full consumption
+#
+# handles optional sign, integer part, fractional part, and exponent.
+# also handles special values inf, -inf, nan, +inf, +nan.
+# returns an error if there are any characters remaining after the number.
+# leading whitespace is also rejected.
+# ---
+# s:   string to parse
+# ret: the parsed value, or an error message
+pub fun parse_f64_exact(s: str) res[f64, ParseError] {
+    val len: usize = str_len(s);
+    if (len == 0) { ret res[f64, ParseError].err{ParseError.empty{}}; }
+
+    var i: usize = 0;
+
+    var sign: f64 = 1.0;
+    if (s[i] == '-') {
+        sign = 0.0 - 1.0;
+        i    = i + 1;
+    }
+    or (s[i] == '+') { i = i + 1; }
+
+    if (i >= len) { ret res[f64, ParseError].err{ParseError.syntax{i}}; }
+
+    # inf
+    if (i + 3 <= len && s[i] == 'i' && s[i + 1] == 'n' && s[i + 2] == 'f') {
+        if (i + 3 != len) { ret res[f64, ParseError].err{ParseError.syntax{i}}; }
+        var bits: u64 = 0x7FF0000000000000;
+        if (sign < 0.0) { bits = 0xFFF0000000000000; }
+        var inf_val: f64;
+        memory.raw_copy(?inf_val, ?bits, 8);
+        ret res[f64, ParseError].ok{inf_val};
+    }
+
+    # nan
+    if (i + 3 <= len && s[i] == 'n' && s[i + 1] == 'a' && s[i + 2] == 'n') {
+        if (i + 3 != len) { ret res[f64, ParseError].err{ParseError.syntax{i}}; }
+        val bits:    u64 = 0x7FF8000000000000;
+        var nan_val: f64;
+        memory.raw_copy(?nan_val, ?bits, 8);
+        ret res[f64, ParseError].ok{nan_val};
+    }
+
+    # significand digits and decimal exponent.
+    var M:     bignum.Big;
+    var dexp:  i64  = 0;
+    var trunc: bool = false;
+    if (!collect_significand(s, len, ?i, ?M, ?dexp, ?trunc)) {
+        ret res[f64, ParseError].err{ParseError.syntax{i}};
+    }
+
+    # exponent
+    var exp: i64 = 0;
+    if (i < len && (s[i] == 'e' || s[i] == 'E')) {
+        i = i + 1;
+        var exp_sign: i64 = 1;
+        if (i < len && s[i] == '+') { i = i + 1; }
+        or (i < len && s[i] == '-') {
+            exp_sign = -1;
+            i        = i + 1;
+        }
+
+        var has_exp: bool = false;
+        for (i < len) {
+            val c: u8 = s[i];
+            if (c == '_') {
+                i = i + 1;
+                cnt;
+            }
+            if (c < '0' || c > '9') { brk; }
+            has_exp = true;
+            exp     = exp * 10 + (c - '0')::u64::i64;
+            i       = i + 1;
+        }
+        if (!has_exp) { ret res[f64, ParseError].err{ParseError.syntax{i}}; }
+        exp = exp * exp_sign;
+    }
+
+    if (i != len) {
+        ret res[f64, ParseError].err{ParseError.syntax{i}};
+    }
+
+    var bits: u64 = decimal_to_f64(?M, dexp + exp, trunc);
+    if (sign < 0.0) { bits = bits | 0x8000000000000000; }
+    var result: f64;
+    memory.raw_copy(?result, ?bits, 8);
+    ret res[f64, ParseError].ok{result};
+}
+
+# whether parse_u64(s, base) succeeds with want
+#[testing]
+fun u64_is(s: str, base: u8, want: u64) bool {
+    val r: res[u64, ParseError] = parse_u64(s, base);
+    if (sel r.err) { ret false; }
+    ret r.ok == want;
+}
+
+# whether parse_i64(s, base) succeeds with want
+#[testing]
+fun i64_is(s: str, base: u8, want: i64) bool {
+    val r: res[i64, ParseError] = parse_i64(s, base);
+    if (sel r.err) { ret false; }
+    ret r.ok == want;
+}
+
+# each base by name and by prefix, either hex case, underscores, leading
+# whitespace, the maximum, and a stop at the first byte that is not a digit
+test parse_u64__bases_and_bounds {
+    if (!u64_is("0", 10, 0))                                       { ret 1; }
+    if (!u64_is("12345", 10, 12345))                               { ret 2; }
+    if (!u64_is("ff", 16, 255) || !u64_is("FF", 16, 255))          { ret 3; }
+    if (!u64_is("1010", 2, 10) || !u64_is("77", 8, 63))            { ret 4; }
+    if (!u64_is("0xff", 0, 255) || !u64_is("0b1010", 0, 10))       { ret 5; }
+    if (!u64_is("0o77", 0, 63) || !u64_is("999", 0, 999))          { ret 6; }
+    if (!u64_is("1_000_000", 10, 1000000))                         { ret 7; }
+    if (!u64_is("  42", 10, 42))                                   { ret 8; }
+    if (!u64_is("18446744073709551615", 10, 18446744073709551615)) { ret 9; }
+    if (!u64_is("12g45", 10, 12))                                  { ret 10; }
+    ret 0;
+}
+
+# either sign, a signed prefix, underscores, whitespace, and both bounds, one
+# past the negative bound refused
+test parse_i64__signs_and_bounds {
+    if (!i64_is("-12345", 10, -12345) || !i64_is("+42", 10, 42))   { ret 1; }
+    if (!i64_is("-0", 10, 0))                                      { ret 2; }
+    if (!i64_is("-0xff", 0, -255))                                 { ret 3; }
+    if (!i64_is("-1_000_000", 10, -1000000))                       { ret 4; }
+    if (!i64_is("  -42", 10, -42))                                 { ret 5; }
+    if (!i64_is("9223372036854775807", 10, 9223372036854775807))   { ret 6; }
+    if (!i64_is("-9223372036854775808", 10, -9223372036854775808)) { ret 7; }
+    val under: res[i64, ParseError] = parse_i64("-9223372036854775809", 10);
+    if (!sel under.err) { ret 8; }
+    ret 0;
+}
+
+# the exact forms accept what the prefix forms accept and refuse any byte left
+# over, whitespace included
+test parse__exact_forms_refuse_leftover_bytes {
+    val u: res[u64, ParseError] = parse_u64_exact("0x1_0", 0);
+    if (sel u.err)  { ret 1; }
+    if (u.ok != 16) { ret 1; }
+    val u_tail: res[u64, ParseError] = parse_u64_exact("12g45", 10);
+    if (sel u_tail.ok) { ret 2; }
+    val u_lead: res[u64, ParseError] = parse_u64_exact(" 42", 10);
+    if (sel u_lead.ok) { ret 3; }
+
+    val i: res[i64, ParseError] = parse_i64_exact("-12345", 10);
+    if (sel i.err)      { ret 4; }
+    if (i.ok != -12345) { ret 4; }
+    val i_tail: res[i64, ParseError] = parse_i64_exact("42 ", 10);
+    if (sel i_tail.ok) { ret 5; }
+
+    val f: res[f64, ParseError] = parse_f64_exact("1.5e2");
+    if (sel f.err)     { ret 6; }
+    if (f.ok != 150.0) { ret 6; }
+    val f_tail: res[f64, ParseError] = parse_f64_exact("3.14abc");
+    if (sel f_tail.ok) { ret 7; }
+    val inf: res[f64, ParseError] = parse_f64_exact("inf");
+    if (sel inf.err) { ret 8; }
+    val inf_tail: res[f64, ParseError] = parse_f64_exact("inf ");
+    if (sel inf_tail.ok) { ret 9; }
+    ret 0;
+}
+
+# parse_f64_len stops at `len` and never reads a trailing null, so a float span
+# embedded in a larger buffer parses without consuming its neighbours.
+test parse__f64_len_bounded_span {
+    # only the first 3 bytes ("1.5") are in scope; the "e9" must be ignored.
+    val r: res[f64, ParseError] = parse_f64_len("1.5e9", 3);
+    if (sel r.err)   { ret 1; }
+    if (r.ok != 1.5) { ret 1; }
+    ret 0;
+}
+
+# parse s and return its f64 bit pattern (0xDEADBEEF sentinel on error)
+#[testing]
+fun pbits(s: str) u64 {
+    val r: res[f64, ParseError] = parse_f64(s);
+    if (sel r.err) { ret 0xDEADBEEF; }
+    val v:    f64 = r.ok;
+    var bits: u64;
+    memory.raw_copy(?bits, ?v, 8);
+    ret bits;
+}
+
+test parse_f64__correctly_rounded_golden_bits {
+    if (pbits("0") != 0)                                        { ret 1; }
+    if (pbits("1") != 0x3FF0000000000000)                       { ret 1; }
+    if (pbits("-1") != 0xBFF0000000000000)                      { ret 1; }
+    if (pbits("0.5") != 0x3FE0000000000000)                     { ret 1; }
+    if (pbits("1.5") != 0x3FF8000000000000)                     { ret 1; }
+    if (pbits("0.1") != 0x3FB999999999999A)                     { ret 1; }
+    if (pbits("3.141592653589793") != 0x400921FB54442D18)       { ret 1; }
+    if (pbits("10000000000000000") != 0x4341C37937E08000)       { ret 1; }
+    if (pbits("1e100") != 0x54B249AD2594C37D)                   { ret 1; }
+    if (pbits("1.7976931348623157e308") != 0x7FEFFFFFFFFFFFFF)  { ret 1; }
+    if (pbits("2.2250738585072014e-308") != 0x0010000000000000) { ret 1; }
+    if (pbits("5e-324") != 1)                                   { ret 1; }
+    if (pbits("1_000.5") != 0x408F440000000000)                 { ret 2; }
+    ret 0;
+}
+
+test parse_f64__special_and_out_of_range {
+    if (pbits("-0") != 0x8000000000000000)    { ret 1; }
+    if (pbits("inf") != 0x7FF0000000000000)   { ret 1; }
+    if (pbits("-inf") != 0xFFF0000000000000)  { ret 1; }
+    if (pbits("nan") != 0x7FF8000000000000)   { ret 1; }
+    if (pbits("1e400") != 0x7FF0000000000000) { ret 1; }
+    if (pbits("1e-400") != 0)                 { ret 1; }
+    if (pbits("1e320") != 0x7FF0000000000000) { ret 2; }
+    if (pbits("1e-340") != 0)                 { ret 2; }
+    if (pbits("4.9e-324") != 1)               { ret 2; }
+    if (pbits("2.4e-324") != 0)               { ret 2; }
+    ret 0;
+}
+
+test parse_f64__round_to_even_ties_and_carry_out {
+    # exact midpoint 1.0 <-> 1+2^-52 -> round to even (down) = 1.0
+    if (pbits("1.00000000000000011102230246251565404236316680908203125") != 0x3FF0000000000000) { ret 1; }
+    # exact midpoint 1+2^-52 <-> 1+2*2^-52 -> round to even (up) = ...0002
+    if (pbits("1.00000000000000033306690738754696212708950042724609375") != 0x3FF0000000000002) { ret 1; }
+    # exact midpoint just below 1.0 -> round to even = 1.0 (exercises the q==2^53 carry-out)
+    if (pbits("0.99999999999999994448884876874217606037855148315429687500") != 0x3FF0000000000000) { ret 1; }
+    ret 0;
+}
+
+# the truncation tie: matches the 1.0 <-> 1+2^-52 midpoint to 768 significant
+# digits, then a nonzero 769th digit -> strictly above the midpoint, must round UP.
+# without the sticky bit this is misread as an exact tie and rounds to-even (down).
+test parse_f64__768_digit_truncation_tie_rounds_up_sticky {
+    var buf:    [1024]u8;
+    val prefix: str   = "1.00000000000000011102230246251565404236316680908203125";
+    var n:      usize = 0;
+    var k:      usize = 0;
+    for (prefix[k] != 0) {
+        buf[n] = prefix[k];
+        n      = n + 1;
+        k      = k + 1;
+    }
+    var z: usize = 0;
+    for (z < 714) {
+        buf[n] = '0';
+        n      = n + 1;
+        z      = z + 1;
+    }
+    buf[n] = '1';
+    n      = n + 1;
+    buf[n] = 0;
+    if (pbits(?buf[0]) != 0x3FF0000000000001) { ret 1; }
+    ret 0;
+}
+
+test parse_f64__subnormal_ties_and_sticky_oracle {
+    # subnormal tie-to-even up
+    if (pbits("0.0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000074109846876186981626485318930233205854758970392148714663837852375101326090531312779794975454245398856969484704316857659638998506553390969459816219401617281718945106978546710679176872575177347315553307795408549809608457500958111373034747658096871009590975442271004757307809711118935784838675653998783503015228055934046593739791790738723868299395818481660169122019456499931289798411362062484498678713572180352209017023903285791732520220528974020802906854021606612375549983402671300035812486479041385743401875520901590172592547146296175134159774938718574737870961645638908718119841271673056017045493004705269590165763776884908267986972573366521765567941072508764337560846003984904972149117463085539556354188641513168478436313080237596295773983001708984375") != 0x0000000000000002) { ret 1; }
+    # subnormal->normal carry tie
+    if (pbits("0.0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000222507385850720113605740979670913197593481954635164564802342610972482222202107694551652952390813508791414915891303962110687008643869459464552765720740782062174337998814106326732925355228688137214901298112245145188984905722230728525513315575501591439747639798341180199932396254828901710708185069063066665599493827577257201576306269066333264756530000924588831643303777979186961204949739037782970490505108060994073026293712895895000358379996720725430436028407889577179615094551674824347103070260914462157228988025818254518032570701886087211312807951223342628836862232150377566662250398253433597456888442390026549819838548794829220689472168983109969836584681402285424333066033985088644580400103493397042756718644338377048603786162277173854562306587467901408672332763671875") != 0x0010000000000000) { ret 1; }
+    # subnormal sticky pushes up
+    if (pbits("0.00000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000002225073858507200641991763955462587799366026678130273282963623495400057796435394444841022253699383222614312797277047241310305390992976863718870946851468024222968583977359185141028540361975476844303195813273469348201130421165308554532083149367606760832492010670938404726154347408257301721683776564392101064823911617215885247576023130352707715620028417753432987127581235390742131919787390835897715495970664046616205505789259944223223424444728595704169556757585423752417124134805999073137808018133811049489046686648944255834488901008259721496147104204399198556535697531005523193544866389809548508960406603526818528245020786151024435136209123775979785215357703877750457056843614755302706830641135567489433450765873120061458113584868315215636869197624037042260169982910156251") != 0x000FFFFFFFFFFFFF) { ret 1; }
+    ret 0;
+}
+
+# each failure is classified, not described: absence, syntax, overflow and a
+# bad base are distinct cases, and syntax and overflow carry the offset
+test parse__failures_carry_offsets {
+    val e1: res[u64, ParseError] = parse_u64("", 10);
+    if (!sel e1.err)       { ret 1; }
+    if (!sel e1.err.empty) { ret 1; }
+
+    val e2: res[u64, ParseError] = parse_u64("   ", 10);
+    if (!sel e2.err)       { ret 2; }
+    if (!sel e2.err.empty) { ret 2; }
+
+    val b: res[u64, ParseError] = parse_u64("12", 1);
+    if (!sel b.err)      { ret 3; }
+    if (!sel b.err.base) { ret 3; }
+    if (b.err.base != 1) { ret 3; }
+
+    val s1: res[u64, ParseError] = parse_u64("  abc", 10);
+    if (!sel s1.err)        { ret 4; }
+    if (!sel s1.err.syntax) { ret 4; }
+    if (s1.err.syntax != 2) { ret 4; }
+
+    val o: res[u64, ParseError] = parse_u64("18446744073709551616", 10);
+    if (!sel o.err)           { ret 5; }
+    if (!sel o.err.overflow)  { ret 5; }
+    if (o.err.overflow != 19) { ret 5; }
+
+    val s2: res[u64, ParseError] = parse_u64_exact("42 ", 10);
+    if (!sel s2.err)        { ret 6; }
+    if (!sel s2.err.syntax) { ret 6; }
+    if (s2.err.syntax != 2) { ret 6; }
+
+    # a delegated parse reports the offset in the caller's string
+    val s3: res[i64, ParseError] = parse_i64("  -x", 10);
+    if (!sel s3.err)        { ret 7; }
+    if (!sel s3.err.syntax) { ret 7; }
+    if (s3.err.syntax != 3) { ret 7; }
+    val s4: res[i64, ParseError] = parse_i64_exact("-1x", 10);
+    if (!sel s4.err)        { ret 7; }
+    if (!sel s4.err.syntax) { ret 7; }
+    if (s4.err.syntax != 2) { ret 7; }
+
+    val o2: res[i64, ParseError] = parse_i64("9223372036854775808", 10);
+    if (!sel o2.err)          { ret 8; }
+    if (!sel o2.err.overflow) { ret 8; }
+
+    val f1: res[f64, ParseError] = parse_f64("1e");
+    if (!sel f1.err)        { ret 9; }
+    if (!sel f1.err.syntax) { ret 9; }
+    if (f1.err.syntax != 2) { ret 9; }
+
+    val f2: res[f64, ParseError] = parse_f64_exact("3.14 ");
+    if (!sel f2.err)        { ret 10; }
+    if (!sel f2.err.syntax) { ret 10; }
+    if (f2.err.syntax != 4) { ret 10; }
+
+    val f3: res[f64, ParseError] = parse_f64_len("3.14", 0);
+    if (!sel f3.err)       { ret 11; }
+    if (!sel f3.err.empty) { ret 11; }
+    ret 0;
+}

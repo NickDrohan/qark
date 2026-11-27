@@ -1,0 +1,979 @@
+# chunked element storage whose live elements never move
+
+use std.allocator;
+use std.memory;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.result.res;
+use std.types.size.usize;
+
+# the directory is inline and fixed, so growth never moves it either. no table
+# holds more chunks than this
+pub val DIRECTORY: usize = 40;
+
+# every chunk is requested at this alignment, so an element type may need at
+# most this much
+pub val ELEMENT_ALIGN: usize = 16;
+
+# chunk 0 holds `1 << shift` elements and chunk k holds `1 << (shift + k - 1)`,
+# so capacity doubles per chunk and an element address is fixed once handed out
+# allocator: where every chunk comes from and goes back to
+pub rec Table {
+    allocator:    allocator.Allocator;
+    chunks:       [DIRECTORY]ptr;
+    element_size: usize;
+    shift:        usize;
+    chunk_count:  usize;
+    capacity:     usize;
+}
+
+fun floor_log2(value: usize) usize {
+    var v: usize = value;
+    var k: usize = 0;
+    if (v >= 0x100000000) {
+        v = v >> 32;
+        k = k + 32;
+    }
+    if (v >= 0x10000) {
+        v = v >> 16;
+        k = k + 16;
+    }
+    if (v >= 0x100) {
+        v = v >> 8;
+        k = k + 8;
+    }
+    if (v >= 0x10) {
+        v = v >> 4;
+        k = k + 4;
+    }
+    if (v >= 0x4) {
+        v = v >> 2;
+        k = k + 2;
+    }
+    if (v >= 0x2) { k = k + 1; }
+    ret k;
+}
+
+fun chunk_elements(table: *Table, chunk: usize) usize {
+    if (chunk == 0) { ret 1::usize << table.shift; }
+    ret 1::usize << (table.shift + chunk - 1);
+}
+
+fun chunk_bytes(table: *Table, chunk: usize, output: *usize) bool {
+    ret memory.range_scaled(chunk_elements(table, chunk), table.element_size,
+        output);
+}
+
+fun take_chunk(table: *Table, bytes: usize) ptr {
+    val got: res[ptr, allocator.Error] = allocator.allocate_raw(?table.allocator, bytes, ELEMENT_ALIGN);
+    if (sel got.err) { ret nil; }
+    ret got.ok;
+}
+
+# a table whose chunks come from a
+#
+# the table keeps a copy of a, so the allocator's context must outlive the
+# table. the only failure is a refused or unrepresentable allocation, so the
+# result carries no cause
+# ---
+# table:        the table to initialize
+# a:            the allocator every chunk is taken from and returned to
+# element_size: bytes per element, whose alignment is at most ELEMENT_ALIGN
+# initial:      the first chunk's element count, rounded up to a power of two
+# ret:          whether the table was made
+pub fun make(table: *Table, a: *allocator.Allocator, element_size: usize, initial: usize) bool {
+    if (table == nil || a == nil || element_size == 0 || initial == 0) { ret false; }
+    var shift: usize = 0;
+    for ((1::usize << shift) < initial) {
+        shift = shift + 1;
+        if (shift >= DIRECTORY) { ret false; }
+    }
+    table.allocator    = @a;
+    table.element_size = element_size;
+    table.shift        = shift;
+    table.chunk_count  = 0;
+    table.capacity     = 0;
+    var i: usize = 0;
+    for (i < DIRECTORY) {
+        table.chunks[i] = nil;
+        i               = i + 1;
+    }
+    var bytes: usize = 0;
+    if (!chunk_bytes(table, 0, ?bytes)) { ret false; }
+    val chunk: ptr = take_chunk(table, bytes);
+    if (chunk == nil) { ret false; }
+    table.chunks[0]   = chunk;
+    table.chunk_count = 1;
+    table.capacity    = chunk_elements(table, 0);
+    ret true;
+}
+
+# appended elements are uninitialised and the caller owns their first write
+pub fun grow(table: *Table) bool {
+    if (table == nil || table.chunk_count == 0 ||
+        table.chunk_count >= DIRECTORY) { ret false; }
+    if (table.capacity > ~(0::usize) / 2) { ret false; }
+    var bytes: usize = 0;
+    if (!chunk_bytes(table, table.chunk_count, ?bytes)) { ret false; }
+    val chunk: ptr = take_chunk(table, bytes);
+    if (chunk == nil) { ret false; }
+    table.chunks[table.chunk_count] = chunk;
+    table.capacity                  = table.capacity +
+        chunk_elements(table, table.chunk_count);
+    table.chunk_count = table.chunk_count + 1;
+    ret true;
+}
+
+pub fun reserve(table: *Table, count: usize) bool {
+    if (table == nil) { ret false; }
+    for (table.capacity < count) {
+        if (!grow(table)) { ret false; }
+    }
+    ret true;
+}
+
+# the chunk holding index, for an index below the capacity
+pub fun chunk_of(table: *Table, index: usize) usize {
+    if (index < (1::usize << table.shift)) { ret 0; }
+    ret floor_log2(index >> table.shift) + 1;
+}
+
+# the first index chunk holds
+pub fun chunk_start(table: *Table, chunk: usize) usize {
+    if (chunk == 0) { ret 0; }
+    ret 1::usize << (table.shift + chunk - 1);
+}
+
+# how many elements chunk holds
+pub fun chunk_capacity(table: *Table, chunk: usize) usize {
+    ret chunk_elements(table, chunk);
+}
+
+# return the last chunk to the table's allocator
+#
+# the first chunk is never released, and every element below the new capacity
+# stays where it was. the caller owns knowing that no element of the released
+# chunk is still in use. over an allocator that does not reclaim, a released
+# chunk could never be reused and growing again would take fresh bytes, so the
+# table keeps it and a shrink is refused
+# ---
+# table: the table to shrink
+# ret:   ok, invalid for a nil table, one with a single chunk or one whose
+#        allocator does not reclaim, or the allocator's refusal, which leaves
+#        the table and its last chunk as they were
+pub fun shrink(table: *Table) err[allocator.Error] {
+    if (table == nil || table.chunk_count <= 1 || !allocator.reclaims(?table.allocator)) {
+        ret err[allocator.Error].err{allocator.Error.invalid{}};
+    }
+    val last:  usize = table.chunk_count - 1;
+    var bytes: usize = 0;
+    if (!chunk_bytes(table, last, ?bytes)) {
+        ret err[allocator.Error].err{allocator.Error.invalid{}};
+    }
+    val released: err[allocator.Error] = allocator.deallocate_raw(?table.allocator, table.chunks[last], bytes, ELEMENT_ALIGN);
+    if (sel released.err) { ret released; }
+    table.chunks[last] = nil;
+    table.capacity     = table.capacity - chunk_elements(table, last);
+    table.chunk_count  = last;
+    ret released;
+}
+
+pub fun at(table: *Table, index: usize) ptr {
+    if (table == nil || index >= table.capacity) { ret nil; }
+    val chunk: usize = chunk_of(table, index);
+    ret (table.chunks[chunk]::usize + (index - chunk_start(table, chunk)) * table.element_size)::ptr;
+}
+
+pub val NO_INDEX: usize = ~(0::usize);
+
+# recover an element's index from its address, for callers that hand the
+# address itself out as a resource identity
+pub fun index_of(table: *Table, address: usize) usize {
+    if (table == nil) { ret NO_INDEX; }
+    var chunk: usize = 0;
+    var base:  usize = 0;
+    for (chunk < table.chunk_count) {
+        val count: usize = chunk_elements(table, chunk);
+        val start: usize = table.chunks[chunk]::usize;
+        var bytes: usize = 0;
+        if (!memory.range_scaled(count, table.element_size, ?bytes)) { ret NO_INDEX; }
+        if (address >= start && address - start < bytes) {
+            val offset: usize = address - start;
+            if (offset % table.element_size != 0) { ret NO_INDEX; }
+            ret base + offset / table.element_size;
+        }
+        base  = base + count;
+        chunk = chunk + 1;
+    }
+    ret NO_INDEX;
+}
+
+# return every chunk to the table's allocator
+#
+# every chunk is released even after one release fails, and the table is empty
+# afterwards either way. destroying an empty or never-made table succeeds
+# ---
+# table: the table to destroy
+# ret:   ok, or the first refusal the allocator reported
+pub fun destroy(table: *Table) err[allocator.Error] {
+    if (table == nil) { ret err[allocator.Error].ok{}; }
+    var result: err[allocator.Error] = err[allocator.Error].ok{};
+    var chunk:  usize                = 0;
+    for (chunk < table.chunk_count) {
+        var bytes: usize = 0;
+        if (chunk_bytes(table, chunk, ?bytes)) {
+            val released: err[allocator.Error] = allocator.deallocate_raw(?table.allocator, table.chunks[chunk], bytes, ELEMENT_ALIGN);
+            if (sel released.err && sel result.ok) { result = released; }
+        }
+        table.chunks[chunk] = nil;
+        chunk               = chunk + 1;
+    }
+    table.chunk_count = 0;
+    table.capacity    = 0;
+    ret result;
+}
+
+pub fun aliases(table: *Table, data: *u8, len: usize) bool {
+    if (table == nil || !memory.range_valid(data, len)) { ret true; }
+    if (len == 0)                                       { ret false; }
+    var chunk: usize = 0;
+    for (chunk < table.chunk_count) {
+        var bytes: usize = 0;
+        if (!chunk_bytes(table, chunk, ?bytes)) { ret true; }
+        if (memory.ranges_overlap(table.chunks[chunk]::*u8, bytes, data, len)) {
+            ret true;
+        }
+        chunk = chunk + 1;
+    }
+    ret false;
+}
+
+# the free indices of a table, handed out lowest chunk first and oldest first
+# within a chunk, so steady churn drains the high chunks and an index waits
+# behind the other free ones of its chunk. an index the pool has never handed
+# out is older than every index given back, and the pool reads and writes none
+# of its bytes, so a chunk's untouched tail costs address space and not
+# resident memory. the free lists of indices given back link through a usize
+# inside each free element, so the pool allocates nothing
+# ---
+# live:     taken indices per chunk
+# head:     each chunk's oldest index given back and free
+# tail:     each chunk's newest index given back and free
+# frontier: each chunk's lowest index never handed out, the chunk's end once
+#           every index has been
+# lowest:   no chunk below this one holds a free index
+# link:     byte offset of the usize link inside an element
+# floor:    the generation an element of a regrown chunk starts from, above
+#           every generation a released chunk issued (pool_trim)
+pub rec Pool {
+    live:     [DIRECTORY]usize;
+    head:     [DIRECTORY]usize;
+    tail:     [DIRECTORY]usize;
+    frontier: [DIRECTORY]usize;
+    lowest:   usize;
+    link:     usize;
+    floor:    u32;
+}
+
+fun pool_link(pool: *Pool, owner: *Table, index: usize) *usize {
+    ret (at(owner, index)::usize + pool.link)::*usize;
+}
+
+fun chunk_end(owner: *Table, chunk: usize) usize {
+    ret chunk_start(owner, chunk) + chunk_elements(owner, chunk);
+}
+
+fun pool_append(pool: *Pool, owner: *Table, chunk: usize, index: usize) {
+    @pool_link(pool, owner, index) = NO_INDEX;
+    if (pool.tail[chunk] == NO_INDEX) { pool.head[chunk] = index; }
+    or                                { @pool_link(pool, owner, pool.tail[chunk]) = index; }
+    pool.tail[chunk] = index;
+}
+
+# an empty pool whose elements link through the usize at byte offset link
+pub fun pool_make(pool: *Pool, link: usize) {
+    var chunk: usize = 0;
+    for (chunk < DIRECTORY) {
+        pool.live[chunk]     = 0;
+        pool.head[chunk]     = NO_INDEX;
+        pool.tail[chunk]     = NO_INDEX;
+        pool.frontier[chunk] = 0;
+        chunk                = chunk + 1;
+    }
+    pool.lowest = 0;
+    pool.link   = link;
+    pool.floor  = 0;
+}
+
+# every index of the owner's newest chunk joins the pool free, in index order.
+# the pool writes nothing into the chunk: an index stays untouched until the
+# pool first hands it out, and pool_untouched says which are, so a caller may
+# initialise an element when it is first taken instead of here
+pub fun pool_adopt(pool: *Pool, owner: *Table) {
+    val chunk: usize = owner.chunk_count - 1;
+    pool.live[chunk]     = 0;
+    pool.head[chunk]     = NO_INDEX;
+    pool.tail[chunk]     = NO_INDEX;
+    pool.frontier[chunk] = chunk_start(owner, chunk);
+    if (chunk < pool.lowest) { pool.lowest = chunk; }
+}
+
+# whether the pool has never handed index out since its chunk was adopted, so
+# neither the pool nor a taker has written it. an index past the owner's
+# capacity counts as untouched
+pub fun pool_untouched(pool: *Pool, owner: *Table, index: usize) bool {
+    if (index >= owner.capacity) { ret true; }
+    ret index >= pool.frontier[chunk_of(owner, index)];
+}
+
+# chunk's oldest free index, which stays free, or NO_INDEX when chunk has none
+# free
+pub fun pool_oldest(pool: *Pool, owner: *Table, chunk: usize) usize {
+    if (chunk >= owner.chunk_count)                     { ret NO_INDEX; }
+    if (pool.frontier[chunk] < chunk_end(owner, chunk)) { ret pool.frontier[chunk]; }
+    ret pool.head[chunk];
+}
+
+# chunk's newest free index, the last pool_take_head would hand out, or
+# NO_INDEX when chunk has none free
+pub fun pool_newest(pool: *Pool, owner: *Table, chunk: usize) usize {
+    if (chunk >= owner.chunk_count)   { ret NO_INDEX; }
+    if (pool.tail[chunk] != NO_INDEX) { ret pool.tail[chunk]; }
+    val end: usize = chunk_end(owner, chunk);
+    if (pool.frontier[chunk] < end) { ret end - 1; }
+    ret NO_INDEX;
+}
+
+# the index pool_take would hand out, which stays free, or NO_INDEX
+pub fun pool_peek(pool: *Pool, owner: *Table) usize {
+    for (pool.lowest < owner.chunk_count && pool_oldest(pool, owner, pool.lowest) == NO_INDEX) {
+        pool.lowest = pool.lowest + 1;
+    }
+    ret pool_oldest(pool, owner, pool.lowest);
+}
+
+# chunk's oldest free index, now taken, or NO_INDEX when chunk has none free.
+# a taken index's link holds NO_INDEX
+pub fun pool_take_head(pool: *Pool, owner: *Table, chunk: usize) usize {
+    if (chunk >= owner.chunk_count) { ret NO_INDEX; }
+    var index: usize = pool.frontier[chunk];
+    if (index < chunk_end(owner, chunk)) {
+        pool.frontier[chunk] = index + 1;
+    }
+    or {
+        index = pool.head[chunk];
+        if (index == NO_INDEX) { ret NO_INDEX; }
+        pool.head[chunk] = @pool_link(pool, owner, index);
+        if (pool.head[chunk] == NO_INDEX) { pool.tail[chunk] = NO_INDEX; }
+    }
+    @pool_link(pool, owner, index) = NO_INDEX;
+    pool.live[chunk]               = pool.live[chunk] + 1;
+    ret index;
+}
+
+# the lowest chunk's oldest free index, now taken, or NO_INDEX when every
+# index is taken
+pub fun pool_take(pool: *Pool, owner: *Table) usize {
+    if (pool_peek(pool, owner) == NO_INDEX) { ret NO_INDEX; }
+    ret pool_take_head(pool, owner, pool.lowest);
+}
+
+# a taken index goes back to the pool, behind the other free ones of its chunk
+pub fun pool_put(pool: *Pool, owner: *Table, index: usize) {
+    val chunk: usize = chunk_of(owner, index);
+    pool_append(pool, owner, chunk, index);
+    pool.live[chunk] = pool.live[chunk] - 1;
+    if (chunk < pool.lowest) { pool.lowest = chunk; }
+}
+
+# release the owner's last chunk, whose indices are all free, with its list
+# ---
+# ret: whether the chunk was released. a refusal keeps the chunk and its list
+pub fun pool_shrink(pool: *Pool, owner: *Table) bool {
+    val chunk:    usize                = owner.chunk_count - 1;
+    val released: err[allocator.Error] = shrink(owner);
+    if (sel released.err) { ret false; }
+    pool.head[chunk] = NO_INDEX;
+    pool.tail[chunk] = NO_INDEX;
+    pool.live[chunk] = 0;
+    ret true;
+}
+
+# release the capacity a peak left behind. the last chunk goes once it and the
+# chunk below it both hold nothing live, so one empty chunk always remains as
+# slack and a load crossing a chunk boundary back and forth never reallocates.
+# only empty chunks are released, so nothing live moves. over an allocator
+# that does not reclaim nothing is released and the table keeps its peak, as
+# shrink does
+#
+# an element that carries a generation keeps it as a u32 at byte offset
+# generation, and floor rises to the highest one a released chunk held. an
+# element made in a regrown chunk starts from floor, so no handle issued in the
+# released chunk matches it
+# ---
+# live:       the live element count of each chunk, DIRECTORY entries
+# generation: byte offset of the elements' u32 generation, or NO_INDEX for
+#             elements that carry none
+# floor:      raised to the released chunks' highest generation, nil when
+#             generation is NO_INDEX
+# ret:        chunks released. a refused release stops there and keeps the chunk
+pub fun trim(table: *Table, live: *usize, generation: usize, floor: *u32) usize {
+    ret trim_backed(table, live, generation, floor, 0);
+}
+
+# trim for a table that has promised capacity no element holds yet. the lowest
+# backed indices count as live whatever their chunks' live counts say, so a
+# chunk goes only once the promise fits below the chunk under it, and the
+# capacity never falls below backed
+# ---
+# backed: elements that must stay backed, as though they filled the lowest
+#         indices
+# ret:    chunks released
+pub fun trim_backed(table: *Table, live: *usize, generation: usize, floor: *u32, backed: usize) usize {
+    ret trim_written(table, live, generation, floor, backed, nil);
+}
+
+# trim_backed reading generations only below each chunk's frontier, when one is
+# given, since nothing at or past it was ever written
+fun trim_written(table: *Table, live: *usize, generation: usize, floor: *u32, backed: usize, frontier: *usize) usize {
+    var released: usize = 0;
+    if (!allocator.reclaims(?table.allocator)) { ret released; }
+    for (table.chunk_count > 1) {
+        val top: usize = table.chunk_count - 1;
+        if (live[top] != 0 || live[top - 1] != 0 ||
+            backed > chunk_start(table, top - 1)) { brk; }
+        var raised: u32 = 0;
+        if (generation != NO_INDEX) {
+            raised = @floor;
+            val start: usize = chunk_start(table, top);
+            var end:   usize = start + chunk_elements(table, top);
+            if (frontier != nil && frontier[top] < end) { end = frontier[top]; }
+            var index: usize = start;
+            for (index < end) {
+                val issued: u32 = @((at(table, index)::usize + generation)::*u32);
+                if (issued > raised) { raised = issued; }
+                index = index + 1;
+            }
+        }
+        val shrunk: err[allocator.Error] = shrink(table);
+        if (sel shrunk.err)         { brk; }
+        if (generation != NO_INDEX) { @floor = raised; }
+        released = released + 1;
+    }
+    ret released;
+}
+
+# trim for a pooled table, whose floor is the pool's
+# ---
+# generation: byte offset of the elements' u32 generation, or NO_INDEX
+# ret:        chunks released
+pub fun pool_trim(pool: *Pool, owner: *Table, generation: usize) usize {
+    ret pool_trim_backed(pool, owner, generation, 0);
+}
+
+# trim_backed for a pooled table, whose floor is the pool's
+# ---
+# generation: byte offset of the elements' u32 generation, or NO_INDEX
+# backed:     elements that must stay backed, as in trim_backed
+# ret:        chunks released
+pub fun pool_trim_backed(pool: *Pool, owner: *Table, generation: usize, backed: usize) usize {
+    val released: usize = trim_written(owner, ?pool.live[0], generation, ?pool.floor, backed, ?pool.frontier[0]);
+    var chunk:    usize = owner.chunk_count;
+    for (chunk < owner.chunk_count + released) {
+        pool.head[chunk] = NO_INDEX;
+        pool.tail[chunk] = NO_INDEX;
+        chunk            = chunk + 1;
+    }
+    ret released;
+}
+
+use std.allocator.fixed;
+use std.types.option.opt;
+
+val TEST_BYTES: usize = 32768;
+
+rec TestArena {
+    state:  fixed.FixedState;
+    buffer: [TEST_BYTES]u8;
+}
+
+#[testing]
+fun test_allocator(a: *allocator.Allocator, arena: *TestArena) bool {
+    val made: err[allocator.Error] = fixed.make(a, ?arena.state, ?arena.buffer[0], TEST_BYTES);
+    ret sel made.ok;
+}
+
+# the arena posing as an allocator that reclaims, so shrink and trim run. what
+# they release is never reused, and the arena is large enough for every regrowth
+#[testing]
+fun reclaiming_allocator(a: *allocator.Allocator, arena: *TestArena) bool {
+    if (!test_allocator(a, arena)) { ret false; }
+    a.retains = false;
+    ret true;
+}
+
+#[testing]
+fun destroyed(table: *Table) bool {
+    val released: err[allocator.Error] = destroy(table);
+    ret sel released.ok;
+}
+
+#[testing]
+fun refusing_allocate(ctx: ptr, size: usize, align: usize) opt[ptr] {
+    ret opt[ptr].none{};
+}
+
+#[testing]
+fun refusing_reallocate(ctx: ptr, p: ptr, old_size: usize, new_size: usize, align: usize) opt[ptr] {
+    ret opt[ptr].none{};
+}
+
+# hands out the arena's storage but refuses every release with -5
+#[testing]
+fun failing_deallocate(ctx: ptr, p: ptr, size: usize, align: usize) i64 {
+    ret -5;
+}
+
+# every index maps to its own element, and growth moves no live element
+test table__every_index_maps_to_one_stable_element {
+    var a:     allocator.Allocator;
+    var arena: TestArena;
+    var table: Table;
+    if (!test_allocator(?a, ?arena))           { ret 1; }
+    if (!make(?table, ?a, $size_of(usize), 4)) { ret 1; }
+    var taken: [4]*usize;
+    var i:     usize = 0;
+    for (i < 4) {
+        taken[i]  = at(?table, i)::*usize;
+        @taken[i] = i;
+        i         = i + 1;
+    }
+    if (!reserve(?table, 600) || table.capacity != 1024) { ret 2; }
+    i = 0;
+    for (i < 4) {
+        if (at(?table, i)::*usize != taken[i] || @taken[i] != i) { ret 3; }
+        i = i + 1;
+    }
+    for (i < table.capacity) {
+        val cell: *usize = at(?table, i)::*usize;
+        if (cell == nil) { ret 4; }
+        @cell = i;
+        i     = i + 1;
+    }
+    i = 0;
+    for (i < table.capacity) {
+        if (@(at(?table, i)::*usize) != i) { ret 5; }
+        i = i + 1;
+    }
+    if (at(?table, table.capacity) != nil)           { ret 6; }
+    if (!destroyed(?table))                          { ret 7; }
+    if (table.capacity != 0 || at(?table, 0) != nil) { ret 8; }
+    ret 0;
+}
+
+test table__an_element_address_recovers_its_own_index {
+    var a:     allocator.Allocator;
+    var arena: TestArena;
+    var table: Table;
+    if (!test_allocator(?a, ?arena))           { ret 1; }
+    if (!make(?table, ?a, $size_of(usize), 2)) { ret 1; }
+    if (!reserve(?table, 40))                  { ret 2; }
+    var i: usize = 0;
+    for (i < table.capacity) {
+        val address: usize = at(?table, i)::usize;
+        if (index_of(?table, address) != i)            { ret 3; }
+        if (index_of(?table, address + 1) != NO_INDEX) { ret 4; }
+        i = i + 1;
+    }
+    if (index_of(?table, 0) != NO_INDEX) { ret 5; }
+    if (!destroyed(?table))              { ret 6; }
+    ret 0;
+}
+
+test table__ownership_query_covers_every_chunk {
+    var a:        allocator.Allocator;
+    var arena:    TestArena;
+    var table:    Table;
+    var external: [8]u8;
+    if (!test_allocator(?a, ?arena))           { ret 1; }
+    if (!make(?table, ?a, $size_of(usize), 2)) { ret 1; }
+    if (!grow(?table))                         { ret 2; }
+    var chunk: usize = 0;
+    for (chunk < table.chunk_count) {
+        if (!aliases(?table, table.chunks[chunk]::*u8, 1)) { ret 3; }
+        chunk = chunk + 1;
+    }
+    if (aliases(?table, ?external[0], 8)) { ret 4; }
+    if (!aliases(?table, nil, 1))         { ret 5; }
+    if (!destroyed(?table))               { ret 6; }
+    if (aliases(?table, ?external[0], 8)) { ret 7; }
+    ret 0;
+}
+
+test table__a_refused_shape_allocates_nothing {
+    var a:     allocator.Allocator;
+    var arena: TestArena;
+    var table: Table;
+    if (!test_allocator(?a, ?arena))                 { ret 1; }
+    if (make(?table, ?a, 0, 4))                      { ret 1; }
+    if (make(?table, ?a, $size_of(usize), 0))        { ret 2; }
+    if (make(nil, ?a, $size_of(usize), 4))           { ret 3; }
+    if (make(?table, nil, $size_of(usize), 4))       { ret 4; }
+    if (fixed.remaining(?arena.state) != TEST_BYTES) { ret 5; }
+    if (!make(?table, ?a, $size_of(usize), 2))       { ret 6; }
+    if (!reserve(?table, 2) || table.capacity != 2)  { ret 7; }
+    if (!destroyed(?table))                          { ret 8; }
+    ret 0;
+}
+
+test table__chunks_come_from_the_given_allocator_and_a_refusal_fails_the_table {
+    var refusing: allocator.Allocator = allocator.Allocator{
+        ctx:           nil,
+        fn_allocate:   refusing_allocate,
+        fn_reallocate: refusing_reallocate,
+        fn_deallocate: failing_deallocate,
+    };
+    var table: Table;
+    if (make(?table, ?refusing, $size_of(usize), 4)) { ret 1; }
+
+    var a:     allocator.Allocator;
+    var arena: TestArena;
+    if (!test_allocator(?a, ?arena))           { ret 2; }
+    if (!make(?table, ?a, $size_of(usize), 4)) { ret 3; }
+    val before: usize = fixed.remaining(?arena.state);
+    if (!grow(?table))                           { ret 4; }
+    if (fixed.remaining(?arena.state) >= before) { ret 5; }
+    table.allocator.fn_allocate = refusing_allocate;
+    if (grow(?table))           { ret 6; }
+    if (table.chunk_count != 2) { ret 7; }
+    ret 0;
+}
+
+test table__destroy_reports_a_refused_release_and_still_empties_the_table {
+    var a:     allocator.Allocator;
+    var arena: TestArena;
+    var table: Table;
+    if (!test_allocator(?a, ?arena))           { ret 1; }
+    if (!make(?table, ?a, $size_of(usize), 4)) { ret 2; }
+    if (!grow(?table))                         { ret 3; }
+    table.allocator.fn_deallocate = failing_deallocate;
+    val released: err[allocator.Error] = destroy(?table);
+    if (!sel released.err)                                         { ret 4; }
+    if (!(sel released.err.release && released.err.release == -5)) { ret 4; }
+    if (table.chunk_count != 0 || table.capacity != 0)             { ret 5; }
+    if (table.chunks[0] != nil || table.chunks[1] != nil)          { ret 6; }
+    ret 0;
+}
+
+test table__shrink_releases_the_last_chunk_and_moves_nothing_below_it {
+    var a:     allocator.Allocator;
+    var arena: TestArena;
+    var table: Table;
+    if (!reclaiming_allocator(?a, ?arena))     { ret 1; }
+    if (!make(?table, ?a, $size_of(usize), 4)) { ret 1; }
+    val single: err[allocator.Error] = shrink(?table);
+    if (!sel single.err || table.chunk_count != 1) { ret 2; }
+    if (!reserve(?table, 32))                      { ret 3; }
+    if (table.chunk_count != 4)                    { ret 3; }
+    if (chunk_start(?table, 3) != 16 || chunk_capacity(?table, 3) != 16 ||
+        chunk_of(?table, 15) != 2 || chunk_of(?table, 16) != 3 ||
+        chunk_of(?table, 3) != 0 || chunk_of(?table, 4) != 1) { ret 4; }
+    var taken: [16]*usize;
+    var i:     usize = 0;
+    for (i < 16) {
+        taken[i]  = at(?table, i)::*usize;
+        @taken[i] = i + 7;
+        i         = i + 1;
+    }
+    val shrunk: err[allocator.Error] = shrink(?table);
+    if (!sel shrunk.ok)                                  { ret 5; }
+    if (table.chunk_count != 3 || table.capacity != 16)  { ret 6; }
+    if (table.chunks[3] != nil || at(?table, 16) != nil) { ret 6; }
+    i = 0;
+    for (i < 16) {
+        if (at(?table, i)::*usize != taken[i] || @taken[i] != i + 7) { ret 8; }
+        i = i + 1;
+    }
+    # a refused release keeps the chunk, so the table still owns it
+    table.allocator.fn_deallocate = failing_deallocate;
+    val refused: err[allocator.Error] = shrink(?table);
+    if (!sel refused.err)                                        { ret 9; }
+    if (table.chunk_count != 3 || table.capacity != 16)          { ret 10; }
+    if (at(?table, 15)::*usize != taken[15] || @taken[15] != 22) { ret 10; }
+    table.allocator.fn_deallocate = a.fn_deallocate;
+    # a shrunk table grows again into a fresh chunk
+    if (!grow(?table) || table.capacity != 32) { ret 11; }
+    if (!destroyed(?table))                    { ret 12; }
+    ret 0;
+}
+
+#[testing]
+rec TestPooled {
+    generation: u32;
+    link:       usize;
+}
+
+#[testing]
+fun test_adopt(pool: *Pool, table: *Table) bool {
+    if (!grow(table)) { ret false; }
+    val chunk: usize = table.chunk_count - 1;
+    var index: usize = chunk_start(table, chunk);
+    for (index < table.capacity) {
+        (at(table, index)::*TestPooled).generation = pool.floor;
+        index                                      = index + 1;
+    }
+    pool_adopt(pool, table);
+    ret true;
+}
+
+test table__a_pool_hands_out_the_lowest_chunk_first_and_trims_to_one_empty_chunk {
+    var a:     allocator.Allocator;
+    var arena: TestArena;
+    var table: Table;
+    var pool:  Pool;
+    if (!reclaiming_allocator(?a, ?arena))          { ret 1; }
+    if (!make(?table, ?a, $size_of(TestPooled), 4)) { ret 1; }
+    pool_make(?pool, $offset_of(TestPooled, link));
+    var index: usize = 0;
+    for (index < 4) {
+        (at(?table, index)::*TestPooled).generation = 0;
+        index                                       = index + 1;
+    }
+    pool_adopt(?pool, ?table);
+    for (table.capacity < 32) {
+        if (!test_adopt(?pool, ?table)) { ret 2; }
+    }
+    # every index is handed out once, in order, and then the pool is dry
+    var i: usize = 0;
+    for (i < 32) {
+        if (pool_peek(?pool, ?table) != i) { ret 3; }
+        val taken: usize = pool_take(?pool, ?table);
+        if (taken != i) { ret 3; }
+        (at(?table, taken)::*TestPooled).generation = (100 + i)::u32;
+        i                                           = i + 1;
+    }
+    if (pool_take(?pool, ?table) != NO_INDEX || pool_peek(?pool, ?table) != NO_INDEX) { ret 4; }
+    # a live index in chunk 3 pins it and the chunk below it
+    i = 0;
+    for (i < 32) {
+        if (i != 17) { pool_put(?pool, ?table, i); }
+        i = i + 1;
+    }
+    if (pool_trim(?pool, ?table, $offset_of(TestPooled, generation)) != 0 || table.chunk_count != 4) { ret 5; }
+    # a freed index waits behind the older free ones of its chunk
+    if (pool_take(?pool, ?table) != 0) { ret 6; }
+    pool_put(?pool, ?table, 0);
+    if (pool_peek(?pool, ?table) != 1) { ret 6; }
+    # once 17 goes, every chunk above chunk 0 is empty and released
+    pool_put(?pool, ?table, 17);
+    if (pool_trim(?pool, ?table, $offset_of(TestPooled, generation)) != 3) { ret 7; }
+    if (table.chunk_count != 1 || table.capacity != 4)                     { ret 7; }
+    # the floor is the highest generation the released chunks issued
+    if (pool.floor != 131) { ret 8; }
+    # chunk 0 never goes
+    if (pool_trim(?pool, ?table, NO_INDEX) != 0 || table.chunk_count != 1) { ret 9; }
+    # a regrown chunk starts at the floor and joins the pool behind chunk 0
+    if (!test_adopt(?pool, ?table))                     { ret 10; }
+    if ((at(?table, 4)::*TestPooled).generation != 131) { ret 10; }
+    i = 0;
+    for (i < 4) {
+        if (pool_take(?pool, ?table) >= 4) { ret 11; }
+        i = i + 1;
+    }
+    if (pool_take(?pool, ?table) != 4) { ret 12; }
+    # one taken index in chunk 1 keeps chunk 2 as the empty slack above it
+    if (!test_adopt(?pool, ?table) || !test_adopt(?pool, ?table))          { ret 13; }
+    if (pool_trim(?pool, ?table, NO_INDEX) != 1 || table.chunk_count != 3) { ret 14; }
+    if (!destroyed(?table))                                                { ret 15; }
+    ret 0;
+}
+
+test table__a_backed_count_keeps_its_capacity_and_one_chunk_of_slack_above_it {
+    var a:     allocator.Allocator;
+    var arena: TestArena;
+    var table: Table;
+    var pool:  Pool;
+    if (!reclaiming_allocator(?a, ?arena))          { ret 1; }
+    if (!make(?table, ?a, $size_of(TestPooled), 4)) { ret 1; }
+    pool_make(?pool, $offset_of(TestPooled, link));
+    pool_adopt(?pool, ?table);
+    for (table.capacity < 32) {
+        if (!test_adopt(?pool, ?table)) { ret 2; }
+    }
+    # nothing is live, so only the promise holds chunks: the chunk it ends in
+    # stays, and so does the one above it
+    if (pool_trim_backed(?pool, ?table, NO_INDEX, 10) != 0 || table.capacity != 32) { ret 3; }
+    if (pool_trim_backed(?pool, ?table, NO_INDEX, 8) != 1 || table.capacity != 16)  { ret 4; }
+    if (pool_trim_backed(?pool, ?table, NO_INDEX, 5) != 0 || table.capacity != 16)  { ret 5; }
+    if (pool_trim_backed(?pool, ?table, NO_INDEX, 4) != 1 || table.capacity != 8)   { ret 6; }
+    # a live index still pins its chunk and the one below it past the promise
+    if (!test_adopt(?pool, ?table) || !test_adopt(?pool, ?table)) { ret 7; }
+    var i: usize = 0;
+    for (i < 17) {
+        pool_take(?pool, ?table);
+        i = i + 1;
+    }
+    i = 0;
+    for (i < 16) {
+        pool_put(?pool, ?table, i);
+        i = i + 1;
+    }
+    if (pool_trim_backed(?pool, ?table, NO_INDEX, 0) != 0 || table.capacity != 32) { ret 8; }
+    pool_put(?pool, ?table, 16);
+    if (pool_trim_backed(?pool, ?table, NO_INDEX, 0) != 3 || table.capacity != 4) { ret 9; }
+    if (!destroyed(?table))                                                       { ret 10; }
+    ret 0;
+}
+
+# #880: an allocator.fixed arena never reuses what it is given back, so over it
+# a trim or a shrink keeps every chunk, and a peak that drains and returns costs
+# the arena nothing after the first
+test table__a_table_over_an_allocator_that_does_not_reclaim_keeps_its_peak {
+    var a:     allocator.Allocator;
+    var arena: TestArena;
+    var table: Table;
+    var pool:  Pool;
+    if (!test_allocator(?a, ?arena) || allocator.reclaims(?a)) { ret 1; }
+    if (!make(?table, ?a, $size_of(TestPooled), 4))            { ret 1; }
+    pool_make(?pool, $offset_of(TestPooled, link));
+    pool_adopt(?pool, ?table);
+    var remaining: usize = 0;
+    var round:     usize = 0;
+    for (round < 8) {
+        var i: usize = 0;
+        for (i < 64) {
+            if (pool_peek(?pool, ?table) == NO_INDEX && !test_adopt(?pool, ?table)) { ret 2; }
+            pool_take(?pool, ?table);
+            i = i + 1;
+        }
+        i = 0;
+        for (i < 64) {
+            pool_put(?pool, ?table, i);
+            i = i + 1;
+        }
+        if (pool_trim(?pool, ?table, $offset_of(TestPooled, generation)) != 0) { ret 3; }
+        if (table.capacity != 64 || pool.floor != 0)                           { ret 4; }
+        if (round == 0)                                                        { remaining = fixed.remaining(?arena.state); }
+        or (fixed.remaining(?arena.state) != remaining)                        { ret 5; }
+        round = round + 1;
+    }
+    val shrunk: err[allocator.Error] = shrink(?table);
+    if (!(sel shrunk.err && sel shrunk.err.invalid) || table.chunk_count != 5) { ret 6; }
+    if (pool_shrink(?pool, ?table) || table.chunk_count != 5)                  { ret 7; }
+    if (!destroyed(?table))                                                    { ret 8; }
+    ret 0;
+}
+
+#[testing]
+val TEST_PAINT: u8 = 0xa5;
+
+# grow by one chunk, painted, and adopt it
+#[testing]
+fun test_adopt_painted(pool: *Pool, table: *Table) bool {
+    if (!grow(table)) { ret false; }
+    val chunk: usize = table.chunk_count - 1;
+    memory.raw_fill(table.chunks[chunk], TEST_PAINT, chunk_capacity(table, chunk) * table.element_size);
+    pool_adopt(pool, table);
+    ret true;
+}
+
+# bytes of the table no longer holding the paint
+#[testing]
+fun test_written(table: *Table) usize {
+    var written: usize = 0;
+    var chunk:   usize = 0;
+    for (chunk < table.chunk_count) {
+        val bytes: *u8   = table.chunks[chunk]::*u8;
+        var i:     usize = 0;
+        for (i < chunk_capacity(table, chunk) * table.element_size) {
+            if (bytes[i] != TEST_PAINT) { written = written + 1; }
+            i = i + 1;
+        }
+        chunk = chunk + 1;
+    }
+    ret written;
+}
+
+# #886: adopting a chunk writes none of it, and an index is written first when
+# the pool hands it out. an untouched index is older than one given back, so
+# the order is the one a pool that linked every index at adoption kept
+test table__a_pool_writes_nothing_into_a_chunk_until_it_hands_an_index_out {
+    var a:     allocator.Allocator;
+    var arena: TestArena;
+    var table: Table;
+    var pool:  Pool;
+    if (!test_allocator(?a, ?arena))                { ret 1; }
+    if (!make(?table, ?a, $size_of(TestPooled), 4)) { ret 1; }
+    memory.raw_fill(table.chunks[0], TEST_PAINT, 4 * table.element_size);
+    pool_make(?pool, $offset_of(TestPooled, link));
+    pool_adopt(?pool, ?table);
+    for (table.capacity < 64) {
+        if (!test_adopt_painted(?pool, ?table)) { ret 2; }
+    }
+    if (test_written(?table) != 0)                                                { ret 3; }
+    if (pool_peek(?pool, ?table) != 0 || !pool_untouched(?pool, ?table, 0))       { ret 4; }
+    if (pool_oldest(?pool, ?table, 1) != 4 || pool_newest(?pool, ?table, 1) != 7) { ret 4; }
+    # taking writes only the taken element's link
+    var i: usize = 0;
+    for (i < 3) {
+        if (pool_take(?pool, ?table) != i) { ret 5; }
+        i = i + 1;
+    }
+    if (test_written(?table) > 3 * $size_of(usize))                            { ret 6; }
+    if (pool_untouched(?pool, ?table, 2) || !pool_untouched(?pool, ?table, 3)) { ret 7; }
+    if (!pool_untouched(?pool, ?table, table.capacity))                        { ret 7; }
+    # a given back index waits behind the untouched ones of its chunk
+    pool_put(?pool, ?table, 1);
+    if (pool_newest(?pool, ?table, 0) != 1)                             { ret 8; }
+    if (pool_peek(?pool, ?table) != 3 || pool_take(?pool, ?table) != 3) { ret 8; }
+    if (pool_peek(?pool, ?table) != 1 || pool_take(?pool, ?table) != 1) { ret 9; }
+    if (pool_peek(?pool, ?table) != 4 || pool_take(?pool, ?table) != 4) { ret 10; }
+    if (pool_live_total(?pool) != 5)                                    { ret 11; }
+    if (!destroyed(?table))                                             { ret 12; }
+    ret 0;
+}
+
+#[testing]
+fun pool_live_total(pool: *Pool) usize {
+    var total: usize = 0;
+    var chunk: usize = 0;
+    for (chunk < DIRECTORY) {
+        total = total + pool.live[chunk];
+        chunk = chunk + 1;
+    }
+    ret total;
+}
+
+# #886: a trim raises the floor from the generations its released chunks
+# issued, and never reads the untouched indices, whose bytes are not a
+# generation
+test table__a_trim_reads_no_generation_past_a_chunk_s_frontier {
+    var a:     allocator.Allocator;
+    var arena: TestArena;
+    var table: Table;
+    var pool:  Pool;
+    if (!reclaiming_allocator(?a, ?arena))          { ret 1; }
+    if (!make(?table, ?a, $size_of(TestPooled), 4)) { ret 1; }
+    pool_make(?pool, $offset_of(TestPooled, link));
+    pool_adopt(?pool, ?table);
+    for (table.capacity < 32) {
+        if (!test_adopt_painted(?pool, ?table)) { ret 2; }
+    }
+    var i: usize = 0;
+    for (i < 5) {
+        val taken: usize = pool_take(?pool, ?table);
+        (at(?table, taken)::*TestPooled).generation = (7 + i)::u32;
+        i                                           = i + 1;
+    }
+    i = 0;
+    for (i < 5) {
+        pool_put(?pool, ?table, i);
+        i = i + 1;
+    }
+    if (pool_trim(?pool, ?table, $offset_of(TestPooled, generation)) != 3) { ret 3; }
+    if (pool.floor != 11)                                                  { ret 4; }
+    if (!destroyed(?table))                                                { ret 5; }
+    ret 0;
+}

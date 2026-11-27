@@ -1,0 +1,341 @@
+# UTF-8 encoding, decoding, and validation
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.size.usize;
+
+pub def Codepoint: u32;
+
+pub val REPLACEMENT:   Codepoint = 0xFFFD;
+pub val MAX_CODEPOINT: Codepoint = 0x10FFFF;
+
+# return the sequence length from a UTF-8 leading byte
+# ---
+# first_byte: the first byte of a UTF-8 sequence
+# ret:        1-4 for valid leading bytes, 0 for invalid
+pub fun byte_len(first_byte: u8) usize {
+    if (first_byte < 0x80) { ret 1; }
+    if (first_byte < 0xC0) { ret 0; }
+    if (first_byte < 0xE0) { ret 2; }
+    if (first_byte < 0xF0) { ret 3; }
+    if (first_byte < 0xF8) { ret 4; }
+    ret 0;
+}
+
+# return how many bytes are needed to encode a codepoint
+# ---
+# cp:  the codepoint to measure
+# ret: 1-4 for valid codepoints, 0 if > U+10FFFF
+pub fun codepoint_len(cp: Codepoint) usize {
+    if (cp <= 0x7F)     { ret 1; }
+    if (cp <= 0x7FF)    { ret 2; }
+    if (cp <= 0xFFFF)   { ret 3; }
+    if (cp <= 0x10FFFF) { ret 4; }
+    ret 0;
+}
+
+# true if the byte is a UTF-8 continuation byte (0x80-0xBF)
+# ---
+# b:   byte to test
+# ret: true if continuation byte
+pub fun is_continuation(b: u8) bool {
+    ret b >= 0x80 && b < 0xC0;
+}
+
+# encode a codepoint into a byte buffer
+# ---
+# cp:  codepoint to encode
+# buf: destination buffer
+# len: size of buf in bytes
+# ret: bytes written (0 if buf too small or invalid codepoint)
+pub fun encode(cp: Codepoint, buf: *u8, len: usize) usize {
+    val need: usize = codepoint_len(cp);
+    if (need == 0 || need > len) { ret 0; }
+
+    if (cp >= 0xD800 && cp <= 0xDFFF) { ret 0; }
+
+    if (need == 1) {
+        @buf = cp::u8;
+        ret 1;
+    }
+
+    if (need == 2) {
+        @buf = (0xC0 | ((cp >> 6) & 0x1F))::u8;
+        val p1: *u8 = (buf::usize + 1)::*u8;
+        @p1 = (0x80 | (cp & 0x3F))::u8;
+        ret 2;
+    }
+
+    if (need == 3) {
+        @buf = (0xE0 | ((cp >> 12) & 0x0F))::u8;
+        val p1: *u8 = (buf::usize + 1)::*u8;
+        @p1 = (0x80 | ((cp >> 6) & 0x3F))::u8;
+        val p2: *u8 = (buf::usize + 2)::*u8;
+        @p2 = (0x80 | (cp & 0x3F))::u8;
+        ret 3;
+    }
+
+    @buf = (0xF0 | ((cp >> 18) & 0x07))::u8;
+    val p1: *u8 = (buf::usize + 1)::*u8;
+    @p1 = (0x80 | ((cp >> 12) & 0x3F))::u8;
+    val p2: *u8 = (buf::usize + 2)::*u8;
+    @p2 = (0x80 | ((cp >> 6) & 0x3F))::u8;
+    val p3: *u8 = (buf::usize + 3)::*u8;
+    @p3 = (0x80 | (cp & 0x3F))::u8;
+    ret 4;
+}
+
+# decode one codepoint from a byte buffer
+# ---
+# buf: source buffer
+# len: number of bytes available
+# cp:  pointer to write the decoded codepoint
+# ret: bytes consumed (0 if invalid or empty; sets *cp to REPLACEMENT on error)
+pub fun decode(buf: *u8, len: usize, cp: *Codepoint) usize {
+    if (len == 0) {
+        @cp = REPLACEMENT;
+        ret 0;
+    }
+
+    val b0:      u8    = @buf;
+    val seq_len: usize = byte_len(b0);
+
+    if (seq_len == 0 || seq_len > len) {
+        @cp = REPLACEMENT;
+        ret 0;
+    }
+
+    if (seq_len == 1) {
+        @cp = b0::Codepoint;
+        ret 1;
+    }
+
+    val b1: u8 = @((buf::usize + 1)::*u8);
+    if (!is_continuation(b1)) {
+        @cp = REPLACEMENT;
+        ret 0;
+    }
+
+    if (seq_len == 2) {
+        val c: Codepoint = ((b0 & 0x1F)::Codepoint << 6)
+            | (b1 & 0x3F)::Codepoint;
+        if (c < 0x80) {
+            @cp = REPLACEMENT;
+            ret 0;
+        }
+        @cp = c;
+        ret 2;
+    }
+
+    val b2: u8 = @((buf::usize + 2)::*u8);
+    if (!is_continuation(b2)) {
+        @cp = REPLACEMENT;
+        ret 0;
+    }
+
+    if (seq_len == 3) {
+        val c: Codepoint = ((b0 & 0x0F)::Codepoint << 12)
+            | ((b1 & 0x3F)::Codepoint << 6)
+            | (b2 & 0x3F)::Codepoint;
+        if (c < 0x800) {
+            @cp = REPLACEMENT;
+            ret 0;
+        }
+        if (c >= 0xD800 && c <= 0xDFFF) {
+            @cp = REPLACEMENT;
+            ret 0;
+        }
+        @cp = c;
+        ret 3;
+    }
+
+    val b3: u8 = @((buf::usize + 3)::*u8);
+    if (!is_continuation(b3)) {
+        @cp = REPLACEMENT;
+        ret 0;
+    }
+
+    val c: Codepoint = ((b0 & 0x07)::Codepoint << 18)
+        | ((b1 & 0x3F)::Codepoint << 12)
+        | ((b2 & 0x3F)::Codepoint << 6)
+        | (b3 & 0x3F)::Codepoint;
+    if (c < 0x10000) {
+        @cp = REPLACEMENT;
+        ret 0;
+    }
+    if (c > 0x10FFFF) {
+        @cp = REPLACEMENT;
+        ret 0;
+    }
+    @cp = c;
+    ret 4;
+}
+
+# check if a byte buffer contains valid UTF-8
+# ---
+# buf: source buffer
+# len: number of bytes
+# ret: true if the entire buffer is valid UTF-8
+pub fun validate(buf: *u8, len: usize) bool {
+    var i: usize = 0;
+    for (i < len) {
+        val b0:      u8    = @((buf::usize + i)::*u8);
+        val seq_len: usize = byte_len(b0);
+
+        if (seq_len == 0)      { ret false; }
+        if (i + seq_len > len) { ret false; }
+
+        if (seq_len == 1) {
+            i = i + 1;
+            cnt;
+        }
+
+        val b1: u8 = @((buf::usize + i + 1)::*u8);
+        if (!is_continuation(b1)) { ret false; }
+
+        if (seq_len == 2) {
+            val c: Codepoint = ((b0 & 0x1F)::Codepoint << 6)
+                | (b1 & 0x3F)::Codepoint;
+            if (c < 0x80) { ret false; }
+            i = i + 2;
+            cnt;
+        }
+
+        val b2: u8 = @((buf::usize + i + 2)::*u8);
+        if (!is_continuation(b2)) { ret false; }
+
+        if (seq_len == 3) {
+            val c: Codepoint = ((b0 & 0x0F)::Codepoint << 12)
+                | ((b1 & 0x3F)::Codepoint << 6)
+                | (b2 & 0x3F)::Codepoint;
+            if (c < 0x800)                  { ret false; }
+            if (c >= 0xD800 && c <= 0xDFFF) { ret false; }
+            i = i + 3;
+            cnt;
+        }
+
+        val b3: u8 = @((buf::usize + i + 3)::*u8);
+        if (!is_continuation(b3)) { ret false; }
+
+        val c: Codepoint = ((b0 & 0x07)::Codepoint << 18)
+            | ((b1 & 0x3F)::Codepoint << 12)
+            | ((b2 & 0x3F)::Codepoint << 6)
+            | (b3 & 0x3F)::Codepoint;
+        if (c < 0x10000)  { ret false; }
+        if (c > 0x10FFFF) { ret false; }
+
+        i = i + 4;
+    }
+    ret true;
+}
+
+# count the number of codepoints in a UTF-8 byte buffer
+# ---
+# buf: source buffer
+# len: number of bytes
+# ret: number of codepoints (counts sequence starts, not bytes)
+pub fun count(buf: *u8, len: usize) usize {
+    var n: usize = 0;
+    var i: usize = 0;
+    for (i < len) {
+        val b: u8 = @((buf::usize + i)::*u8);
+        if (!is_continuation(b)) {
+            n = n + 1;
+        }
+        i = i + 1;
+    }
+    ret n;
+}
+
+# the length boundaries of lead bytes and of code points
+test utf8__lengths {
+    if (byte_len(0x7F) != 1 || byte_len(0x80) != 0 || byte_len(0xBF) != 0) { ret 1; }
+    if (byte_len(0xC0) != 2 || byte_len(0xDF) != 2)                        { ret 2; }
+    if (byte_len(0xE0) != 3 || byte_len(0xEF) != 3)                        { ret 3; }
+    if (byte_len(0xF0) != 4 || byte_len(0xF7) != 4 || byte_len(0xF8) != 0) { ret 4; }
+    if (codepoint_len(0x7F) != 1 || codepoint_len(0x80) != 2)              { ret 5; }
+    if (codepoint_len(0x7FF) != 2 || codepoint_len(0x800) != 3)            { ret 6; }
+    if (codepoint_len(0xFFFF) != 3 || codepoint_len(0x10000) != 4)         { ret 7; }
+    if (codepoint_len(0x10FFFF) != 4 || codepoint_len(0x110000) != 0)      { ret 8; }
+    ret 0;
+}
+
+# whether cp encodes to its codepoint_len bytes and decodes back
+#[testing]
+fun round_trips(cp: Codepoint, buf: *u8) bool {
+    val n: usize = encode(cp, buf, 8);
+    if (n == 0 || n != codepoint_len(cp)) { ret false; }
+    var back: Codepoint;
+    ret decode(buf, 8, ?back) == n && back == cp;
+}
+
+# every sequence length encodes and decodes back, bytes exact
+test utf8__encode_decode_round_trip {
+    var buf: [8]u8;
+    if (!round_trips(0x41, ?buf[0]))                                          { ret 1; }
+    if (!round_trips(0xE9, ?buf[0]))                                          { ret 2; }
+    if (buf[0] != 0xC3 || buf[1] != 0xA9)                                     { ret 3; }
+    if (!round_trips(0x20AC, ?buf[0]))                                        { ret 4; }
+    if (buf[0] != 0xE2 || buf[1] != 0x82 || buf[2] != 0xAC)                   { ret 5; }
+    if (!round_trips(0x1D11E, ?buf[0]))                                       { ret 6; }
+    if (buf[0] != 0xF0 || buf[1] != 0x9D || buf[2] != 0x84 || buf[3] != 0x9E) { ret 7; }
+    if (!round_trips(0x10FFFF, ?buf[0]))                                      { ret 8; }
+    ret 0;
+}
+
+# surrogates, code points past U+10FFFF and a short buffer encode nothing
+test utf8__encode_rejects {
+    var buf: [8]u8;
+    if (encode(0xD800, ?buf[0], 8) != 0 || encode(0xDFFF, ?buf[0], 8) != 0) { ret 1; }
+    if (encode(0x110000, ?buf[0], 8) != 0)                                  { ret 2; }
+    if (encode(0xE9, ?buf[0], 1) != 0 || encode(0x1D11E, ?buf[0], 3) != 0)  { ret 3; }
+    ret 0;
+}
+
+# whether decoding the n bytes at buf fails with the replacement
+#[testing]
+fun decode_fails(buf: *u8, n: usize) bool {
+    var cp: Codepoint = 0;
+    ret decode(buf, n, ?cp) == 0 && cp == REPLACEMENT;
+}
+
+# a stray continuation, a bad continuation, a truncated sequence, overlong
+# forms, a surrogate and a code point past U+10FFFF are each rejected
+test utf8__decode_rejects {
+    var stray:     [1]u8 = [1]u8{0x80};
+    var bad_cont:  [2]u8 = [2]u8{0xC3, 0x00};
+    var truncated: [2]u8 = [2]u8{0xE2, 0x82};
+    var over2:     [2]u8 = [2]u8{0xC0, 0x81};
+    var over3:     [3]u8 = [3]u8{0xE0, 0x80, 0x80};
+    var over4:     [4]u8 = [4]u8{0xF0, 0x80, 0x80, 0x80};
+    var surrogate: [3]u8 = [3]u8{0xED, 0xA0, 0x80};
+    var above:     [4]u8 = [4]u8{0xF4, 0x90, 0x80, 0x80};
+    if (!decode_fails(?stray[0], 1))     { ret 1; }
+    if (!decode_fails(?bad_cont[0], 2))  { ret 2; }
+    if (!decode_fails(?truncated[0], 2)) { ret 3; }
+    if (!decode_fails(?over2[0], 2))     { ret 4; }
+    if (!decode_fails(?over3[0], 3))     { ret 5; }
+    if (!decode_fails(?over4[0], 4))     { ret 6; }
+    if (!decode_fails(?surrogate[0], 3)) { ret 7; }
+    if (!decode_fails(?above[0], 4))     { ret 8; }
+    var empty: Codepoint = 0;
+    if (decode(?stray[0], 0, ?empty) != 0) { ret 9; }
+    ret 0;
+}
+
+# validate accepts every length and the empty buffer, and refuses a bad lead,
+# a sequence cut off at the end, a surrogate and an overlong form
+test utf8__validate {
+    var ok: [10]u8 = [10]u8{0x48, 0xC3, 0xA9, 0xE2, 0x82, 0xAC, 0xF0, 0x9D, 0x84, 0x9E};
+    if (!validate(?ok[0], 10)) { ret 1; }
+    if (!validate(?ok[0], 0))  { ret 2; }
+    if (validate(?ok[0], 9))   { ret 3; }
+    var lead: [3]u8 = [3]u8{0x48, 0xFF, 0xA9};
+    if (validate(?lead[0], 3)) { ret 4; }
+    var surrogate: [3]u8 = [3]u8{0xED, 0xA0, 0x80};
+    if (validate(?surrogate[0], 3)) { ret 5; }
+    var over: [2]u8 = [2]u8{0xC0, 0x81};
+    if (validate(?over[0], 2)) { ret 6; }
+    ret 0;
+}

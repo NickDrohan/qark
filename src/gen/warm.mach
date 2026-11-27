@@ -120,7 +120,7 @@ pub fun reap_if_dead(w: *Warm) {
 
 fun null_device() usize {
     var name: str = "/dev/null";
-    $if ($mach.build.os == $mach.os.windows) {
+    $if ($mach.build.sys == $mach.sys.windows) {
         name = "NUL";
     }
     var h: usize = os.INVALID_HANDLE;

@@ -1,0 +1,47 @@
+[project]
+id = "relroprobe"
+version = "0.0.0"
+mach = "^6"
+src = "src"
+out = "out/{target.name}/{profile.name}"
+
+[target.linux]
+isa = "x86_64"
+os  = "linux"
+abi = "sysv64"
+
+[target.linux-arm64]
+isa = "aarch64"
+os  = "linux"
+abi = "aapcs64"
+
+[target.linux-riscv64]
+isa = "riscv64"
+os  = "linux"
+abi = "lp64"
+
+[profile.debug]
+opt = 0
+debug = true
+simd = "scalarize"
+vectorize = false
+float_reassoc = false
+
+[artifact.relro_happy]
+kind = "bin"
+entry = "happy.mach"
+out = "bin/relro_happy"
+targets = ["*"]
+link = []
+need = []
+
+[artifact.relro_fault]
+kind = "bin"
+entry = "fault.mach"
+out = "bin/relro_fault"
+targets = ["*"]
+link = []
+need = []
+
+[dep.std]
+path = "dep/std"

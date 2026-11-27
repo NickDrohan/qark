@@ -1,0 +1,255 @@
+# integer math utilities
+
+use std.types.bool.bool;
+use std.types.bool.false;
+
+val I64_MIN: i64 = -9223372036854775808;
+val I64_MAX: i64 = 9223372036854775807;
+
+# return the smaller of two signed integers
+# ---
+# a:   first value
+# b:   second value
+# ret: the smaller of a and b
+pub fun min(a: i64, b: i64) i64 {
+    if (a < b) { ret a; }
+    ret b;
+}
+
+# return the larger of two signed integers
+# ---
+# a:   first value
+# b:   second value
+# ret: the larger of a and b
+pub fun max(a: i64, b: i64) i64 {
+    if (a > b) { ret a; }
+    ret b;
+}
+
+# clamp a signed integer to the range [lo, hi]
+# ---
+# v:   value to clamp
+# lo:  lower bound
+# hi:  upper bound
+# ret: v clamped to [lo, hi]
+pub fun clamp(v: i64, lo: i64, hi: i64) i64 {
+    if (v < lo) { ret lo; }
+    if (v > hi) { ret hi; }
+    ret v;
+}
+
+# return the absolute value of a signed integer
+#
+# saturates at I64_MAX for I64_MIN input.
+# ---
+# v:   value
+# ret: absolute value of v
+pub fun abs(v: i64) i64 {
+    if (v == I64_MIN) { ret I64_MAX; }
+    if (v < 0)        { ret 0 - v; }
+    ret v;
+}
+
+# return the smaller of two unsigned integers
+# ---
+# a:   first value
+# b:   second value
+# ret: the smaller of a and b
+pub fun umin(a: u64, b: u64) u64 {
+    if (a < b) { ret a; }
+    ret b;
+}
+
+# return the larger of two unsigned integers
+# ---
+# a:   first value
+# b:   second value
+# ret: the larger of a and b
+pub fun umax(a: u64, b: u64) u64 {
+    if (a > b) { ret a; }
+    ret b;
+}
+
+# clamp an unsigned integer to the range [lo, hi]
+# ---
+# v:   value to clamp
+# lo:  lower bound
+# hi:  upper bound
+# ret: v clamped to [lo, hi]
+pub fun uclamp(v: u64, lo: u64, hi: u64) u64 {
+    if (v < lo) { ret lo; }
+    if (v > hi) { ret hi; }
+    ret v;
+}
+
+# check whether a value is a power of two
+# ---
+# v:   value to check
+# ret: true if v is a non-zero power of two
+pub fun is_pow2(v: u64) bool {
+    if (v == 0) { ret false; }
+    ret (v & (v - 1)) == 0;
+}
+
+# round up to the next power of two
+#
+# returns v if already a power of two, 1 if v is 0.
+# ---
+# v:   value to round up
+# ret: next power of two >= v
+pub fun next_pow2(v: u64) u64 {
+    if (v == 0) { ret 1; }
+    var n: u64 = v - 1;
+    n = n | (n >> 1);
+    n = n | (n >> 2);
+    n = n | (n >> 4);
+    n = n | (n >> 8);
+    n = n | (n >> 16);
+    n = n | (n >> 32);
+    ret n + 1;
+}
+
+# compute the floor of log base 2
+#
+# returns 0 for v == 0 (undefined).
+# ---
+# v:   value
+# ret: floor(log2(v))
+pub fun log2(v: u64) u64 {
+    if (v == 0) { ret 0; }
+    var n: u64 = 0;
+    var x: u64 = v;
+    if (x >= 4294967296) {
+        n = n + 32;
+        x = x >> 32;
+    }
+    if (x >= 65536) {
+        n = n + 16;
+        x = x >> 16;
+    }
+    if (x >= 256) {
+        n = n + 8;
+        x = x >> 8;
+    }
+    if (x >= 16) {
+        n = n + 4;
+        x = x >> 4;
+    }
+    if (x >= 4) {
+        n = n + 2;
+        x = x >> 2;
+    }
+    if (x >= 2) { n = n + 1; }
+    ret n;
+}
+
+# ceiling division of two unsigned integers
+# ---
+# a:   dividend
+# b:   divisor (must not be 0)
+# ret: ceil(a / b)
+pub fun ceil_div(a: u64, b: u64) u64 {
+    ret (a + b - 1) / b;
+}
+
+# saturating signed addition
+#
+# clamps the result to [I64_MIN, I64_MAX] on overflow.
+# ---
+# a:   first operand
+# b:   second operand
+# ret: a + b, saturated
+pub fun sat_add(a: i64, b: i64) i64 {
+    val result: i64 = a + b;
+    if (b > 0 && result < a) { ret I64_MAX; }
+    if (b < 0 && result > a) { ret I64_MIN; }
+    ret result;
+}
+
+# saturating signed subtraction
+#
+# clamps the result to [I64_MIN, I64_MAX] on overflow.
+# ---
+# a:   first operand
+# b:   second operand
+# ret: a - b, saturated
+pub fun sat_sub(a: i64, b: i64) i64 {
+    val result: i64 = a - b;
+    if (b < 0 && result < a) { ret I64_MAX; }
+    if (b > 0 && result > a) { ret I64_MIN; }
+    ret result;
+}
+
+# saturating signed multiplication
+#
+# clamps the result to [I64_MIN, I64_MAX] on overflow.
+# ---
+# a:   first operand
+# b:   second operand
+# ret: a * b, saturated
+pub fun sat_mul(a: i64, b: i64) i64 {
+    if (a == 0 || b == 0) { ret 0; }
+    if (a == I64_MIN) {
+        if (b > 0) { ret I64_MIN; }
+        ret I64_MAX;
+    }
+    if (b == I64_MIN) {
+        if (a > 0) { ret I64_MIN; }
+        ret I64_MAX;
+    }
+    val result: i64 = a * b;
+    if (result / a != b) {
+        if ((a > 0 && b > 0) || (a < 0 && b < 0)) { ret I64_MAX; }
+        ret I64_MIN;
+    }
+    ret result;
+}
+
+test abs__i64_min_saturates {
+    if (abs(-42) != 42)          { ret 1; }
+    if (abs(I64_MIN) != I64_MAX) { ret 2; }
+    ret 0;
+}
+
+test next_pow2__rounds_up_to_a_power {
+    if (next_pow2(0) != 1)                   { ret 1; }
+    if (next_pow2(16) != 16)                 { ret 2; }
+    if (next_pow2(1000) != 1024)             { ret 3; }
+    if (next_pow2(4294967297) != 8589934592) { ret 4; }
+    ret 0;
+}
+
+test log2__floors_across_every_shift {
+    if (log2(0) != 0)                   { ret 1; }
+    if (log2(1) != 0)                   { ret 2; }
+    if (log2(3) != 1)                   { ret 3; }
+    if (log2(100) != 6)                 { ret 4; }
+    if (log2(65535) != 15)              { ret 5; }
+    if (log2(4294967296) != 32)         { ret 6; }
+    if (log2(0xffffffffffffffff) != 63) { ret 7; }
+    ret 0;
+}
+
+test sat_add__saturates_both_ways {
+    if (sat_add(-3, 5) != 2)                  { ret 1; }
+    if (sat_add(I64_MAX, 1) != I64_MAX)       { ret 2; }
+    if (sat_add(I64_MIN, I64_MIN) != I64_MIN) { ret 3; }
+    ret 0;
+}
+
+test sat_sub__saturates_both_ways {
+    if (sat_sub(-3, -5) != 2)            { ret 1; }
+    if (sat_sub(I64_MAX, -1) != I64_MAX) { ret 2; }
+    if (sat_sub(I64_MIN, 1) != I64_MIN)  { ret 3; }
+    ret 0;
+}
+
+test sat_mul__saturates_by_sign {
+    if (sat_mul(0, I64_MIN) != 0)        { ret 1; }
+    if (sat_mul(-3, 5) != -15)           { ret 2; }
+    if (sat_mul(I64_MAX, 2) != I64_MAX)  { ret 3; }
+    if (sat_mul(-2, I64_MAX) != I64_MIN) { ret 4; }
+    if (sat_mul(I64_MIN, 2) != I64_MIN)  { ret 5; }
+    if (sat_mul(-1, I64_MIN) != I64_MAX) { ret 6; }
+    ret 0;
+}

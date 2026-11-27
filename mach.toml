@@ -1,32 +1,32 @@
 [project]
 id = "qark"
 version = "0.3.1"
-mach = "^6.0"
+mach = "^7"
 src = "src"
-out = "out/{target.name}/{profile.name}"
+work = "out/{target.name}/{profile.name}"
 
 [target.linux-x86_64]
-isa = "x86_64"
-os  = "linux"
+arch = "x86_64"
+sys  = "linux"
 abi = "sysv64"
 
 [target.windows-x86_64]
-isa = "x86_64"
-os  = "windows"
+arch = "x86_64"
+sys  = "windows"
 abi = "win64"
 stack_reserve = 67108864
 stack_commit = 65536
 
 [target.darwin-x86_64]
-isa = "x86_64"
-os  = "darwin"
+arch = "x86_64"
+sys  = "darwin"
 abi = "sysv64"
 
 [artifact.qark]
 kind = "bin"
 default = true
 entry = "main.mach"
-out = "bin/qark{artifact.suffix}"
+out = "{project.work}/bin/qark{artifact.suffix}"
 targets = ["*"]
 link = ["kernel32"]
 need = []
@@ -34,7 +34,7 @@ need = []
 [artifact.qa]
 kind = "bin"
 entry = "dev/qa.mach"
-out = "bin/qa{artifact.suffix}"
+out = "{project.work}/bin/qa{artifact.suffix}"
 targets = ["*"]
 link = ["kernel32"]
 need = []
@@ -42,7 +42,7 @@ need = []
 [artifact.tests]
 kind = "static"
 entry = "test/all.mach"
-out = "lib/tests{artifact.suffix}"
+out = "{project.work}/lib/tests{artifact.suffix}"
 targets = ["*"]
 link = ["kernel32"]
 need = []
@@ -50,25 +50,21 @@ need = []
 [link.kernel32]
 source = "system"
 name = "kernel32.dll"
-os = ["windows"]
-isa = ["*"]
+sys = ["windows"]
+arch = ["*"]
 abi = ["*"]
 export = false
 
 [profile.debug]
 default = true
-opt = 0
+optimize = false
 debug = true
 simd = "scalarize"
-vectorize = false
-float_reassoc = false
 
 [profile.release]
-opt = 2
+optimize = true
 debug = false
 simd = "scalarize"
-vectorize = true
-float_reassoc = false
 
 [dep.std]
 git = "https://github.com/briar-systems/mach-std"

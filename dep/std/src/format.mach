@@ -1,0 +1,1561 @@
+# formatting primitives
+#
+# writes formatted data to any io.Writer without allocation.
+#
+# format strings fill `{}` holes from the arguments in order, each rendered by
+# its type: signed/unsigned integers (8 to 128 bits) in decimal, str as text, ptr as
+# 0x-hex, f64 as the shortest round-trippable decimal. f32 widens to f64 (an
+# exact widening) and prints as that value, so it has no f32-specific shortest
+# round-trip, an inexact f32 shows the full f64 expansion of its widened value.
+# bool and char share u8's
+# representation, so they render as their numeric value, a bool prints 1 or 0;
+# reach for the `{:c}` spec to render an integer's low byte as a character.
+#
+# a hole may carry a spec after `:`, a leading `<` to left-align (pad on the
+# right), `x`/`X` for lower/upper hex, `b` for binary, `c` for a low-byte char, a
+# decimal minimum width, and a leading `0` to zero-pad rather than space-pad (e.g.
+# `{:x}`, `{:b}`, `{:c}`, `{:5}`, `{:<5}`, `{:08x}`). hex and binary render a
+# signed integer's two's-complement pattern, at 64 bits for widths up to 64 and
+# at 128 for i128. width pads on the left (right-align) by default. `{{` and `}}`
+# emit literal braces. a hole/argument count mismatch is an error in either
+# direction, and an argument of a type with no rendering is a compile error.
+#
+# the write_* primitives report the writer's own outcome, a WriteError whose
+# payload is the prefix this call persisted before the failure. vformat, format
+# and sprint add the format string's failures on top as a FormatError, whose
+# `write` case carries the same prefix, so a caller always knows how many bytes
+# reached the sink.
+
+use A: std.allocator;
+use std.allocator.fixed;
+use std.system.capability;
+
+$if (capability.HOSTED) {
+    use std.allocator.testing;
+}
+
+use io_error: std.io.error;
+use std.io.writer;
+use std.io.writer.WriteError;
+use std.math.bignum;
+use std.memory;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.char.char;
+use std.types.error.err;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_equals;
+use std.types.string.str_len;
+
+# every way a format can fail beyond the writer's own outcome
+# ---
+# syntax:     the format string is malformed; payload is the byte offset of
+#             the offending brace or spec
+# few_holes:  more arguments than holes; payload is the offset where the scan
+#             ended with an argument still unrendered
+# many_holes: more holes than arguments; payload is the offset of the hole
+#             no argument fills
+# write:      the sink failed; payload carries the persisted prefix and cause
+# alloc:      sprint's result buffer was refused; nothing was written
+pub tag FormatError: u8 {
+    syntax:     usize;
+    few_holes:  usize;
+    many_holes: usize;
+    write:      WriteError;
+    alloc:      A.Error;
+}
+
+# a sink refusing bytes past its capacity reports the exhaustion with the
+# bytes it accepted before refusing
+fun capacity_exhausted(accepted: usize) WriteError {
+    ret writer.native_failure(accepted, io_error.make(io_error.RESOURCE_EXHAUSTED, io_error.OP_WRITE));
+}
+
+# adapt writer.write_all's outcome to format's byte-count result
+fun write_full(w: *writer.Writer, buf: *u8, len: usize) res[usize, WriteError] {
+    val e: err[WriteError] = writer.write_all(w, buf, len);
+    if (sel e.err) { ret res[usize, WriteError].err{e.err}; }
+    ret res[usize, WriteError].ok{len};
+}
+
+# write raw bytes to a writer
+# ---
+# w:   target writer
+# buf: source buffer
+# len: number of bytes to write
+# ret: bytes written, or the writer's failure with the persisted prefix
+pub fun write_bytes(w: *writer.Writer, buf: *u8, len: usize) res[usize, WriteError] {
+    ret write_full(w, buf, len);
+}
+
+# write a null-terminated string to a writer
+# ---
+# w:   target writer
+# s:   string to write (nil treated as empty)
+# ret: bytes written, or the writer's failure with the persisted prefix
+pub fun write_str(w: *writer.Writer, s: str) res[usize, WriteError] {
+    if (s == nil) { ret res[usize, WriteError].ok{0}; }
+    ret write_full(w, s, str_len(s));
+}
+
+# write a single byte to a writer
+# ---
+# w:   target writer
+# b:   byte to write
+# ret: 1 on success, or the writer's failure
+pub fun write_byte(w: *writer.Writer, b: u8) res[usize, WriteError] {
+    val x: u8 = b;
+    ret write_full(w, ?x, 1);
+}
+
+# write a linefeed to a writer
+# ---
+# w:   target writer
+# ret: 1 on success, or the writer's failure
+pub fun write_newline(w: *writer.Writer) res[usize, WriteError] {
+    ret write_byte(w, '\n');
+}
+
+# write an unsigned integer in decimal
+# ---
+# w:   target writer
+# n:   value to format
+# ret: bytes written, or the writer's failure with the persisted prefix
+pub fun write_u64(w: *writer.Writer, n: u64) res[usize, WriteError] {
+    var buf: [DECIMAL_MAX]u8;
+    ret write_full(w, ?buf[0], put_u64(?buf[0], n));
+}
+
+# write a signed integer in decimal
+# ---
+# w:   target writer
+# n:   value to format
+# ret: bytes written, or the writer's failure with the persisted prefix
+pub fun write_i64(w: *writer.Writer, n: i64) res[usize, WriteError] {
+    var buf: [DECIMAL_MAX]u8;
+    ret write_full(w, ?buf[0], put_i64(?buf[0], n));
+}
+
+# the most bytes put_u64 or put_i64 writes
+pub val DECIMAL_MAX: usize = 20;
+
+# write an unsigned integer in decimal into storage
+#
+# writes exactly the bytes it returns, so storage sized for this value's
+# digits suffices; DECIMAL_MAX bytes hold any value
+# ---
+# dst: storage for the digits
+# n:   value to format
+# ret: bytes written, the digits starting at dst
+pub fun put_u64(dst: *u8, n: u64) usize {
+    var buf: [DECIMAL_MAX]u8;
+    val i:   usize = put_digits(?buf[0], DECIMAL_MAX, n, 10, false, 1);
+    memory.raw_copy(dst::ptr, (?buf[i])::ptr, DECIMAL_MAX - i);
+    ret DECIMAL_MAX - i;
+}
+
+# write a signed integer in decimal into storage
+#
+# writes exactly the bytes it returns, so storage sized for this value's sign
+# and digits suffices; DECIMAL_MAX bytes hold any value
+# ---
+# dst: storage for the sign and digits
+# n:   value to format
+# ret: bytes written, a leading `-` then the digits starting at dst
+pub fun put_i64(dst: *u8, n: i64) usize {
+    if (n >= 0) { ret put_u64(dst, n::u64); }
+    dst[0] = '-';
+    ret 1 + put_u64((dst::usize + 1)::*u8, ~(n::u64) + 1);
+}
+
+# write a 64-bit value in hexadecimal
+# ---
+# w:     target writer
+# n:     value to format
+# upper: true for uppercase (A-F), false for lowercase (a-f)
+# ret:   bytes written, or the writer's failure with the persisted prefix
+pub fun write_hex_u64(w: *writer.Writer, n: u64, upper: bool) res[usize, WriteError] {
+    var buf: [16]u8;
+    val i:   usize = put_digits(?buf[0], 16, n, 16, upper, 1);
+    ret write_full(w, ?buf[i], 16 - i);
+}
+
+# render v in radix backward into buf, ending just before index at
+# ---
+# the digits are zero-filled to at least min; buf must hold them all.
+# ret: the index of the first digit
+fun put_digits(buf: *u8, at: usize, v: u64, radix: u64, upper: bool, min: usize) usize {
+    var a: u8 = 'a';
+    if (upper) { a = 'A'; }
+
+    var i: usize = at;
+    var x: u64   = v;
+    for (x > 0 || at - i < min) {
+        val d: u8 = (x % radix)::u8;
+        x = x / radix;
+        i = i - 1;
+        if (d < 10) { buf[i] = d + '0'; }
+        or          { buf[i] = (d - 10) + a; }
+    }
+    ret i;
+}
+
+# render a 128-bit v in radix backward into buf, ending just before index at
+# ---
+# while v exceeds a u64 its low digits are peeled off in the widest chunk a u64
+# holds, so a value that fits a u64 costs no 128-bit division.
+# ret: the index of the first digit
+fun put_digits_128(buf: *u8, at: usize, v: u128, radix: u64, upper: bool) usize {
+    val top:   u64   = 0xFFFFFFFFFFFFFFFF;
+    var chunk: u64   = radix;
+    var width: usize = 1;
+    for (chunk <= top / radix) {
+        chunk = chunk * radix;
+        width = width + 1;
+    }
+
+    var i: usize = at;
+    var x: u128  = v;
+    for (x > top::u128) {
+        i = put_digits(buf, i, (x % chunk::u128)::u64, radix, upper, width);
+        x = x / chunk::u128;
+    }
+    ret put_digits(buf, i, x::u64, radix, upper, 1);
+}
+
+# write a pointer as 0x followed by hex digits
+# ---
+# w:   target writer
+# p:   pointer to format
+# ret: bytes written, or the writer's failure with the persisted prefix
+pub fun write_ptr(w: *writer.Writer, p: ptr) res[usize, WriteError] {
+    val r1: res[usize, WriteError] = write_str(w, "0x");
+    if (sel r1.err) { ret r1; }
+
+    val r2: res[usize, WriteError] = write_hex_u64(w, p::usize::u64, false);
+    if (sel r2.err) { ret res[usize, WriteError].err{writer.advance(r2.err, r1.ok)}; }
+
+    ret res[usize, WriteError].ok{r1.ok + r2.ok};
+}
+
+# number of significant bits in v (0 when v == 0)
+fun bitlen_u64(v: u64) usize {
+    var n: usize = 0;
+    var x: u64   = v;
+    for (x > 0) {
+        n = n + 1;
+        x = x >> 1;
+    }
+    ret n;
+}
+
+# shortest round-trippable decimal digits of v = f * 2^e (f != 0)
+# writes digit values 0..9 into buf, the count into out_n, and the decimal
+# exponent into out_decExp such that v = 0.<buf digits> * 10^out_decExp. exact
+# bignum arithmetic, round-to-nearest-even, no magic tables.
+fun dragon4(f: u64, e: i64, buf: *u8, out_n: *usize, out_decExp: *i64) {
+    var R:  bignum.Big;
+    var S:  bignum.Big;
+    var Mp: bignum.Big;
+    var Mm: bignum.Big;
+    bignum.from_u64(?R, f);
+    if (e >= 0) {
+        if (f != 0x10000000000000) {
+            bignum.shl(?R, (e + 1)::usize);
+            bignum.from_u64(?S, 2);
+            bignum.from_u64(?Mp, 1);
+            bignum.shl(?Mp, e::usize);
+            bignum.from_u64(?Mm, 1);
+            bignum.shl(?Mm, e::usize);
+        }
+        or {
+            bignum.shl(?R, (e + 2)::usize);
+            bignum.from_u64(?S, 4);
+            bignum.from_u64(?Mp, 1);
+            bignum.shl(?Mp, (e + 1)::usize);
+            bignum.from_u64(?Mm, 1);
+            bignum.shl(?Mm, e::usize);
+        }
+    }
+    or {
+        if (e == -1074 || f != 0x10000000000000) {
+            bignum.shl(?R, 1);
+            bignum.from_u64(?S, 1);
+            bignum.shl(?S, (1 - e)::usize);
+            bignum.from_u64(?Mp, 1);
+            bignum.from_u64(?Mm, 1);
+        }
+        or {
+            bignum.shl(?R, 2);
+            bignum.from_u64(?S, 1);
+            bignum.shl(?S, (2 - e)::usize);
+            bignum.from_u64(?Mp, 2);
+            bignum.from_u64(?Mm, 1);
+        }
+    }
+
+    # estimate the decimal exponent, then scale so R/S lands in [0.1, 1).
+    val binexp: i64 = e + bitlen_u64(f)::i64 - 1;
+    var k:      i64 = (binexp * 1233) / 4096 + 1;
+    if (k >= 0) {
+        bignum.mul_pow10(?S, k::usize);
+    }
+    or {
+        bignum.mul_pow10(?R, (0 - k)::usize);
+        bignum.mul_pow10(?Mp, (0 - k)::usize);
+        bignum.mul_pow10(?Mm, (0 - k)::usize);
+    }
+    for (bignum.cmp(?R, ?S) >= 0) {
+        bignum.mul_small(?S, 10);
+        k = k + 1;
+    }
+    var r10: bignum.Big;
+    bignum.copy(?r10, ?R);
+    bignum.mul_small(?r10, 10);
+    for (bignum.cmp(?r10, ?S) < 0) {
+        bignum.mul_small(?R, 10);
+        bignum.mul_small(?Mp, 10);
+        bignum.mul_small(?Mm, 10);
+        k = k - 1;
+        bignum.copy(?r10, ?R);
+        bignum.mul_small(?r10, 10);
+    }
+
+    val even: bool  = (f & 1) == 0;
+    var nd:   usize = 0;
+    var tmp:  bignum.Big;
+    var done: bool  = false;
+    for (!done) {
+        bignum.mul_small(?R, 10);
+        bignum.mul_small(?Mp, 10);
+        bignum.mul_small(?Mm, 10);
+        var d: i64 = 0;
+        for (bignum.cmp(?R, ?S) >= 0) {
+            bignum.sub(?R, ?S);
+            d = d + 1;
+        }
+        var low: bool = false;
+        if (even) { low = bignum.cmp(?R, ?Mm) <= 0; }
+        or        { low = bignum.cmp(?R, ?Mm) < 0; }
+        bignum.copy(?tmp, ?R);
+        bignum.add(?tmp, ?Mp);
+        var high: bool = false;
+        if (even) { high = bignum.cmp(?tmp, ?S) >= 0; }
+        or        { high = bignum.cmp(?tmp, ?S) > 0; }
+
+        if (low || high) {
+            var up: bool = false;
+            if (high && !low) { up = true; }
+            or (low && !high) { up = false; }
+            or {
+                bignum.copy(?tmp, ?R);
+                bignum.shl(?tmp, 1);
+                val c: i64 = bignum.cmp(?tmp, ?S);
+                if (c > 0) { up = true; }
+                or (c < 0) { up = false; }
+                or         { up = (d & 1) == 1; }
+            }
+            if (up) { d = d + 1; }
+            done = true;
+        }
+        buf[nd] = d::u8;
+        nd      = nd + 1;
+    }
+
+    # propagate a round-up carry (terminating digit may have become 10).
+    if (buf[nd - 1] == 10) {
+        buf[nd - 1] = 0;
+        var carry: bool  = true;
+        var i:     usize = nd - 1;
+        for (carry && i > 0) {
+            buf[i - 1] = buf[i - 1] + 1;
+            if (buf[i - 1] == 10) {
+                buf[i - 1] = 0;
+                i          = i - 1;
+            }
+            or {
+                carry = false;
+            }
+        }
+        if (carry) {
+            var j: usize = nd;
+            for (j > 0) {
+                buf[j] = buf[j - 1];
+                j      = j - 1;
+            }
+            buf[0] = 1;
+            nd     = nd + 1;
+            k      = k + 1;
+        }
+    }
+    # trim trailing zeros (can appear after a round-up carry).
+    for (nd > 1 && buf[nd - 1] == 0) {
+        nd = nd - 1;
+    }
+
+    @out_n      = nd;
+    @out_decExp = k;
+}
+
+# write a 64-bit float in shortest round-trippable decimal
+# ---
+# w:   target writer
+# n:   value to format
+# ret: bytes written, or the writer's failure with the persisted prefix
+pub fun write_f64(w: *writer.Writer, n: f64) res[usize, WriteError] {
+    var bits: u64;
+    memory.raw_copy(?bits, ?n, 8);
+    val sign:     bool = (bits >> 63) != 0;
+    val exp_bits: u64  = (bits >> 52) & 0x7FF;
+    val frac:     u64  = bits & 0xFFFFFFFFFFFFF;
+
+    if (exp_bits == 0x7FF) {
+        if (frac == 0) {
+            if (sign) { ret write_str(w, "-inf"); }
+            ret write_str(w, "inf");
+        }
+        ret write_str(w, "nan");
+    }
+    if (exp_bits == 0 && frac == 0) {
+        if (sign) { ret write_str(w, "-0"); }
+        ret write_str(w, "0");
+    }
+
+    var f: u64;
+    var e: i64;
+    if (exp_bits == 0) {
+        f = frac;
+        e = -1074;
+    }
+    or {
+        f = frac | 0x10000000000000;
+        e = exp_bits::i64 - 1075;
+    }
+
+    var dig:    [32]u8;
+    var nd:     usize = 0;
+    var decExp: i64   = 0;
+    dragon4(f, e, ?dig[0], ?nd, ?decExp);
+
+    var out:  [48]u8;
+    var olen: usize = 0;
+    if (sign) {
+        out[olen] = '-';
+        olen      = olen + 1;
+    }
+
+    if (decExp > 17 || decExp < -3) {
+        out[olen] = dig[0] + '0';
+        olen      = olen + 1;
+        if (nd > 1) {
+            out[olen] = '.';
+            olen      = olen + 1;
+            var i: usize = 1;
+            for (i < nd) {
+                out[olen] = dig[i] + '0';
+                olen      = olen + 1;
+                i         = i + 1;
+            }
+        }
+        out[olen] = 'e';
+        olen      = olen + 1;
+        var ex: i64 = decExp - 1;
+        if (ex < 0) {
+            out[olen] = '-';
+            olen      = olen + 1;
+            ex        = 0 - ex;
+        }
+        var eb: [8]u8;
+        var en: usize = 0;
+        if (ex == 0) {
+            eb[0] = '0';
+            en    = 1;
+        }
+        or {
+            for (ex > 0) {
+                eb[en] = (ex % 10)::u8 + '0';
+                ex     = ex / 10;
+                en     = en + 1;
+            }
+        }
+        var j: usize = en;
+        for (j > 0) {
+            j         = j - 1;
+            out[olen] = eb[j];
+            olen      = olen + 1;
+        }
+    }
+    or (decExp <= 0) {
+        out[olen] = '0';
+        olen      = olen + 1;
+        out[olen] = '.';
+        olen      = olen + 1;
+        var z: i64 = 0 - decExp;
+        for (z > 0) {
+            out[olen] = '0';
+            olen      = olen + 1;
+            z         = z - 1;
+        }
+        var i: usize = 0;
+        for (i < nd) {
+            out[olen] = dig[i] + '0';
+            olen      = olen + 1;
+            i         = i + 1;
+        }
+    }
+    or (decExp::usize >= nd) {
+        var i: usize = 0;
+        for (i < nd) {
+            out[olen] = dig[i] + '0';
+            olen      = olen + 1;
+            i         = i + 1;
+        }
+        var z: i64 = decExp - nd::i64;
+        for (z > 0) {
+            out[olen] = '0';
+            olen      = olen + 1;
+            z         = z - 1;
+        }
+    }
+    or {
+        var i: usize = 0;
+        for (i < decExp::usize) {
+            out[olen] = dig[i] + '0';
+            olen      = olen + 1;
+            i         = i + 1;
+        }
+        out[olen] = '.';
+        olen      = olen + 1;
+        for (i < nd) {
+            out[olen] = dig[i] + '0';
+            olen      = olen + 1;
+            i         = i + 1;
+        }
+    }
+
+    ret write_bytes(w, ?out[0], olen);
+}
+
+# a parsed `{...}` hole spec
+# ---
+# left:  left-align (pad on the right) instead of the default right-align
+# radix: the integer base, 10, 16 or 2
+# upper: uppercase hex digits
+# chr:   render an integer's low byte as a character
+# zero:  pad to width with '0' instead of ' '
+# width: minimum field width in bytes
+rec Spec {
+    left:  bool;
+    radix: u64;
+    upper: bool;
+    chr:   bool;
+    zero:  bool;
+    width: usize;
+}
+
+fun plain_spec() Spec {
+    ret Spec{left: false, radix: 10, upper: false, chr: false, zero: false, width: 0};
+}
+
+# a fixed-capacity buffer writer used to size a field before padding
+rec Span {
+    buf: *u8;
+    len: usize;
+    cap: usize;
+}
+
+# writer callback appending bytes into a Span up to its capacity
+fun span_write(ctx: ptr, p: *u8, len: usize) res[usize, WriteError] {
+    val s: *Span = ctx::*Span;
+    var i: usize = 0;
+    for (i < len) {
+        if (s.len >= s.cap) { ret res[usize, WriteError].err{capacity_exhausted(i)}; }
+        s.buf[s.len] = p[i];
+        s.len        = s.len + 1;
+        i            = i + 1;
+    }
+    ret res[usize, WriteError].ok{len};
+}
+
+# parse a `{...}` hole, advancing *ip past the closing brace
+# ---
+# precondition: fmt[*ip] == '{' opening a real hole (callers handle `{{`).
+# grammar:      '{' [ ':' [ '<' ] [ '0' ] [ width ] [ 'x' | 'X' | 'b' | 'c' ] ] '}'
+# ip:           in/out format cursor
+# ret:          the parsed spec, or syntax at the offending byte
+fun parse_spec(fmt: str, ip: *usize) res[Spec, FormatError] {
+    var i:  usize = @ip + 1;
+    var sp: Spec  = plain_spec();
+
+    if (fmt[i] == '}') {
+        @ip = i + 1;
+        ret res[Spec, FormatError].ok{sp};
+    }
+    if (fmt[i] != ':') {
+        ret res[Spec, FormatError].err{FormatError.syntax{i}};
+    }
+    i = i + 1;
+
+    if (fmt[i] == '<') {
+        sp.left = true;
+        i       = i + 1;
+    }
+
+    if (fmt[i] == '0') {
+        sp.zero = true;
+        i       = i + 1;
+    }
+    for (fmt[i] >= '0' && fmt[i] <= '9') {
+        sp.width = sp.width * 10 + (fmt[i] - '0')::usize;
+        i        = i + 1;
+    }
+
+    if (fmt[i] == 'x') {
+        sp.radix = 16;
+        i        = i + 1;
+    }
+    or (fmt[i] == 'X') {
+        sp.radix = 16;
+        sp.upper = true;
+        i        = i + 1;
+    }
+    or (fmt[i] == 'b') {
+        sp.radix = 2;
+        i        = i + 1;
+    }
+    or (fmt[i] == 'c') {
+        sp.chr = true;
+        i      = i + 1;
+    }
+
+    if (fmt[i] != '}') {
+        ret res[Spec, FormatError].err{FormatError.syntax{i}};
+    }
+    @ip = i + 1;
+    ret res[Spec, FormatError].ok{sp};
+}
+
+# widest padding run handed to the writer in one call
+val PAD_CHUNK: usize = 32;
+
+# write n copies of byte b to w, a chunk of fill per call rather than a byte
+fun emit_pad(w: *writer.Writer, b: u8, n: usize) res[usize, WriteError] {
+    if (n == 0) { ret res[usize, WriteError].ok{0}; }
+
+    var fill: [PAD_CHUNK]u8;
+    var size: usize = n;
+    if (size > PAD_CHUNK) { size = PAD_CHUNK; }
+    var i: usize = 0;
+    for (i < size) {
+        fill[i] = b;
+        i       = i + 1;
+    }
+
+    var done: usize = 0;
+    for (done < n) {
+        var chunk: usize = n - done;
+        if (chunk > size) { chunk = size; }
+        val r: res[usize, WriteError] = write_full(w, ?fill[0], chunk);
+        if (sel r.err) { ret res[usize, WriteError].err{writer.advance(r.err, done)}; }
+        done = done + chunk;
+    }
+    ret res[usize, WriteError].ok{n};
+}
+
+# write a rendered field with width padding per spec
+# ---
+# right-aligned by default; a leading '-' stays ahead of '0' padding. when
+# sp.left is set, the value is written first and space-padded on the right
+# (the zero flag is ignored, trailing zeros would corrupt the value).
+# ret: total bytes written (>= len), or the writer's failure with the prefix
+fun emit_field(w: *writer.Writer, buf: *u8, len: usize, sp: *Spec) res[usize, WriteError] {
+    if (sp.width <= len) {
+        ret write_bytes(w, buf, len);
+    }
+    val pad: usize = sp.width - len;
+
+    if (sp.left) {
+        val rb: res[usize, WriteError] = write_bytes(w, buf, len);
+        if (sel rb.err) { ret rb; }
+        val rp: res[usize, WriteError] = emit_pad(w, ' ', pad);
+        if (sel rp.err) { ret res[usize, WriteError].err{writer.advance(rp.err, len)}; }
+        ret res[usize, WriteError].ok{sp.width};
+    }
+
+    if (sp.zero && len > 0 && buf[0] == '-') {
+        val r1: res[usize, WriteError] = write_byte(w, '-');
+        if (sel r1.err) { ret r1; }
+        val r2: res[usize, WriteError] = emit_pad(w, '0', pad);
+        if (sel r2.err) { ret res[usize, WriteError].err{writer.advance(r2.err, 1)}; }
+        val r3: res[usize, WriteError] = write_bytes(w, (buf::usize + 1)::*u8, len - 1);
+        if (sel r3.err) { ret res[usize, WriteError].err{writer.advance(r3.err, 1 + pad)}; }
+        ret res[usize, WriteError].ok{sp.width};
+    }
+
+    var fill: u8 = ' ';
+    if (sp.zero) { fill = '0'; }
+    val rp: res[usize, WriteError] = emit_pad(w, fill, pad);
+    if (sel rp.err) { ret rp; }
+    val rb: res[usize, WriteError] = write_bytes(w, buf, len);
+    if (sel rb.err) { ret res[usize, WriteError].err{writer.advance(rb.err, pad)}; }
+    ret res[usize, WriteError].ok{sp.width};
+}
+
+# write literal text up to the next hole, honoring `{{`/`}}`
+# ---
+# advances *ip and adds written bytes to *tp. each maximal run of literal
+# bytes reaches the writer in one call; a brace escape ends a run on its first
+# byte, so `{{` costs no extra write.
+# ret: ok{true} stopped at a hole-open `{`; ok{false} reached end of string;
+#      syntax on an unmatched `}`, or write with the prefix (*tp included)
+fun emit_literal(w: *writer.Writer, fmt: str, ip: *usize, tp: *usize) res[bool, FormatError] {
+    var i: usize = @ip;
+    for {
+        val start: usize = i;
+        for (fmt[i] != 0 && fmt[i] != '{' && fmt[i] != '}') { i = i + 1; }
+
+        var run:    usize = i - start;
+        var escape: bool  = false;
+        if (fmt[i] != 0 && fmt[i + 1] == fmt[i]) {
+            run    = run + 1;
+            escape = true;
+        }
+
+        if (run > 0) {
+            val r: res[usize, WriteError] = write_full(w, ?fmt[start], run);
+            if (sel r.err) {
+                @ip = start;
+                ret res[bool, FormatError].err{FormatError.write{writer.advance(r.err, @tp)}};
+            }
+            @tp = @tp + r.ok;
+        }
+
+        if (escape) {
+            i = i + 2;
+            cnt;
+        }
+
+        @ip = i;
+        if (fmt[i] == 0)   { ret res[bool, FormatError].ok{false}; }
+        if (fmt[i] == '{') { ret res[bool, FormatError].ok{true}; }
+        ret res[bool, FormatError].err{FormatError.syntax{i}};
+    }
+}
+
+# widest rendered integer: 128 binary digits, or a sign and 39 decimal digits
+val INT_FIELD: usize = 128;
+
+# format an integer per spec with width padding
+# ---
+# v is the value's bit pattern at its width, or its magnitude when neg. the
+# pattern renders in hex or binary, the magnitude in decimal behind a '-', and
+# {:c} renders the low byte as a char.
+fun fmt_int(w: *writer.Writer, v: u128, neg: bool, sp: *Spec) res[usize, WriteError] {
+    var buf: [INT_FIELD]u8;
+    var i:   usize = INT_FIELD;
+    if (sp.chr) {
+        i      = i - 1;
+        buf[i] = v::u8;
+    }
+    or {
+        i = put_digits_128(?buf[0], i, v, sp.radix, sp.upper);
+        if (neg) {
+            i      = i - 1;
+            buf[i] = '-';
+        }
+    }
+    ret emit_field(w, ?buf[i], INT_FIELD - i, sp);
+}
+
+# format a signed integer up to 64 bits: decimal, or the two's-complement
+# pattern of its 64-bit widening in hex and binary
+fun fmt_i64(w: *writer.Writer, v: i64, sp: *Spec) res[usize, WriteError] {
+    if (v < 0 && sp.radix == 10 && !sp.chr) {
+        ret fmt_int(w, (~(v::u64) + 1)::u128, true, sp);
+    }
+    ret fmt_int(w, v::u64::u128, false, sp);
+}
+
+# format a signed 128-bit integer: decimal, or its two's-complement pattern in
+# hex and binary
+fun fmt_i128(w: *writer.Writer, v: i128, sp: *Spec) res[usize, WriteError] {
+    if (v < 0 && sp.radix == 10 && !sp.chr) {
+        ret fmt_int(w, ~(v::u128) + 1, true, sp);
+    }
+    ret fmt_int(w, v::u128, false, sp);
+}
+
+# format a float in shortest round-trip decimal with width padding
+fun fmt_f64_field(w: *writer.Writer, v: f64, sp: *Spec) res[usize, WriteError] {
+    var scratch: [64]u8;
+    var s:       Span = Span{buf: ?scratch[0], len: 0, cap: 64};
+    var bw:      writer.Writer;
+    bw.ctx     = (?s)::ptr;
+    bw.f_write = span_write;
+
+    val r: res[usize, WriteError] = write_f64(?bw, v);
+    if (sel r.err) { ret r; }
+    ret emit_field(w, ?scratch[0], s.len, sp);
+}
+
+# format a pointer as 0x-prefixed hex with width padding
+fun fmt_ptr_field(w: *writer.Writer, p: ptr, sp: *Spec) res[usize, WriteError] {
+    var scratch: [64]u8;
+    var s:       Span = Span{buf: ?scratch[0], len: 0, cap: 64};
+    var bw:      writer.Writer;
+    bw.ctx     = (?s)::ptr;
+    bw.f_write = span_write;
+
+    val r: res[usize, WriteError] = write_ptr(?bw, p);
+    if (sel r.err) { ret r; }
+    ret emit_field(w, ?scratch[0], s.len, sp);
+}
+
+# write a string with width padding (space-padded; right-aligned
+# by default, left-aligned when sp.left is set).
+fun fmt_str_field(w: *writer.Writer, sv: str, sp: *Spec) res[usize, WriteError] {
+    var n: usize = 0;
+    if (sv != nil) { n = str_len(sv); }
+    if (sp.width <= n) {
+        ret write_str(w, sv);
+    }
+    val pad: usize = sp.width - n;
+
+    if (sp.left) {
+        val rs: res[usize, WriteError] = write_str(w, sv);
+        if (sel rs.err) { ret rs; }
+        val rp: res[usize, WriteError] = emit_pad(w, ' ', pad);
+        if (sel rp.err) { ret res[usize, WriteError].err{writer.advance(rp.err, n)}; }
+        ret res[usize, WriteError].ok{sp.width};
+    }
+
+    val rp: res[usize, WriteError] = emit_pad(w, ' ', pad);
+    if (sel rp.err) { ret rp; }
+    val rs: res[usize, WriteError] = write_str(w, sv);
+    if (sel rs.err) { ret res[usize, WriteError].err{writer.advance(rs.err, pad)}; }
+    ret res[usize, WriteError].ok{sp.width};
+}
+
+# write values in their default rendering, the `{}` of vformat without a
+# format string
+#
+# the same type-directed dispatch as vformat's holes: signed/unsigned integers
+# in decimal, str as text, ptr as 0x-hex, f64 and f32 as the shortest
+# round-trippable decimal. each value of the pack is rendered in order with
+# nothing between them; the common call passes one. a type vformat would
+# refuse at runtime is refused here at instantiation, since the pack's types
+# are known.
+# ---
+# w:   target writer
+# va:  the values to render
+# ret: bytes written, or the writer's failure with the persisted prefix
+pub fun write_value(w: *writer.Writer, va: ...) res[usize, WriteError] {
+    var sp:    Spec  = plain_spec();
+    var total: usize = 0;
+    $each arg in va {
+        var fr: res[usize, WriteError];
+        $if ($type_of(arg) == str)  { fr = fmt_str_field(w, (arg::usize)::str, ?sp); }
+        $or ($type_of(arg) == ptr)  { fr = fmt_ptr_field(w, (arg::usize)::ptr, ?sp); }
+        $or ($type_of(arg) == f64)  { fr = fmt_f64_field(w, arg::f64, ?sp); }
+        $or ($type_of(arg) == f32)  { fr = fmt_f64_field(w, arg::f64, ?sp); }
+        $or ($type_of(arg) == i128) { fr = fmt_i128(w, arg::i128, ?sp); }
+        $or ($type_of(arg) == i64)  { fr = fmt_i64(w, arg::i64, ?sp); }
+        $or ($type_of(arg) == i32)  { fr = fmt_i64(w, arg::i64, ?sp); }
+        $or ($type_of(arg) == i16)  { fr = fmt_i64(w, arg::i64, ?sp); }
+        $or ($type_of(arg) == i8)   { fr = fmt_i64(w, arg::i64, ?sp); }
+        $or ($type_of(arg) == u128) { fr = fmt_int(w, arg::u128, false, ?sp); }
+        $or ($type_of(arg) == u64)  { fr = fmt_int(w, arg::u128, false, ?sp); }
+        $or ($type_of(arg) == u32)  { fr = fmt_int(w, arg::u128, false, ?sp); }
+        $or ($type_of(arg) == u16)  { fr = fmt_int(w, arg::u128, false, ?sp); }
+        $or ($type_of(arg) == u8)   { fr = fmt_int(w, arg::u128, false, ?sp); }
+        $or                         { $error("std.format.write_value: the value's type has no default rendering; integers, floats, str and ptr do"); }
+        if (sel fr.err)             { ret res[usize, WriteError].err{writer.advance(fr.err, total)}; }
+        total = total + fr.ok;
+    }
+    ret res[usize, WriteError].ok{total};
+}
+
+# format a comptime-variadic pack into a writer (v1.7 packs)
+#
+# holes are type-directed `{}` matched to args in order: signed/unsigned int ->
+# decimal, str -> text, ptr -> 0xHEX, f64 -> shortest round-trip decimal. specs:
+# `{:x}`/`{:X}` hex, `{:b}` binary, `{:c}` low-byte char, `{:N}`/`{:0N}` minimum
+# width (right-align), `{:<N}` left-align. `{{` and `}}` are literal-brace
+# escapes. the arg sequence is comptime-unrolled and monomorphized per call, so
+# an argument of a type with no rendering is a compile error; the format scan
+# stays at runtime.
+# ---
+# w:   target writer
+# fmt: format string
+# va:  comptime variadic argument pack
+# ret: total bytes written, or the failure; a write failure carries the bytes
+#      persisted before it
+pub fun vformat(w: *writer.Writer, fmt: str, va: ...) res[usize, FormatError] {
+    var i:     usize = 0;
+    var total: usize = 0;
+
+    $each arg in va {
+        val lit: res[bool, FormatError] = emit_literal(w, fmt, ?i, ?total);
+        if (sel lit.err) { ret res[usize, FormatError].err{lit.err}; }
+        if (!lit.ok)     { ret res[usize, FormatError].err{FormatError.few_holes{i}}; }
+
+        val spr: res[Spec, FormatError] = parse_spec(fmt, ?i);
+        if (sel spr.err) { ret res[usize, FormatError].err{spr.err}; }
+        var sp: Spec = spr.ok;
+
+        # type-directed dispatch: a `$type_of` gate folds at lowering (#1472), so
+        # every arm is type-checked under each concrete arg type and only the
+        # selected arm executes. each arm casts arg to its own type, an identity
+        # cast in the taken arm; the rest are pruned before they run. a type with
+        # no rendering is refused at instantiation, since the pack's types are known.
+        var fr: res[usize, WriteError];
+        $if ($type_of(arg) == str) { fr = fmt_str_field(w, (arg::usize)::str, ?sp); }
+        $or ($type_of(arg) == ptr) { fr = fmt_ptr_field(w, (arg::usize)::ptr, ?sp); }
+        $or ($type_of(arg) == f64) { fr = fmt_f64_field(w, arg::f64, ?sp); }
+        # f32 widens to f64 (exact) and prints as that value, no f32 shortest round-trip.
+        $or ($type_of(arg) == f32)  { fr = fmt_f64_field(w, arg::f64, ?sp); }
+        $or ($type_of(arg) == i128) { fr = fmt_i128(w, arg::i128, ?sp); }
+        $or ($type_of(arg) == i64)  { fr = fmt_i64(w, arg::i64, ?sp); }
+        $or ($type_of(arg) == i32)  { fr = fmt_i64(w, arg::i64, ?sp); }
+        $or ($type_of(arg) == i16)  { fr = fmt_i64(w, arg::i64, ?sp); }
+        $or ($type_of(arg) == i8)   { fr = fmt_i64(w, arg::i64, ?sp); }
+        $or ($type_of(arg) == u128) { fr = fmt_int(w, arg::u128, false, ?sp); }
+        $or ($type_of(arg) == u64)  { fr = fmt_int(w, arg::u128, false, ?sp); }
+        $or ($type_of(arg) == u32)  { fr = fmt_int(w, arg::u128, false, ?sp); }
+        $or ($type_of(arg) == u16)  { fr = fmt_int(w, arg::u128, false, ?sp); }
+        $or ($type_of(arg) == u8)   { fr = fmt_int(w, arg::u128, false, ?sp); }
+        $or                         { $error("std.format.vformat: the argument's type has no rendering; integers, floats, str and ptr do"); }
+        if (sel fr.err)             { ret res[usize, FormatError].err{FormatError.write{writer.advance(fr.err, total)}}; }
+        total = total + fr.ok;
+    }
+
+    val tail: res[bool, FormatError] = emit_literal(w, fmt, ?i, ?total);
+    if (sel tail.err) { ret res[usize, FormatError].err{tail.err}; }
+    if (tail.ok)      { ret res[usize, FormatError].err{FormatError.many_holes{i}}; }
+
+    ret res[usize, FormatError].ok{total};
+}
+
+# format a comptime-variadic pack into a writer
+#
+# thin wrapper that forwards the whole pack to vformat.
+# ---
+# w:   target writer
+# fmt: format string
+# va:  comptime variadic argument pack
+# ret: total bytes written, or the failure
+pub fun format(w: *writer.Writer, fmt: str, va: ...) res[usize, FormatError] {
+    ret vformat(w, fmt, va...);
+}
+
+# writer callback that discards its bytes, used to measure a format's exact size
+fun measure_write(ctx: ptr, p: *u8, len: usize) res[usize, WriteError] {
+    ret res[usize, WriteError].ok{len};
+}
+
+# format a comptime-variadic pack into a freshly allocated string
+#
+# the allocating counterpart to `format`/`vformat`: renders the same `{}` holes
+# with identical type-directed dispatch and spec vocabulary, but returns a new
+# str owned by `a` rather than writing to a Writer. the result is an exact-size,
+# null-terminated allocation (str_len + 1 bytes), matching the std.types.string
+# allocating constructors and released with text.string.str_free. formats
+# twice: a measuring pass over vformat sizes the buffer, then a filling pass
+# renders into it, so no growth or trimming is needed. a format error is
+# reported before any allocation.
+# ---
+# a:   allocator for the result
+# fmt: format string
+# va:  comptime variadic argument pack
+# ret: the formatted string, or the format's failure, or alloc when the
+#      allocator refuses the buffer
+pub fun sprint(a: *A.Allocator, fmt: str, va: ...) res[str, FormatError] {
+    # measuring pass: run the format into a discarding writer to size the result
+    var mw: writer.Writer;
+    mw.ctx     = nil;
+    mw.f_write = measure_write;
+    val rc: res[usize, FormatError] = vformat(?mw, fmt, va...);
+    if (sel rc.err) { ret res[str, FormatError].err{rc.err}; }
+    val total: usize = rc.ok;
+
+    # allocate an exact-size buffer including the null terminator
+    val got: res[str, A.Error] = A.allocate[char](a, total + 1);
+    if (sel got.err) { ret res[str, FormatError].err{FormatError.alloc{got.err}}; }
+    val buf: str = got.ok;
+
+    # filling pass: render into the exact buffer; the measured size guarantees
+    # span_write never hits its capacity guard
+    var s:  Span = Span{buf: buf, len: 0, cap: total};
+    var bw: writer.Writer;
+    bw.ctx     = (?s)::ptr;
+    bw.f_write = span_write;
+    val rf: res[usize, FormatError] = vformat(?bw, fmt, va...);
+    if (sel rf.err) {
+        A.deallocate[char](a, buf, total + 1);
+        ret res[str, FormatError].err{rf.err};
+    }
+
+    buf[total] = 0;
+    ret res[str, FormatError].ok{buf};
+}
+
+$if (capability.HOSTED) {
+    # test-only buffer-backed writer used to capture write_f64 output
+    #[testing]
+    rec TestBuf {
+        data: *u8;
+        len:  usize;
+        cap:  usize;
+    }
+
+    #[testing]
+    fun testbuf_write(ctx: ptr, p: *u8, len: usize) res[usize, WriteError] {
+        val tb: *TestBuf = ctx::*TestBuf;
+        var i:  usize    = 0;
+        for (i < len) {
+            if (tb.len >= tb.cap) { ret res[usize, WriteError].err{capacity_exhausted(i)}; }
+            tb.data[tb.len] = p[i];
+            tb.len          = tb.len + 1;
+            i               = i + 1;
+        }
+        ret res[usize, WriteError].ok{len};
+    }
+
+    # format n into storage (null-terminated); returns the byte length
+    #[testing]
+    fun f64_into(n: f64, storage: *u8, cap: usize) usize {
+        var tb: TestBuf;
+        tb.data = storage;
+        tb.len  = 0;
+        tb.cap  = cap;
+        var w: writer.Writer;
+        w.ctx     = (?tb)::ptr;
+        w.f_write = testbuf_write;
+        val r: res[usize, WriteError] = write_f64(?w, n);
+        if (sel r.err) {
+            storage[0] = 0;
+            ret 0;
+        }
+        storage[tb.len] = 0;
+        ret tb.len;
+    }
+
+    # format n and compare to the expected shortest decimal
+    #[testing]
+    fun golden_eq(n: f64, want: str) bool {
+        var s: [64]u8;
+        f64_into(n, ?s[0], 64);
+        ret str_equals(?s[0], want);
+    }
+
+    # format the f64 with the given bit pattern and compare
+    #[testing]
+    fun golden_bits_eq(bits: u64, want: str) bool {
+        var n: f64;
+        memory.raw_copy(?n, ?bits, 8);
+        ret golden_eq(n, want);
+    }
+
+    # shortest round-trip decimals, plain up to 1e21 and exponent notation past it
+    test write_f64__shortest_round_trip {
+        if (!golden_eq(0.0, "0") || !golden_eq(1.0, "1") || !golden_eq(100.0, "100"))   { ret 1; }
+        if (!golden_eq(1.5, "1.5") || !golden_eq(0.5, "0.5") || !golden_eq(0.1, "0.1")) { ret 2; }
+        if (!golden_eq(-2.5, "-2.5"))                                                   { ret 3; }
+        if (!golden_eq(3.141592653589793, "3.141592653589793"))                         { ret 4; }
+        if (!golden_eq(123456.789, "123456.789"))                                       { ret 5; }
+        if (!golden_eq(1.0e10, "10000000000") || !golden_eq(1.0e-10, "1e-10"))          { ret 6; }
+        if (!golden_eq(1.0e20, "1e20") || !golden_eq(1.0e21, "1e21"))                   { ret 7; }
+        ret 0;
+    }
+
+    # extremes and specials by exact bit pattern, so they don't depend on the
+    # precision of the compiler's float-literal lexer
+    test write_f64__extremes_and_specials {
+        if (!golden_bits_eq(0x7FEFFFFFFFFFFFFF, "1.7976931348623157e308"))  { ret 1; }
+        if (!golden_bits_eq(0x0010000000000000, "2.2250738585072014e-308")) { ret 2; }
+        if (!golden_bits_eq(1, "5e-324"))                                   { ret 3; }
+        if (!golden_bits_eq(0x54B249AD2594C37D, "1e100"))                   { ret 4; }
+        if (!golden_bits_eq(0x4341C37937E08000, "10000000000000000"))       { ret 5; }
+        if (!golden_bits_eq(0x8000000000000000, "-0"))                      { ret 6; }
+        if (!golden_bits_eq(0x7FF0000000000000, "inf"))                     { ret 7; }
+        if (!golden_bits_eq(0xFFF0000000000000, "-inf"))                    { ret 8; }
+        if (!golden_bits_eq(0x7FF8000000000000, "nan"))                     { ret 9; }
+        ret 0;
+    }
+
+    # vformat a pack into storage (null-terminated); returns the outcome
+    # behavioral tests assert the captured bytes and the returned true byte count.
+    #[testing]
+    fun fmt_capture(storage: *u8, cap: usize, fmt: str, va: ...) res[usize, FormatError] {
+        var tb: TestBuf;
+        tb.data = storage;
+        tb.len  = 0;
+        tb.cap  = cap;
+        var w: writer.Writer;
+        w.ctx     = (?tb)::ptr;
+        w.f_write = testbuf_write;
+        val r: res[usize, FormatError] = vformat(?w, fmt, va...);
+        storage[tb.len] = 0;
+        ret r;
+    }
+
+    # whether a capture succeeded with exactly the expected bytes
+    #[testing]
+    fun captured(r: res[usize, FormatError], s: *u8, want: str) bool {
+        if (sel r.err) { ret false; }
+        ret str_equals(s, want);
+    }
+
+    # a heterogeneous format covering every dispatch arm (signed/unsigned int, str,
+    # f64, char via {:c}, bool, ptr) in one runtime scan; bool and char share u8's
+    # representation, so bool formats as its numeric value and {:c} renders a byte.
+    test format__mixed_types_exact_bytes {
+        var s:  [128]u8;
+        var pz: ptr                     = nil;
+        val r:  res[usize, FormatError] = fmt_capture(?s[0], 128,
+            "i={} u={} s={} f={} c={:c} b={} p={}",
+            -42::i64, 7::u64, "hi", 3.5::f64, 65::u8, true::u8, pz);
+        if (sel r.err) { ret 1; }
+        val want: str = "i=-42 u=7 s=hi f=3.5 c=A b=1 p=0x0";
+        if (!str_equals(?s[0], want)) { ret 2; }
+        # the count is the true bytes written, not the format-scan position.
+        if (r.ok != str_len(want)) { ret 3; }
+        ret 0;
+    }
+
+    # hex of either case, width, zero pad with the sign ahead of the fill, strings
+    # space-padded regardless of the zero flag, and left-align, which ignores it
+    test format__specs {
+        var s: [64]u8;
+        if (!captured(fmt_capture(?s[0], 64, "{:x}", 255::u64), ?s[0], "ff"))            { ret 1; }
+        if (!captured(fmt_capture(?s[0], 64, "{:X}", 255::u64), ?s[0], "FF"))            { ret 2; }
+        if (!captured(fmt_capture(?s[0], 64, "{:08x}", 0xABCD::u64), ?s[0], "0000abcd")) { ret 3; }
+        if (!captured(fmt_capture(?s[0], 64, "[{:5}]", 42::i64), ?s[0], "[   42]"))      { ret 4; }
+        if (!captured(fmt_capture(?s[0], 64, "[{:05}]", 42::i64), ?s[0], "[00042]"))     { ret 5; }
+        if (!captured(fmt_capture(?s[0], 64, "[{:05}]", -42::i64), ?s[0], "[-0042]"))    { ret 5; }
+        if (!captured(fmt_capture(?s[0], 64, "[{:05}]", "hi"), ?s[0], "[   hi]"))        { ret 6; }
+        if (!captured(fmt_capture(?s[0], 64, "[{:<5}]", -42::i64), ?s[0], "[-42  ]"))    { ret 7; }
+        if (!captured(fmt_capture(?s[0], 64, "[{:<05}]", 42::i64), ?s[0], "[42   ]"))    { ret 8; }
+        if (!captured(fmt_capture(?s[0], 64, "[{:<5}]", "hi"), ?s[0], "[hi   ]"))        { ret 9; }
+        if (!captured(fmt_capture(?s[0], 64, "[{:<5x}]", 255::u64), ?s[0], "[ff   ]"))   { ret 10; }
+        if (!captured(fmt_capture(?s[0], 64, "[{:<2}]", 42::i64), ?s[0], "[42]"))        { ret 11; }
+        # signed hex is the two's-complement pattern
+        if (!captured(fmt_capture(?s[0], 64, "{:x}", (-42)::i64), ?s[0], "ffffffffffffffd6")) { ret 12; }
+        if (!captured(fmt_capture(?s[0], 64, "{:b}", 10::u8), ?s[0], "1010"))                 { ret 13; }
+        if (!captured(fmt_capture(?s[0], 64, "[{:08b}]", 5::u64), ?s[0], "[00000101]"))       { ret 14; }
+        if (!captured(fmt_capture(?s[0], 64, "{:b}", 0::u64), ?s[0], "0"))                    { ret 15; }
+        ret 0;
+    }
+
+    # a hole/argument mismatch and a malformed format are classified, not
+    # described, and each carries the format offset where the scan stopped
+    test format__errors_carry_offsets {
+        var s: [64]u8;
+
+        # more arguments than holes: the scan ends at the terminator with an
+        # argument unrendered.
+        val few: res[usize, FormatError] = fmt_capture(?s[0], 64, "{}", 1::i64, 2::i64);
+        if (!sel few.err)           { ret 1; }
+        if (!sel few.err.few_holes) { ret 2; }
+        if (few.err.few_holes != 2) { ret 2; }
+
+        # more holes than arguments: the unfilled hole is reported.
+        val many: res[usize, FormatError] = fmt_capture(?s[0], 64, "{} {}", 1::i64);
+        if (!sel many.err)            { ret 3; }
+        if (!sel many.err.many_holes) { ret 4; }
+        if (many.err.many_holes != 3) { ret 4; }
+
+        # an unmatched literal brace.
+        val brace: res[usize, FormatError] = fmt_capture(?s[0], 64, "oops }", 1::i64);
+        if (!sel brace.err)        { ret 5; }
+        if (!sel brace.err.syntax) { ret 6; }
+        if (brace.err.syntax != 5) { ret 6; }
+
+        # a malformed hole spec.
+        val spec: res[usize, FormatError] = fmt_capture(?s[0], 64, "{:q}", 1::i64);
+        if (!sel spec.err)        { ret 7; }
+        if (!sel spec.err.syntax) { ret 8; }
+        if (spec.err.syntax != 2) { ret 8; }
+        ret 0;
+    }
+
+    # f32 has no shortest-round-trip of its own: the f32 dispatch arm widens to f64
+    # (exact) and formats that, so an f32 renders as its f64 value. an exactly
+    # representable f32 is unaffected; an inexact one shows the full f64 expansion.
+    test format__f32_widens_to_f64 {
+        var s: [64]u8;
+
+        if (!captured(fmt_capture(?s[0], 64, "{}", 0.5::f32), ?s[0], "0.5"))     { ret 1; }
+        if (!captured(fmt_capture(?s[0], 64, "{}", 1.25::f32), ?s[0], "1.25"))   { ret 2; }
+        if (!captured(fmt_capture(?s[0], 64, "{}", 2.0::f32), ?s[0], "2"))       { ret 3; }
+        if (!captured(fmt_capture(?s[0], 64, "{}", (-3.5)::f32), ?s[0], "-3.5")) { ret 4; }
+
+        # 0.1 is not exactly representable in f32; widening its value (bits
+        # 0x3DCCCCCD) to f64 yields the full expansion, not "0.1".
+        var x:    f32;
+        var bits: u32 = 0x3DCCCCCD;
+        memory.raw_copy(?x, ?bits, 4);
+        if (!captured(fmt_capture(?s[0], 64, "{}", x), ?s[0], "0.10000000149011612")) { ret 5; }
+        ret 0;
+    }
+
+    # every smaller integer width widens to i64/u64 and shares fmt_i64/fmt_u64; one
+    # case per width class confirms the dispatch arms and the widening.
+    test format__smaller_integer_widths {
+        var s: [64]u8;
+        if (!captured(fmt_capture(?s[0], 64, "{}", (-5)::i8), ?s[0], "-5"))                { ret 1; }
+        if (!captured(fmt_capture(?s[0], 64, "{}", (-300)::i16), ?s[0], "-300"))           { ret 2; }
+        if (!captured(fmt_capture(?s[0], 64, "{}", (-70000)::i32), ?s[0], "-70000"))       { ret 3; }
+        if (!captured(fmt_capture(?s[0], 64, "{}", 65535::u16), ?s[0], "65535"))           { ret 4; }
+        if (!captured(fmt_capture(?s[0], 64, "{}", 4000000000::u32), ?s[0], "4000000000")) { ret 5; }
+        ret 0;
+    }
+
+    # 128-bit integers render natively in every integer style, past the u64 range
+    # and at both extremes, with hex and binary over the full 128-bit pattern
+    test format__128_bit_integers {
+        var s:   [160]u8;
+        val max: u128 = ~(0::u128);
+        val min: i128 = (1::u128 << 127)::i128;
+        val big: u128 = 0x123456789ABCDEF00FEDCBA987654321;
+        val p64: u128 = 18446744073709551616;
+        val n64: i128 = -18446744073709551616;
+
+        if (!captured(fmt_capture(?s[0], 160, "{}", 0::u128), ?s[0], "0"))                                                                                                                              { ret 1; }
+        if (!captured(fmt_capture(?s[0], 160, "{}", p64), ?s[0], "18446744073709551616"))                                                                                                               { ret 2; }
+        if (!captured(fmt_capture(?s[0], 160, "{}", max), ?s[0], "340282366920938463463374607431768211455"))                                                                                            { ret 3; }
+        if (!captured(fmt_capture(?s[0], 160, "{}", min), ?s[0], "-170141183460469231731687303715884105728"))                                                                                           { ret 4; }
+        if (!captured(fmt_capture(?s[0], 160, "{}", (min::u128 - 1)::i128), ?s[0], "170141183460469231731687303715884105727"))                                                                          { ret 5; }
+        if (!captured(fmt_capture(?s[0], 160, "{}", (-7)::i128), ?s[0], "-7"))                                                                                                                          { ret 6; }
+        if (!captured(fmt_capture(?s[0], 160, "{:x}", big), ?s[0], "123456789abcdef00fedcba987654321"))                                                                                                 { ret 7; }
+        if (!captured(fmt_capture(?s[0], 160, "{:X}", big), ?s[0], "123456789ABCDEF00FEDCBA987654321"))                                                                                                 { ret 8; }
+        if (!captured(fmt_capture(?s[0], 160, "{:x}", (-1)::i128), ?s[0], "ffffffffffffffffffffffffffffffff"))                                                                                          { ret 9; }
+        if (!captured(fmt_capture(?s[0], 160, "{:b}", p64 | 1::u128), ?s[0], "10000000000000000000000000000000000000000000000000000000000000001"))                                                      { ret 10; }
+        if (!captured(fmt_capture(?s[0], 160, "{:b}", min), ?s[0], "10000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000")) { ret 11; }
+        if (!captured(fmt_capture(?s[0], 160, "[{:024}]", n64), ?s[0], "[-00018446744073709551616]"))                                                                                                   { ret 12; }
+        if (!captured(fmt_capture(?s[0], 160, "[{:<22}]", p64), ?s[0], "[18446744073709551616  ]"))                                                                                                     { ret 13; }
+        if (!captured(fmt_capture(?s[0], 160, "[{:036x}]", big), ?s[0], "[0000123456789abcdef00fedcba987654321]"))                                                                                      { ret 14; }
+        if (!captured(fmt_capture(?s[0], 160, "{:c}", 0x141::u128), ?s[0], "A"))                                                                                                                        { ret 15; }
+        ret 0;
+    }
+
+    # write_value renders one value as `{}` would, and is the leaf other modules
+    # (derive) build on without a format string
+    test format__write_value_renders_every_type {
+        var s:  [64]u8;
+        var tb: TestBuf;
+        tb.data = ?s[0];
+        tb.len  = 0;
+        tb.cap  = 64;
+        var w: writer.Writer;
+        w.ctx     = (?tb)::ptr;
+        w.f_write = testbuf_write;
+
+        var total: usize                  = 0;
+        val a:     res[usize, WriteError] = write_value(?w, -42::i64);
+        if (!sel a.ok) { ret 1; }
+        total = total + a.ok;
+        val b: res[usize, WriteError] = write_value(?w, 7::u16);
+        if (!sel b.ok) { ret 2; }
+        total = total + b.ok;
+        val c: res[usize, WriteError] = write_value(?w, "hi");
+        if (!sel c.ok) { ret 3; }
+        total = total + c.ok;
+        val d: res[usize, WriteError] = write_value(?w, 3.5::f64);
+        if (!sel d.ok) { ret 4; }
+        total = total + d.ok;
+        var pz:  ptr                    = nil;
+        val n64: i128                   = -18446744073709551616;
+        val e:   res[usize, WriteError] = write_value(?w, pz);
+        if (!sel e.ok) { ret 5; }
+        total = total + e.ok;
+        val f: res[usize, WriteError] = write_value(?w, n64);
+        if (!sel f.ok) { ret 8; }
+        total     = total + f.ok;
+        s[tb.len] = 0;
+        if (total != tb.len)                                         { ret 6; }
+        if (!str_equals(?s[0], "-427hi3.50x0-18446744073709551616")) { ret 7; }
+        ret 0;
+    }
+
+    # a sink that fails part way reports the persisted prefix at every level: the
+    # primitive, the padded field and the whole format all carry it, and the bytes
+    # the sink holds are exactly that prefix
+    test format__write_failure_carries_prefix {
+        var s: [8]u8;
+
+        # the sink accepts 5 bytes; "ab" lands, the padded field "   42" gets 3 of
+        # its 5 and the native failure reports 5 persisted across the call
+        val r: res[usize, FormatError] = fmt_capture(?s[0], 5, "ab{:5}cd", 42::i64);
+        if (!sel r.err)                                                                                         { ret 1; }
+        if (!sel r.err.write)                                                                                   { ret 2; }
+        if (!sel r.err.write.native)                                                                            { ret 3; }
+        if (writer.persisted(r.err.write) != 5)                                                                 { ret 4; }
+        if (r.err.write.native.error.kind != io_error.RESOURCE_EXHAUSTED || r.err.write.native.error.code != 0) { ret 5; }
+        if (!str_equals(?s[0], "ab   "))                                                                        { ret 6; }
+
+        # a primitive with an internal composite: '-' then the digits
+        var tb: TestBuf;
+        tb.data = ?s[0];
+        tb.len  = 0;
+        tb.cap  = 2;
+        var w: writer.Writer;
+        w.ctx     = (?tb)::ptr;
+        w.f_write = testbuf_write;
+        val n: res[usize, WriteError] = write_i64(?w, -123);
+        if (!sel n.err)                   { ret 7; }
+        if (writer.persisted(n.err) != 2) { ret 8; }
+        s[tb.len] = 0;
+        if (!str_equals(?s[0], "-1")) { ret 9; }
+
+        # a literal failing after a rendered hole counts the hole's bytes
+        val lit: res[usize, FormatError] = fmt_capture(?s[0], 4, "{}xyz", 12::i64);
+        if (!sel lit.err)                         { ret 10; }
+        if (!sel lit.err.write)                   { ret 11; }
+        if (writer.persisted(lit.err.write) != 4) { ret 12; }
+        if (!str_equals(?s[0], "12xy"))           { ret 13; }
+        ret 0;
+    }
+
+    # a sink that records every call's length alongside the bytes, so a test can
+    # assert how many writes a format costs as well as what it produced
+    rec CountSink {
+        data:  *u8;
+        len:   usize;
+        cap:   usize;
+        calls: usize;
+    }
+
+    #[testing]
+    fun count_write(ctx: ptr, p: *u8, len: usize) res[usize, WriteError] {
+        val cs: *CountSink = ctx::*CountSink;
+        cs.calls = cs.calls + 1;
+        var i: usize = 0;
+        for (i < len) {
+            if (cs.len >= cs.cap) { ret res[usize, WriteError].err{capacity_exhausted(i)}; }
+            cs.data[cs.len] = p[i];
+            cs.len          = cs.len + 1;
+            i               = i + 1;
+        }
+        ret res[usize, WriteError].ok{len};
+    }
+
+    #[testing]
+    fun count_writer(cs: *CountSink, storage: *u8, cap: usize) writer.Writer {
+        cs.data  = storage;
+        cs.len   = 0;
+        cs.cap   = cap;
+        cs.calls = 0;
+        var w: writer.Writer;
+        w.ctx     = cs::ptr;
+        w.f_write = count_write;
+        ret w;
+    }
+
+    # fill storage with n copies of b and null-terminate, returning it as a str
+    #[testing]
+    fun repeated(storage: *u8, b: u8, n: usize) str {
+        var i: usize = 0;
+        for (i < n) {
+            storage[i] = b;
+            i          = i + 1;
+        }
+        storage[n] = 0;
+        ret storage::str;
+    }
+
+    # literal text reaches the writer in maximal runs rather than per byte, and the
+    # bytes are unchanged at every boundary: an empty format, a run that ends the
+    # string, a run far longer than any internal chunk, holes at both ends, and
+    # brace escapes adjacent to runs and to each other.
+    test format__literal_runs_at_every_boundary {
+        var s: [1024]u8;
+
+        if (!captured(fmt_capture(?s[0], 1024, ""), ?s[0], ""))                             { ret 1; }
+        if (!captured(fmt_capture(?s[0], 1024, "bare literal"), ?s[0], "bare literal"))     { ret 2; }
+        if (!captured(fmt_capture(?s[0], 1024, "{}", 1::i64), ?s[0], "1"))                  { ret 3; }
+        if (!captured(fmt_capture(?s[0], 1024, "{}tail", 1::i64), ?s[0], "1tail"))          { ret 4; }
+        if (!captured(fmt_capture(?s[0], 1024, "head{}", 1::i64), ?s[0], "head1"))          { ret 5; }
+        if (!captured(fmt_capture(?s[0], 1024, "a{}b{}c", 1::i64, 2::i64), ?s[0], "a1b2c")) { ret 6; }
+        if (!captured(fmt_capture(?s[0], 1024, "{}{}", 1::i64, 2::i64), ?s[0], "12"))       { ret 7; }
+
+        # escapes: alone, doubled up, and hugging a run on either side
+        if (!captured(fmt_capture(?s[0], 1024, "{{"), ?s[0], "{"))            { ret 8; }
+        if (!captured(fmt_capture(?s[0], 1024, "}}"), ?s[0], "}"))            { ret 9; }
+        if (!captured(fmt_capture(?s[0], 1024, "{{{{}}}}"), ?s[0], "{{}}"))   { ret 10; }
+        if (!captured(fmt_capture(?s[0], 1024, "x{{y}}z"), ?s[0], "x{y}z"))   { ret 11; }
+        if (!captured(fmt_capture(?s[0], 1024, "{{}}{{"), ?s[0], "{}{"))      { ret 12; }
+        if (!captured(fmt_capture(?s[0], 1024, "{{{}", 5::i64), ?s[0], "{5")) { ret 13; }
+        if (!captured(fmt_capture(?s[0], 1024, "{}}}", 5::i64), ?s[0], "5}")) { ret 14; }
+
+        # a literal run longer than the pad chunk and longer than print's staging
+        # buffer still arrives whole and unaltered
+        var big:  [700]u8;
+        val long: str                     = repeated(?big[0], 'q', 699);
+        val r:    res[usize, FormatError] = fmt_capture(?s[0], 1024, long);
+        if (sel r.err)                { ret 15; }
+        if (r.ok != 699)              { ret 16; }
+        if (!str_equals(?s[0], long)) { ret 17; }
+        ret 0;
+    }
+
+    # padding wider than the fill chunk is written in chunks and is exact
+    test format__padding_wider_than_the_fill_chunk {
+        var s:    [256]u8;
+        var want: [256]u8;
+
+        # 100-wide right-align: 98 spaces then "42"
+        var i: usize = 0;
+        for (i < 98) {
+            want[i] = ' ';
+            i       = i + 1;
+        }
+        want[98]  = '4';
+        want[99]  = '2';
+        want[100] = 0;
+        if (!captured(fmt_capture(?s[0], 256, "{:100}", 42::i64), ?s[0], ?want[0])) { ret 1; }
+
+        # 100-wide zero-pad keeps the sign ahead of the fill
+        want[0] = '-';
+        i       = 1;
+        for (i < 98) {
+            want[i] = '0';
+            i       = i + 1;
+        }
+        want[98]  = '4';
+        want[99]  = '2';
+        want[100] = 0;
+        if (!captured(fmt_capture(?s[0], 256, "{:0100}", -42::i64), ?s[0], ?want[0])) { ret 2; }
+
+        # 100-wide left-align: "42" then 98 spaces
+        want[0] = '4';
+        want[1] = '2';
+        i       = 2;
+        for (i < 100) {
+            want[i] = ' ';
+            i       = i + 1;
+        }
+        want[100] = 0;
+        if (!captured(fmt_capture(?s[0], 256, "{:<100}", 42::i64), ?s[0], ?want[0])) { ret 3; }
+
+        # a pad exactly one chunk wide, and one byte either side of it
+        if (!captured(fmt_capture(?s[0], 256, "{:33}", "x"), ?s[0], "                                x")) { ret 4; }
+        ret 0;
+    }
+
+    # the write count, not just the bytes: a literal run costs one call whatever
+    # its length, and padding costs one call per chunk
+    test format__a_literal_run_costs_one_write {
+        var s:  [1024]u8;
+        var cs: CountSink;
+
+        # "hello " and "!\n" are two runs, the hole renders in one call
+        var w: writer.Writer           = count_writer(?cs, ?s[0], 1024);
+        val r: res[usize, FormatError] = vformat(?w, "hello {}!\n", 7::i64);
+        if (sel r.err)     { ret 1; }
+        if (cs.calls != 3) { ret 2; }
+        s[cs.len] = 0;
+        if (!str_equals(?s[0], "hello 7!\n")) { ret 3; }
+
+        # a 699-byte literal is a single call
+        var big:  [700]u8;
+        val long: str = repeated(?big[0], 'q', 699);
+        w = count_writer(?cs, ?s[0], 1024);
+        val bulk: res[usize, FormatError] = vformat(?w, long);
+        if (sel bulk.err)  { ret 4; }
+        if (cs.calls != 1) { ret 5; }
+
+        # a 100-wide pad is ceil(98/32) = 4 fill calls plus the value's own call
+        w = count_writer(?cs, ?s[0], 1024);
+        val pad: res[usize, FormatError] = vformat(?w, "{:100}", 42::i64);
+        if (sel pad.err)   { ret 6; }
+        if (cs.calls != 5) { ret 7; }
+        ret 0;
+    }
+
+    # a released sprint result is exactly the allocation it made
+    #[testing]
+    fun release(a: *A.Allocator, s: str) {
+        A.deallocate[char](a, s, str_len(s) + 1);
+    }
+
+    # sprint renders into an allocation of exactly str_len + 1 bytes, an empty
+    # format into a non-nil empty string, and a nil str argument as nothing
+    test sprint__renders_into_an_exact_allocation {
+        var buf: [4096]u8;
+        var st:  fixed.FixedState;
+        var a:   A.Allocator;
+        fixed.make(?a, ?st, ?buf[0], 4096);
+
+        val before: usize                 = st.offset;
+        val r:      res[str, FormatError] = sprint(?a, "{}-{}={:08x}", "a", 7::u64, 0xABCD::u64);
+        if (sel r.err)                               { ret 1; }
+        if (!str_equals(r.ok, "a-7=0000abcd"))       { ret 2; }
+        if (st.offset - before != str_len(r.ok) + 1) { ret 3; }
+
+        val empty: res[str, FormatError] = sprint(?a, "");
+        if (sel empty.err)             { ret 4; }
+        if (empty.ok == nil)           { ret 5; }
+        if (!str_equals(empty.ok, "")) { ret 6; }
+
+        val n:  str                   = nil;
+        val nr: res[str, FormatError] = sprint(?a, "[{}]", n);
+        if (sel nr.err)               { ret 7; }
+        if (!str_equals(nr.ok, "[]")) { ret 8; }
+        ret 0;
+    }
+
+    # a malformed format surfaces from the measuring pass before any allocation,
+    # and a refused allocation is the allocator's own error, nothing acquired
+    test sprint__errors {
+        var buf: [4096]u8;
+        var st:  fixed.FixedState;
+        var a:   A.Allocator;
+        fixed.make(?a, ?st, ?buf[0], 4096);
+
+        val before: usize                 = st.offset;
+        val r:      res[str, FormatError] = sprint(?a, "{} {}", 1::i64);
+        if (!sel r.err)            { ret 1; }
+        if (!sel r.err.many_holes) { ret 2; }
+        if (st.offset != before)   { ret 3; }
+
+        var tracker: testing.Testing;
+        val made:    err[A.Error] = testing.make(?tracker);
+        if (sel made.err) { ret 4; }
+        testing.fail_at_ordinal(?tracker, 1);
+        val refused: res[str, FormatError] = sprint(testing.allocator_of(?tracker), "n={}", 42::i64);
+        if (!sel refused.err)                  { ret 5; }
+        if (!sel refused.err.alloc)            { ret 6; }
+        if (!sel refused.err.alloc.exhausted)  { ret 7; }
+        if (testing.live_count(?tracker) != 0) { ret 8; }
+        testing.clear_failure(?tracker);
+        val got: res[str, FormatError] = sprint(testing.allocator_of(?tracker), "n={}", 42::i64);
+        if (sel got.err)                 { ret 9; }
+        if (!str_equals(got.ok, "n=42")) { ret 10; }
+        release(testing.allocator_of(?tracker), got.ok);
+        if (testing.live_count(?tracker) != 0) { ret 11; }
+        testing.dnit(?tracker);
+        ret 0;
+    }
+}
+
+#[testing]
+fun t_decimal_is(storage: *u8, len: usize, want: str) bool {
+    if (len != str_len(want)) { ret false; }
+    ret memory.raw_equal(storage::ptr, want::ptr, len);
+}
+
+test put__decimal_fills_storage_from_its_start {
+    var buf: [DECIMAL_MAX]u8;
+    if (!t_decimal_is(?buf[0], put_u64(?buf[0], 0), "0"))                            { ret 1; }
+    if (!t_decimal_is(?buf[0], put_u64(?buf[0], 4096), "4096"))                      { ret 2; }
+    if (!t_decimal_is(?buf[0], put_u64(?buf[0], ~(0::u64)), "18446744073709551615")) { ret 3; }
+    if (!t_decimal_is(?buf[0], put_i64(?buf[0], -7), "-7"))                          { ret 4; }
+    if (!t_decimal_is(?buf[0], put_i64(?buf[0], 42), "42"))                          { ret 5; }
+    val min: i64 = (1::u64 << 63)::i64;
+    if (!t_decimal_is(?buf[0], put_i64(?buf[0], min), "-9223372036854775808")) { ret 6; }
+    ret 0;
+}

@@ -1,0 +1,32 @@
+# terminal outcomes shared by std.terminal and its per-os backends
+#
+# lives in its own module so the parent and the backends name one tag without
+# a circular import, the same split std.terminal.key makes for Key.
+
+use io_error: std.io.error;
+use std.terminal.key;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+
+# every way a terminal operation can fail
+# ---
+# native: the terminal call failed; payload carries the native failure, its
+#         operation being OP_OPTION for a mode or queue control call and
+#         OP_READ for a poll
+pub tag TermError: u8 {
+    native: io_error.Error;
+}
+
+# the outcome of a mode or queue control call
+pub def Operation: err[TermError];
+
+# the outcome of one poll: a waiting key, absence when the queue is empty, or
+# the native read failure
+pub def Poll: res[opt[key.Key], TermError];
+
+# the native code behind a terminal failure
+pub fun code(e: TermError) i64 {
+    if (sel e.native) { ret e.native.code; }
+    ret 0;
+}

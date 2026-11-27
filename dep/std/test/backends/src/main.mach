@@ -1,0 +1,70 @@
+# imports target-gated backends for cross-builds and native artifact checks
+use std.runtime;
+use std.filesystem;
+use io_error: std.io.error;
+use std.memory.secret;
+use net_async:   std.net.async;
+use async_local: std.net.async.local;
+use std.system.os;
+use std.types.error.err;
+
+$if ($mach.build.os == $mach.os.darwin) {
+    use std.system.os.darwin.libsystem;
+
+    # calls every libSystem import the artifact checks name. the linker binds
+    # only what a program can reach, so the checks need a reachable call to see
+    # each spelling. main never takes this path
+    fun bind_libsystem(argv: **u8) i64 {
+        var stat:   [256]u8;
+        var limit:  libsystem.ResourceLimit;
+        var status: i32 = 0;
+        val pid:    i32 = libsystem.getpid();
+        libsystem.getpgid(pid);
+        libsystem.setpgid(pid, pid);
+        libsystem.getrlimit(libsystem.RLIMIT_NOFILE, ?limit);
+        libsystem.kill(pid, 0);
+        libsystem.wait4(pid, ?status, 0, nil);
+        libsystem.waitid(libsystem.P_PID, pid::u32, ?stat[0], libsystem.WEXITED);
+        libsystem.dup2(1, 1);
+        libsystem.chdir(argv[0]);
+        libsystem.fstat(1, ?stat[0]);
+        libsystem.fstatat(-2, argv[0], ?stat[0], 0);
+        val stream: libsystem.DirectoryStream = libsystem.fdopendir(1);
+        libsystem.readdir(stream);
+        libsystem.closedir(stream);
+        libsystem.getentropy(?stat[0], 16);
+        if (libsystem.fork() == 0 || libsystem.vfork() == 0) {
+            libsystem.execve(argv[0], argv, nil);
+        }
+        ret 1;
+    }
+}
+
+rec SecretLeaf {
+    value: ^u64;
+}
+
+#[align(8192)]
+rec SecretRecord {
+    public: u64;
+    secret: SecretLeaf;
+}
+
+#[symbol("main")]
+fun main(argc: i64, argv: **u8) i64 {
+    $if ($mach.build.os == $mach.os.darwin) {
+        if (argc > 1) { ret bind_libsystem(argv); }
+    }
+    if ($size_of(net_async.Driver) == 0 || $size_of(async_local.Driver) == 0) {
+        ret 1;
+    }
+    var c: u8 = 'k'::u8;
+    os.write(os.stdout(), ?c, 1);
+    val secrets: *SecretRecord = secret.allocate_typed[SecretRecord](2);
+    if (secrets == nil) { ret 1; }
+    secrets[0].public       = 1;
+    secrets[0].secret.value = 2;
+    val released: err[io_error.Error] = secret.deallocate_typed[SecretRecord](secrets, 2);
+    if (sel released.err) { ret 1; }
+    ret 0;
+}

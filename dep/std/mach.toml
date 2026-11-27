@@ -1,0 +1,127 @@
+[project]
+id = "std"
+version = "9.5.0"
+mach = "^7"
+src  = "src"
+work = "out/{target.name}/{profile.name}"
+
+[profile.debug]
+default = true
+optimize = false
+debug = true
+simd = "scalarize"
+
+[profile.release]
+optimize = true
+debug = false
+simd = "scalarize"
+
+[target.linux-x86_64]
+arch = "x86_64"
+sys  = "linux"
+abi  = "sysv64"
+
+[target.linux-arm64]
+arch = "aarch64"
+sys  = "linux"
+abi  = "aapcs64"
+
+[target.linux-riscv64]
+arch = "riscv64"
+sys  = "linux"
+abi  = "lp64"
+
+[target.windows-x86_64]
+arch = "x86_64"
+sys  = "windows"
+abi  = "win64"
+
+[target.darwin-x86_64]
+arch = "x86_64"
+sys  = "darwin"
+abi  = "sysv64"
+
+[target.darwin-aarch64]
+arch = "aarch64"
+sys  = "darwin"
+abi  = "darwinpcs"
+
+# darwin's platform library, and the only supported way to reach the kernel:
+# apple does not promise syscall numbers. `name` is spelled as the full install
+# path on purpose. a dyld-loaded image implicitly links libSystem under exactly
+# that path, and a requirement that does not match it string-for-string is a
+# SECOND dependency rather than the same one - the image then carries two
+# LC_LOAD_DYLIB commands, one of them a bare leaf name dyld would have to
+# search for. `library` is the logical name `#[library("libSystem")]` pins to.
+[link.libSystem]
+source  = "system"
+name    = "/usr/lib/libSystem.B.dylib"
+sys     = ["darwin"]
+arch    = ["*"]
+abi     = ["*"]
+export  = true
+
+[link.kernel32]
+source = "system"
+include = "referenced"
+name = "kernel32.dll"
+sys = ["windows"]
+arch = ["*"]
+abi  = ["*"]
+export = true
+
+[link.ws2_32]
+source = "system"
+include = "referenced"
+name = "ws2_32.dll"
+sys = ["windows"]
+arch = ["*"]
+abi  = ["*"]
+export = true
+
+[link.bcrypt]
+source = "system"
+include = "referenced"
+name = "bcrypt.dll"
+sys = ["windows"]
+arch = ["*"]
+abi  = ["*"]
+export = true
+
+[link.advapi32]
+source = "system"
+include = "referenced"
+name = "advapi32.dll"
+sys = ["windows"]
+arch = ["*"]
+abi  = ["*"]
+export = true
+
+[link.synch]
+source = "system"
+include = "referenced"
+name = "api-ms-win-core-synch-l1-2-0.dll"
+sys = ["windows"]
+arch = ["*"]
+abi  = ["*"]
+export = true
+
+# the library, and the only artifact `mach build .` selects
+[artifact.std]
+kind = "static"
+default = true
+export = true
+entry = "lib/libstd.mach"
+out = "{project.work}/lib/std"
+targets = ["*"]
+link = ["kernel32", "ws2_32", "bcrypt", "advapi32", "synch", "libSystem"]
+need = []
+
+# test-only: the modules the library does not reach, run with `mach test . -a tests`
+[artifact.tests]
+kind = "static"
+entry = "lib/tests.mach"
+out = "{project.work}/lib/tests"
+targets = ["*"]
+link = ["kernel32", "ws2_32", "bcrypt", "advapi32", "synch", "libSystem"]
+need = []

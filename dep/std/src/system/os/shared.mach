@@ -1,0 +1,195 @@
+# abstract types and constants for the OS interface
+#
+# types here are target-independent. every OS implementation populates them.
+
+use std.sync.atomic;
+use std.types.bool.bool;
+use std.types.size.usize;
+use std.types.string.str;
+
+# seconds and nanoseconds from a clock source
+# ---
+# sec:  whole seconds
+# nsec: nanoseconds within second [0, 999999999]
+pub rec Timespec {
+    sec:  i64;
+    nsec: i64;
+}
+
+# native wait queue state owned by the portable completion runtime
+# ---
+# wake_pending: 1 from the first wake request until a poll harvests the posted
+#               wake, so later requests in that window post nothing
+# wakes_posted: native wakes actually posted, for the scaling tests
+pub rec IoQueue {
+    handle:       usize;
+    wake:         usize;
+    wake_pending: i64;
+    wakes_posted: i64;
+}
+
+# whether this request must post the native wake: only the first since the
+# last harvest does. a later request finds its work done by the collector that
+# harvests the posted wake, because the collector clears the flag after taking
+# the wake and before it looks for work
+pub fun io_wake_claim(queue: *IoQueue) bool {
+    var expected: i64 = 0;
+    ret atomic.cas(?queue.wake_pending, ?expected, 1);
+}
+
+# the claimed wake was posted
+pub fun io_wake_posted(queue: *IoQueue) {
+    atomic.fetch_add(?queue.wakes_posted, 1);
+}
+
+# the posted wake was taken, or a claimed one could not be posted
+pub fun io_wake_harvested(queue: *IoQueue) {
+    atomic.store(?queue.wake_pending, 0);
+}
+
+# a registered readiness context carries its source id in the top 16 bits, the
+# rest belongs to the source. a completion-port backend carries the id beside
+# its context instead, so every native completion reports `source` either way
+pub val IO_SOURCE_SHIFT: u64 = 48;
+
+# the source id a registered readiness context carries
+pub fun io_context_source(context: usize) u16 {
+    ret (context::u64 >> IO_SOURCE_SHIFT)::u16;
+}
+
+# a readiness context for source from the source's own 48 low bits
+pub fun io_source_context(source: u16, low: u64) usize {
+    ret ((source::u64 << IO_SOURCE_SHIFT) | (low & ((1::u64 << IO_SOURCE_SHIFT) - 1)))::usize;
+}
+
+# the per-thread block std installs for each thread it runs
+#
+# the implementation owns the block of every thread it spawns and installs it
+# before the thread runs any std code. the runtime installs a static one for the
+# main thread before main, unless a loader owns that thread's thread pointer
+# (see OS-CONTRACT.md). its address identifies the thread while it lives.
+# it is not general thread-local storage.
+# ---
+# self_addr:  the block's own address, written when it is installed. x86_64
+#             linux reads the thread pointer through it (fs:[0]), as the psABI
+#             has every thread control block do
+# stack_low:  the lowest address of the thread's stack, recorded once where the
+#             implementation keeps the bounds here
+# stack_high: one past the highest usable address of the thread's stack, or 0
+#             where the block records no bounds
+pub rec ThreadBlock {
+    self_addr:  usize;
+    stack_low:  usize;
+    stack_high: usize;
+}
+
+# the name is borrowed until the next cursor operation, including eof or failure
+pub rec DirectoryEntry {
+    name:      str;
+    length:    usize;
+    type_hint: u8;
+}
+
+# initialization failure and failed duplicate cleanup remain independent
+pub rec DirectoryInitResult {
+    code:         i64;
+    cleanup_code: i64;
+}
+
+# independently qualified cooperative publication capabilities
+pub val PUBLICATION_CLAIMS:              i64 = 1;
+pub val PUBLICATION_RETAIN_REPLACE:      i64 = 2;
+pub val PUBLICATION_READ_RETAIN_REPLACE: i64 = 4;
+
+# seek whence
+pub val SEEK_SET: i32 = 0;
+pub val SEEK_CUR: i32 = 1;
+pub val SEEK_END: i32 = 2;
+
+# memory protection flags
+pub val PROT_NONE:  u32 = 0b000;
+pub val PROT_READ:  u32 = 0b001;
+pub val PROT_WRITE: u32 = 0b010;
+pub val PROT_EXEC:  u32 = 0b100;
+
+# memory advisory hints
+pub val ADVISE_NORMAL:     u32 = 0;
+pub val ADVISE_RANDOM:     u32 = 1;
+pub val ADVISE_SEQUENTIAL: u32 = 2;
+pub val ADVISE_WILL_NEED:  u32 = 3;
+pub val ADVISE_DONT_NEED:  u32 = 4;
+
+# standard huge page sizes
+pub val HUGE_2MB: usize = 2097152;
+pub val HUGE_1GB: usize = 1073741824;
+
+# heap region reserve size (256MB)
+pub val HEAP_RESERVE: usize = 268435456;
+
+# a process state observation, with a full native windows exit code
+pub val PROCESS_EXITED:    u8 = 1;
+pub val PROCESS_SIGNALED:  u8 = 2;
+pub val PROCESS_STOPPED:   u8 = 3;
+pub val PROCESS_CONTINUED: u8 = 4;
+
+pub rec ProcessStatus {
+    kind:        u8;
+    code:        u32;
+    signal:      i32;
+    core_dumped: bool;
+}
+
+pub val PROCESS_OP_WAIT:      u8 = 1;
+pub val PROCESS_OP_STATUS:    u8 = 2;
+pub val PROCESS_OP_CLOSE:     u8 = 3;
+pub val PROCESS_OP_SPAWN:     u8 = 4;
+pub val PROCESS_OP_READ:      u8 = 5;
+pub val PROCESS_OP_PIPE:      u8 = 6;
+pub val PROCESS_OP_TERMINATE: u8 = 7;
+
+pub rec ProcessWaitError {
+    code:        i64;
+    native_code: u32;
+    operation:   u8;
+}
+
+# the open-file limit. soft is the limit in force, hard its ceiling for an
+# unprivileged raise, and ceiling the highest soft value this process may set,
+# which the implementation fills and a set ignores
+pub rec FileLimit {
+    soft:    u64;
+    hard:    u64;
+    ceiling: u64;
+}
+
+# a limit with no bound
+pub val LIMIT_UNLIMITED: u64 = 0xffffffffffffffff;
+
+# pid is positive for an observation, zero for no event or an error
+pub rec WaitResult {
+    pid:   i64;
+    error: ProcessWaitError;
+}
+
+# native producers identify their own continued encoding before decoding
+pub fun posix_status(raw: i32, continued: bool) ProcessStatus {
+    if (continued) { ret ProcessStatus{kind: PROCESS_CONTINUED}; }
+    val signal: i32 = raw & 0x7f;
+    if (signal == 0)    { ret ProcessStatus{kind: PROCESS_EXITED, code: ((raw >> 8) & 0xff)::u32}; }
+    if (signal == 0x7f) { ret ProcessStatus{kind: PROCESS_STOPPED, signal: (raw >> 8) & 0xff}; }
+    ret ProcessStatus{kind: PROCESS_SIGNALED, signal: signal, core_dumped: (raw & 0x80) != 0};
+}
+
+test posix_status__exit_signal_stop_and_continuation_stay_distinct {
+    val exited: ProcessStatus = posix_status(255 << 8, 0);
+    if (exited.kind != PROCESS_EXITED || exited.code != 255 || exited.signal != 0 || exited.core_dumped) { ret 1; }
+    val signaled: ProcessStatus = posix_status(9, 0);
+    if (signaled.kind != PROCESS_SIGNALED || signaled.code != 0 || signaled.signal != 9 || signaled.core_dumped) { ret 2; }
+    val dumped: ProcessStatus = posix_status(11 | 0x80, 0);
+    if (dumped.kind != PROCESS_SIGNALED || dumped.signal != 11 || !dumped.core_dumped) { ret 3; }
+    val stopped: ProcessStatus = posix_status((17 << 8) | 0x7f, 0);
+    if (stopped.kind != PROCESS_STOPPED || stopped.code != 0 || stopped.signal != 17 || stopped.core_dumped) { ret 4; }
+    val continued: ProcessStatus = posix_status(0, 1);
+    if (continued.kind != PROCESS_CONTINUED || continued.code != 0 || continued.signal != 0 || continued.core_dumped) { ret 5; }
+    ret 0;
+}
