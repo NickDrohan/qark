@@ -1,0 +1,236 @@
+# descriptor-relative recursive removal shared by namespace and transaction callers
+use std.types.error.err;
+use io_error: std.io.error;
+use std.system.capability;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.path;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_empty;
+use std.types.string.str_equals;
+use std.types.string.str_len;
+
+$if (capability.HAS_FILES) {
+    use fsnative: std.filesystem.native;
+    use std.system.os;
+}
+$or {
+    $error("std.filesystem.removal needs the files capability (std.system.capability.HAS_FILES)");
+}
+
+$if ($mach.build.sys == $mach.sys.linux)  { use native: std.system.os.linux; }
+$or ($mach.build.sys == $mach.sys.darwin) { use native: std.system.os.darwin; }
+
+pub rec Error {
+    kind: io_error.Kind;
+    # the native code behind the failure, 0 when removal refused on its own
+    code:        i64;
+    containment: bool;
+    # first independent cleanup failure
+    cleanup_code: i64;
+}
+
+pub fun message(e: Error) str {
+    if (e.containment) { ret "invalid removal component or directory tree too deep"; }
+    if (e.code < 0)    { ret os.error_message(e.code); }
+    ret io_error.kind_name(e.kind);
+}
+
+# the error for a native code a primitive returned
+pub fun from_native(code: i64) Error {
+    ret Error{kind: os.error_kind(code), code: code};
+}
+
+# the error for a component or depth removal will not walk
+pub fun contained() Error {
+    ret Error{kind: io_error.INVALID, containment: true};
+}
+
+fun failure(code: i64) err[Error] {
+    ret err[Error].err{from_native(code)};
+}
+
+# keep the primary failure when releasing a cursor or descriptor also fails
+pub fun with_cleanup(result: err[Error], code: i64) err[Error] {
+    if (code >= 0)     { ret result; }
+    if (sel result.ok) { ret failure(code); }
+    var error: Error = result.err;
+    if (error.cleanup_code == 0) { error.cleanup_code = code; }
+    ret err[Error].err{error};
+}
+
+fun component(name: str) bool {
+    if (str_empty(name) || str_equals(name, ".") || str_equals(name, "..")) { ret false; }
+    val len: usize = str_len(name);
+    var i:   usize = 0;
+    for (i < len) {
+        if (path.is_separator(name[i])) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+fun dot(name: *u8) bool {
+    ret name[0] == '.' && (name[1] == 0 || (name[1] == '.' && name[2] == 0));
+}
+
+# count is usable only when the complete operation succeeds
+pub fun tree(dirfd: usize, name: str, removed: *usize, max_depth: usize) err[Error] {
+    if (dirfd == os.working_dir() || removed == nil || !component(name)) {
+        ret err[Error].err{contained()};
+    }
+    ret walk(dirfd, name, removed, 0, max_depth, false);
+}
+
+# only for transaction-owned private trees under an exclusive cooperative root claim
+pub fun private_tree(dirfd: usize, name: str, removed: *usize, max_depth: usize) err[Error] {
+    if (dirfd == os.working_dir() || removed == nil || !component(name)) {
+        ret err[Error].err{contained()};
+    }
+    ret walk(dirfd, name, removed, 0, max_depth, true);
+}
+
+fun walk(dirfd: usize, name: str, removed: *usize, depth: usize, max_depth: usize, private: bool) err[Error] {
+    if (depth > max_depth) { ret err[Error].err{contained()}; }
+    var before: os.stat_t;
+    val sr:     i64 = os.stat_path(dirfd, name, ?before, os.AT_SYMLINK_NOFOLLOW);
+    if (os.error_kind(sr) == io_error.NOT_FOUND) { ret err[Error].ok{}; }
+    if (sr < 0)                                  { ret failure(sr); }
+    if ((fsnative.stat_mode(?before) & os.S_IFMT) != os.S_IFDIR) {
+        val raw: i64 = fsnative.unlink_force(dirfd, name, 0);
+        if (os.error_kind(raw) == io_error.NOT_FOUND) { ret err[Error].ok{}; }
+        if (raw < 0)                                  { ret failure(raw); }
+        @removed = removed[0] + 1;
+        ret err[Error].ok{};
+    }
+    if (private && (fsnative.stat_mode(?before) & 0o700) != 0o700) {
+        val mode:     i32 = ((fsnative.stat_mode(?before) & 0o7777) | 0o700)::i32;
+        val restored: i64 = os.set_mode_at(dirfd, name, mode);
+        if (restored < 0) { ret failure(restored); }
+    }
+    var flags: i32 = os.O_RDONLY | os.O_DIRECTORY;
+    $if ($mach.build.sys != $mach.sys.windows) { flags = flags | native.O_NOFOLLOW; }
+    var child_fd:  usize = os.INVALID_HANDLE;
+    val opened_at: i64   = os.open(dirfd, name, flags, 0, ?child_fd);
+    if (opened_at < 0) { ret failure(opened_at); }
+    var opened:  os.stat_t;
+    val checked: i64 = os.stat(child_fd, ?opened);
+    if (checked < 0) { ret with_cleanup(failure(checked), os.close(child_fd)); }
+    if ((fsnative.stat_mode(?opened) & os.S_IFMT) != os.S_IFDIR) {
+        ret with_cleanup(err[Error].err{contained()}, os.close(child_fd));
+    }
+    val result:    err[Error] = contents(child_fd, removed, depth, max_depth, private);
+    val closed:    i64        = os.close(child_fd);
+    val completed: err[Error] = with_cleanup(result, closed);
+    if (sel completed.err) { ret completed; }
+    val unlinked: i64 = fsnative.unlink_force(dirfd, name, os.AT_REMOVEDIR);
+    if (os.error_kind(unlinked) == io_error.NOT_FOUND) { ret err[Error].ok{}; }
+    if (unlinked < 0)                                  { ret failure(unlinked); }
+    @removed = removed[0] + 1;
+    ret err[Error].ok{};
+}
+
+fun contents(dirfd: usize, removed: *usize, depth: usize, max_depth: usize, private: bool) err[Error] {
+    for {
+        val rewind: i64 = os.seek(dirfd, 0, os.SEEK_SET);
+        if (rewind < 0) { ret failure(rewind); }
+        var cursor:      os.DirectoryCursor     = os.DirectoryCursor{};
+        val initialized: os.DirectoryInitResult = os.directory_init(?cursor, dirfd);
+        if (initialized.code < 0) {
+            var failed: Error = from_native(initialized.code);
+            failed.cleanup_code = initialized.cleanup_code;
+            ret err[Error].err{failed};
+        }
+        val before:    usize      = removed[0];
+        val result:    err[Error] = contents_pass(dirfd, ?cursor, removed, depth, max_depth, private);
+        val completed: err[Error] = with_cleanup(result, os.directory_close(?cursor));
+        if (sel completed.err)    { ret completed; }
+        if (before == removed[0]) { ret err[Error].ok{}; }
+    }
+    ret err[Error].ok{};
+}
+
+# a fresh scan after a mutating pass catches entries skipped by native buffering
+fun contents_pass(dirfd: usize, cursor: *os.DirectoryCursor, removed: *usize,
+    depth: usize, max_depth: usize, private: bool) err[Error] {
+    for {
+        var entry: os.DirectoryEntry;
+        val next:  i64 = os.directory_next(cursor, ?entry);
+        if (next < 0)               { ret failure(next); }
+        if (next == 0)              { ret err[Error].ok{}; }
+        if (dot(entry.name))        { cnt; }
+        if (!component(entry.name)) { ret err[Error].err{contained()}; }
+        val result: err[Error] = walk(dirfd, entry.name, removed, depth + 1, max_depth, private);
+        if (sel result.err) { ret result; }
+    }
+    ret err[Error].ok{};
+}
+
+$if ($mach.build.sys != $mach.sys.windows) {
+    test private_removal__recovers_without_exposing_content_or_linked_trees {
+        val base: str = "mach_612_private_removal";
+        if (os.make_dir(os.working_dir(), base, 0o700) < 0) { ret 1; }
+        fin { os.unlink(os.working_dir(), base, os.AT_REMOVEDIR); }
+        var root:        usize = os.INVALID_HANDLE;
+        val root_status: i64   = os.open(os.working_dir(), base, os.O_RDONLY | os.O_DIRECTORY, 0, ?root);
+        if (root_status < 0) { ret 2; }
+        fin { os.close(root); }
+        if (os.make_dir(root, "private", 0o700) < 0 || os.make_dir(root, "public", 0o700) < 0) { ret 3; }
+        fin {
+            var ignored: usize = 0;
+            private_tree(root, "private", ?ignored, 256);
+            os.unlink(root, "public", os.AT_REMOVEDIR);
+        }
+        var private_fd:        usize = os.INVALID_HANDLE;
+        val private_fd_status: i64   = os.open(root, "private", os.O_RDONLY | os.O_DIRECTORY, 0, ?private_fd);
+        if (private_fd_status < 0) { ret 4; }
+        if (os.make_dir(private_fd, "inner", 0o700) < 0) {
+            os.close(private_fd);
+            ret 5;
+        }
+        var inner:        usize = os.INVALID_HANDLE;
+        val inner_status: i64   = os.open(private_fd, "inner", os.O_RDONLY | os.O_DIRECTORY, 0, ?inner);
+        if (inner_status < 0) {
+            os.close(private_fd);
+            ret 6;
+        }
+        var file:        usize = os.INVALID_HANDLE;
+        val file_status: i64   = os.open(inner, "secret", os.O_CREAT | os.O_EXCL | os.O_RDWR, 0, ?file);
+        if (file_status < 0) {
+            os.close(inner);
+            os.close(private_fd);
+            ret 7;
+        }
+        fin { os.close(file); }
+        if (os.write(file, "secret", 6) != 6) {
+            os.close(inner);
+            os.close(private_fd);
+            ret 8;
+        }
+        if (os.symlink("../public", "mach_612_private_removal/private/alias") < 0) {
+            os.close(inner);
+            os.close(private_fd);
+            ret 9;
+        }
+        val inner_mode:   i64 = os.set_mode(inner, 0);
+        val private_mode: i64 = os.set_mode(private_fd, 0);
+        os.close(inner);
+        os.close(private_fd);
+        if (inner_mode < 0 || private_mode < 0 || os.set_mode_at(root, "public", 0o555) < 0) { ret 10; }
+        var removed:  usize      = 0;
+        val ordinary: err[Error] = tree(root, "private", ?removed, 256);
+        if (sel ordinary.ok || removed != 0) { ret 11; }
+        var untouched: os.stat_t;
+        if (os.stat_path(root, "private", ?untouched, os.AT_SYMLINK_NOFOLLOW) < 0
+            || (fsnative.stat_mode(?untouched) & 0o777) != 0) { ret 12; }
+        val recovered: err[Error] = private_tree(root, "private", ?removed, 256);
+        if (sel recovered.err || removed != 4)                                              { ret 13; }
+        if (os.stat(file, ?untouched) < 0 || (fsnative.stat_mode(?untouched) & 0o777) != 0) { ret 14; }
+        if (os.stat_path(root, "public", ?untouched, os.AT_SYMLINK_NOFOLLOW) < 0
+            || (fsnative.stat_mode(?untouched) & 0o777) != 0o555) { ret 15; }
+        if (os.error_kind(os.stat_path(root, "private", ?untouched, os.AT_SYMLINK_NOFOLLOW)) != io_error.NOT_FOUND) { ret 16; }
+        ret 0;
+    }
+}

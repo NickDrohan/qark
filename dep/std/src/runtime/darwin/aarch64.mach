@@ -1,0 +1,89 @@
+# aarch64 darwin entrypoint
+#
+# provides `_start` (via `start`), the Mach-O entry point for aarch64 darwin executables.
+#
+# darwin arm64 executables are PIE `LC_MAIN` images: dyld enters the program like a
+# C `main(argc, argv, envp)`, with the arguments in registers, not on the stack:
+#   x0 = argc
+#   x1 = argv
+#   x2 = envp
+#
+# this entrypoint:
+#   1. captures argc/argv/envp from x0/x1/x2 for the runtime
+#   2. calls `_rt_init` then `main(argc, argv)` (the stack dyld hands the LC_MAIN
+#      entry is already 16-byte aligned, an arm64 invariant)
+#   3. exits through `_rt_exit`, which is `_exit(2)` via libSystem, with the
+#      return code from main. the entry never returns to dyld: `exit(3)` would
+#      run atexit handlers std never registers, and a raw exit trap is exactly
+#      the unsupported surface this runtime no longer touches.
+#
+# user code must define:
+#   #[symbol("main")]
+#   fun main(argc: i64, argv: **u8) i64 { ... }
+
+$if ($mach.build.sys != $mach.sys.darwin) {
+    $error("std.runtime.darwin.aarch64: requires darwin target");
+}
+
+$if ($mach.build.arch != $mach.arch.aarch64) {
+    $error("std.runtime.darwin.aarch64: requires aarch64 target");
+}
+
+use std.system.dit;
+use os:        std.system.os.darwin.aarch64;
+use os_shared: std.system.os.shared;
+use std.system.panic.panic;
+
+#[symbol("_rt_argc")]
+var _rt_argc: i64 = 0;
+#[symbol("_rt_argv")]
+var _rt_argv: u64 = 0;
+#[symbol("_rt_envp")]
+var _rt_envp: u64 = 0;
+
+# the main thread's block; spawned threads get theirs from the OS layer
+var main_block: os_shared.ThreadBlock;
+
+#[symbol("_rt_init")]
+fun _rt_init() {
+    # the main thread's block, installed before main so its token is valid from entry
+    if (os.thread_block_enter(?main_block) < 0) {
+        panic("std.runtime: the main thread's block could not be installed\n");
+    }
+    os._envp = _rt_envp;
+    # turn on PSTATE.DIT when the link admits a secret multiply, or refuse to start
+    dit.init(os.cpu_dit());
+}
+
+# end the process with main's return code; the single exit path after main
+#[symbol("_rt_exit")]
+fun _rt_exit(code: i64) {
+    os.terminate(code);
+}
+
+#[symbol("start")]
+pub fun _start() {
+    asm armv8-a {
+        // dyld enters an LC_MAIN executable with main's arguments in registers:
+        //   x0 = argc, x1 = argv, x2 = envp
+        adrp x11, _rt_argc
+        str x0, [x11, :lo12:_rt_argc]
+        adrp x11, _rt_argv
+        str x1, [x11, :lo12:_rt_argv]
+        adrp x11, _rt_envp
+        str x2, [x11, :lo12:_rt_envp]
+
+        // the stack dyld hands the LC_MAIN entry is already 16-byte aligned (an
+        // arm64 architectural invariant), so no realignment is needed.
+        bl _rt_init
+
+        adrp x11, _rt_argc
+        ldr x0, [x11, :lo12:_rt_argc]
+        adrp x11, _rt_argv
+        ldr x1, [x11, :lo12:_rt_argv]
+        bl main
+
+        // x0 is main's return value and _rt_exit's first argument
+        bl _rt_exit
+    }
+}

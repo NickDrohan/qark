@@ -1,0 +1,169 @@
+# low-level panic: write message to stderr and terminate
+#
+# self-contained module with no dependency on std.system.os, so the
+# os layer and the runtime can panic without a circular import chain.
+#
+# ONE ARM PER OPERATING SYSTEM, AND NO FALLTHROUGH (#397). This module previously
+# dispatched `$if linux { ... } $or { ...darwin... }`, so "not linux" MEANT "darwin" and a
+# windows build silently compiled darwin syscall numbers - a panic there wrote nothing a
+# reader could see. The terminator was worse: arch-gated with no OS gate at all, so every
+# OS got `hlt` / `brk` / `ebreak` regardless. Two independent instances of one failure
+# mode, and both produced a wrong BINARY rather than a build error.
+#
+# Each OS now defines its own `panic_sink`, selected where the DECLARATIONS are gated rather
+# than inside one function body. That placement is load-bearing twice over: a helper's
+# `$error` fires even when its arm is not the selected one, and an `ext fun` is linked
+# unconditionally wherever it is declared - so a windows-only import declared at module
+# scope breaks every linux and darwin link. Gating the declarations solves both.
+#
+# The property this buys is that an OS with no arm has no `panic_sink` and therefore CANNOT
+# BUILD, rather than inheriting another platform's syscalls. Deleting the windows arm and
+# building for windows demonstrates it. The trailing `$error` names that case explicitly
+# when comptime reaches it first; either way the failure is at compile time. It is
+# prospective, not currently reachable - linux, darwin and windows all have arms, and a
+# freestanding project links no std - and it exists so the NEXT operating system trips it.
+#
+# THE WRITE AND THE TERMINATOR MOVE TOGETHER, in one `panic_sink` per platform. Splitting
+# them is what made the windows breakage look survivable: fixing only the terminator would
+# have produced a correct exit status for a message nobody ever saw.
+
+use std.types.size.isize;
+use std.types.size.usize;
+
+# the process exit status a panic terminates with
+#
+# 255 matches `std.system.os.abort()` rather than inventing a constant. A signal death
+# reports as 128 + N with N <= 64, so 255 can never be confused with one - which is the
+# point, since panic used to die by SIGSEGV and read as memory corruption (#2369). The
+# asm arms spell it as a literal because an immediate operand cannot take a named value;
+# keep them in step with this.
+pub val PANIC_EXIT: u32 = 255;
+
+$if ($mach.build.sys == $mach.sys.linux) {
+    # write(2, msg, len) then exit_group(255)
+    #
+    # exit_group rather than exit so every thread of the process ends - a panic on a
+    # worker must not leave the rest running. The trap after it is unreachable and kept
+    # only as a guard, matching `std.system.os.exit`; it is NOT the terminator.
+    # ---
+    # msg: message bytes
+    # len: message length
+    pub fun panic_sink(msg: *u8, len: usize) {
+        $if ($mach.build.arch == $mach.arch.x86_64) {
+            asm x86-64 {
+                mov eax, 1        # SYS_write
+                mov edi, 2        # fd = stderr
+                mov rsi, {msg}
+                mov rdx, {len}
+                syscall
+                mov eax, 231      # SYS_exit_group
+                mov edi, 255      # PANIC_EXIT
+                syscall
+                hlt
+            }
+        }
+        $or ($mach.build.arch == $mach.arch.aarch64) {
+            asm armv8-a {
+                mov x8, 64    // SYS_write (linux aarch64)
+                mov x0, 2     // fd = stderr
+                ldr x1, {msg}
+                ldr x2, {len}
+                svc 0
+                mov x8, 94    // SYS_exit_group
+                mov x0, 255   // PANIC_EXIT
+                svc 0
+                brk 0
+            }
+        }
+        $or ($mach.build.arch == $mach.arch.riscv64) {
+            asm rv64i {
+                li a7, 64     # SYS_write (linux riscv64)
+                li a0, 2      # fd = stderr
+                ld a1, {msg}
+                ld a2, {len}
+                ecall
+                li a7, 94     # SYS_exit_group
+                li a0, 255    # PANIC_EXIT
+                ecall
+                ebreak
+            }
+        }
+        $or {
+            $error("std.system.panic: unsupported linux architecture");
+        }
+    }
+}
+$or ($mach.build.sys == $mach.sys.darwin) {
+    # write(2) to stderr then _exit(2), both through libSystem
+    #
+    # apple promises no syscall numbers, so the darwin arm calls the two public
+    # libSystem entry points instead of trapping. Like the windows arm these are
+    # EXTERN declarations, not module imports: the dependency-free property the
+    # header describes is preserved exactly, and they sit inside this arm because
+    # an `ext fun` is linked wherever it is declared.
+    #
+    # `_exit` rather than `exit`: a panic must not run atexit handlers (std
+    # registers none, but a host program may), and `_exit` ends every thread of
+    # the process the way linux's `exit_group` does. It does not return, so no
+    # trailing guard is needed. No inline asm and no arch gate: libSystem is the
+    # interface on both darwin architectures.
+    #[library("libSystem")]
+    ext fun write(p0: i32, p1: *u8, p2: usize) isize;
+    #[library("libSystem")]
+    ext fun _exit(p0: i32);
+
+    # ---
+    # msg: message bytes
+    # len: message length
+    pub fun panic_sink(msg: *u8, len: usize) {
+        write(2, msg, len);
+        _exit(PANIC_EXIT::i32);
+    }
+}
+$or ($mach.build.sys == $mach.sys.windows) {
+    # windows has no stable syscall interface, so the panic path calls the documented
+    # kernel32 entry points. These are EXTERN declarations, not module imports: they add
+    # no mach dependency, and the only mach symbol this arm needs - `isize` - comes from
+    # `std.types.size`, which the module already imports for `usize`. The dependency-free
+    # property the header describes is preserved exactly.
+    #
+    # They sit inside this arm because an `ext fun` is linked wherever it is declared: at
+    # module scope these three would appear in every linux and darwin link as undefined
+    # symbols.
+    #[library("kernel32")]
+    ext fun GetStdHandle(p0: u32) isize;
+    #[library("kernel32")]
+    ext fun WriteFile(p0: isize, p1: *u8, p2: u32, p3: *u32, p4: ptr) i32;
+    #[library("kernel32")]
+    ext fun ExitProcess(p0: u32);
+
+    # stderr's handle id; `STD_ERROR_HANDLE` is (DWORD)-12
+    val STD_ERROR_HANDLE: u32 = (-12)::i32::u32;
+
+    # WriteFile to the stderr handle, then ExitProcess(255)
+    #
+    # No inline asm and no arch gate: kernel32 is the interface on every windows target,
+    # so this arm is arch-independent where the syscall arms cannot be. The `written`
+    # count is required by the API and discarded - a panic has nowhere to report a short
+    # write to. ExitProcess does not return, so no trailing guard is needed.
+    # ---
+    # msg: message bytes
+    # len: message length
+    pub fun panic_sink(msg: *u8, len: usize) {
+        var written: u32 = 0;
+        WriteFile(GetStdHandle(STD_ERROR_HANDLE), msg, len::u32, ?written, nil);
+        ExitProcess(PANIC_EXIT);
+    }
+}
+$or {
+    $error("std.system.panic needs a linux, darwin or windows target");
+}
+
+# write a null-terminated message to stderr and abort
+# ---
+# msg: pointer to null-terminated error message
+pub fun panic(msg: *u8) {
+    var len: usize = 0;
+    for (msg[len] != 0) { len = len + 1; }
+    panic_sink(msg, len);
+}

@@ -1,0 +1,3 @@
+# test dispatcher startup without coupling pure modules to the runtime
+
+use std.runtime;

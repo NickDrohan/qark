@@ -1,0 +1,110 @@
+# the linux part of the linux and darwin readiness backend for internet sockets
+# backend for std.net.async, signatures may change in a minor release (README, API surface)
+# std.net.async.unix holds the backend. what differs on linux is the packet
+# metadata a datagram carries in its control messages.
+
+$if ($mach.build.sys != $mach.sys.linux) {
+    $error("std.net.async.linux: requires linux target");
+}
+
+use std.net.async.types;
+use std.net.ip;
+use std.system.os.linux;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.size.usize;
+
+pub val MSG_TRUNC:        i32 = 0x20;
+val     IP_PKTINFO:       i32 = 8;
+val     IPV6_RECVPKTINFO: i32 = 49;
+val     IPV6_PKTINFO:     i32 = 50;
+
+pub fun configure_datagram(resource: usize, family: i32) i64 {
+    var enabled: i32 = 1;
+    if (family == linux.AF_INET) {
+        ret linux.sock_setopt(resource, linux.IPPROTO_IP, IP_PKTINFO, (?enabled)::*u8, 4);
+    }
+    if (family == linux.AF_INET6) {
+        ret linux.sock_setopt(resource, linux.IPPROTO_IPV6, IPV6_RECVPKTINFO, (?enabled)::*u8, 4);
+    }
+    ret linux.ENOTSUP;
+}
+
+fun align_control(length: usize) usize {
+    ret (length + 7) & ~7;
+}
+
+pub fun packet_metadata(packet: *types.Packet, control: *u8, length: usize) {
+    packet.has_local_destination = false;
+    packet.interface_index       = 0;
+    var offset: usize = 0;
+    for (offset + 16 <= length) {
+        val base:           usize = control::usize + offset;
+        val message_length: usize = @(base::*usize);
+        if (message_length < 16 || message_length > length - offset) { ret; }
+        val level: i32   = @((base + 8)::*i32);
+        val kind:  i32   = @((base + 12)::*i32);
+        val data:  usize = base + 16;
+        if (level == linux.IPPROTO_IP && kind == IP_PKTINFO && message_length >= 28) {
+            packet.interface_index = @(data::*u32);
+            val address: ip.IPv4 = ip.ipv4(@((data + 8)::*u8), @((data + 9)::*u8), @((data + 10)::*u8), @((data + 11)::*u8));
+            packet.local_destination     = ip.addr_v4(address);
+            packet.has_local_destination = true;
+        }
+        or (level == linux.IPPROTO_IPV6 && kind == IPV6_PKTINFO && message_length >= 36) {
+            var address: ip.IPv6;
+            var i:       usize = 0;
+            for (i < 16) {
+                address.octets[i] = @((data + i)::*u8);
+                i                 = i + 1;
+            }
+            packet.interface_index       = @((data + 16)::*u32);
+            packet.local_destination     = ip.addr_v6(address);
+            packet.has_local_destination = true;
+        }
+        offset = offset + align_control(message_length);
+    }
+}
+
+pub fun packet_send_metadata(packet: *types.Packet, control: *u8, length: *usize) i64 {
+    @length = 0;
+    if (!packet.has_local_destination && packet.interface_index == 0) { ret 0; }
+    var i: usize = 0;
+    for (i < 48) {
+        control[i] = 0;
+        i          = i + 1;
+    }
+    val base:   usize = control::usize;
+    val family: i32   = ip.endpoint_family(packet.peer);
+    if (family == linux.AF_INET) {
+        if (packet.has_local_destination && packet.local_destination.is_v6 != 0) { ret linux.EINVAL; }
+        @(base::*usize)      = 28;
+        @((base + 8)::*i32)  = linux.IPPROTO_IP;
+        @((base + 12)::*i32) = IP_PKTINFO;
+        @((base + 16)::*u32) = packet.interface_index;
+        if (packet.has_local_destination) {
+            for (i < 4) {
+                @((base + 20 + i)::*u8) = packet.local_destination.v4.octets[i];
+                i                       = i + 1;
+            }
+        }
+        @length = 32;
+        ret 0;
+    }
+    if (family == linux.AF_INET6) {
+        if (packet.has_local_destination && packet.local_destination.is_v6 == 0) { ret linux.EINVAL; }
+        @(base::*usize)      = 36;
+        @((base + 8)::*i32)  = linux.IPPROTO_IPV6;
+        @((base + 12)::*i32) = IPV6_PKTINFO;
+        if (packet.has_local_destination) {
+            for (i < 16) {
+                @((base + 16 + i)::*u8) = packet.local_destination.v6.octets[i];
+                i                       = i + 1;
+            }
+        }
+        @((base + 32)::*u32) = packet.interface_index;
+        @length              = 40;
+        ret 0;
+    }
+    ret linux.ENOTSUP;
+}

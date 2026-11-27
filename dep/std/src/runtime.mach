@@ -1,0 +1,30 @@
+# program entrypoint contract
+# ---
+# provides the platform/arch-specific `_start` symbol that the linker uses as
+# the program entrypoint. user code must define a `main` function as follows:
+#
+#   use std.runtime;
+#
+#   #[symbol("main")]
+#   fun main(argc: i64, argv: **u8) i64 {
+#       ret 0;
+#   }
+#
+# the `_start` entrypoint decodes argc/argv from the initial stack layout and
+# calls the user's `main`. on return, it terminates the process with the exit
+# code returned by `main`.
+#
+# note: `use std.runtime;` is required to link the entrypoint into the binary.
+
+$if ($mach.build.sys == $mach.sys.linux) {
+    use std.runtime.linux;
+}
+$or ($mach.build.sys == $mach.sys.darwin) {
+    use std.runtime.darwin;
+}
+$or ($mach.build.sys == $mach.sys.windows) {
+    use std.runtime.windows;
+}
+$or {
+    $error("std.runtime needs a linux, darwin or windows target");
+}

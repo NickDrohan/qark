@@ -1,0 +1,117 @@
+use std.types.bool.bool;
+
+# a single byte representing a character
+pub def char: u8;
+
+# check if a character is ASCII whitespace
+# ---
+# c:   character to test
+# ret: true if whitespace (space, tab, newline, vertical tab, form feed, carriage return)
+pub fun char_is_space(c: char) bool {
+    ret c == ' ' || c == '\t' || c == '\n' || c == 11 || c == 12 || c == '\r';
+}
+
+# check if a character is an ASCII digit
+# ---
+# c:   character to test
+# ret: true if 0-9
+pub fun char_is_digit(c: char) bool {
+    ret c >= '0' && c <= '9';
+}
+
+# check if a character is an ASCII letter
+# ---
+# c:   character to test
+# ret: true if a-z or A-Z
+pub fun char_is_alpha(c: char) bool {
+    ret (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
+}
+
+# check if a character is alphanumeric
+# ---
+# c:   character to test
+# ret: true if letter or digit
+pub fun char_is_alnum(c: char) bool {
+    ret char_is_alpha(c) || char_is_digit(c);
+}
+
+# check if a character is a lowercase ASCII letter
+# ---
+# c:   character to test
+# ret: true if a-z
+pub fun char_is_lower(c: char) bool {
+    ret c >= 'a' && c <= 'z';
+}
+
+# check if a character is an uppercase ASCII letter
+# ---
+# c:   character to test
+# ret: true if A-Z
+pub fun char_is_upper(c: char) bool {
+    ret c >= 'A' && c <= 'Z';
+}
+
+# convert an ASCII letter to lowercase
+# ---
+# c:   character to convert
+# ret: lowercase equivalent, or c unchanged if not uppercase
+pub fun char_to_lower(c: char) char {
+    if (c >= 'A' && c <= 'Z') { ret c + 32; }
+    ret c;
+}
+
+# convert an ASCII letter to uppercase
+# ---
+# c:   character to convert
+# ret: uppercase equivalent, or c unchanged if not lowercase
+pub fun char_to_upper(c: char) char {
+    if (c >= 'a' && c <= 'z') { ret c - 32; }
+    ret c;
+}
+
+# check if a character is a hexadecimal digit
+# ---
+# c:   character to test
+# ret: true if 0-9, a-f, or A-F
+pub fun char_is_hex_digit(c: char) bool {
+    ret (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+}
+
+# check if a character is ASCII punctuation
+# ---
+# c:   character to test
+# ret: true if punctuation
+pub fun char_is_punct(c: char) bool {
+    ret (c >= '!' && c <= '/') || (c >= ':' && c <= '@') || (c >= '[' && c <= '`') || (c >= '{' && c <= '~');
+}
+
+# check if a character is printable ASCII
+# ---
+# c:   character to test
+# ret: true if printable (space through tilde)
+pub fun char_is_print(c: char) bool {
+    ret c >= ' ' && c <= '~';
+}
+
+# check if a character is an ASCII control character
+# ---
+# c:   character to test
+# ret: true if control character
+pub fun char_is_ctrl(c: char) bool {
+    ret c < ' ' || c == 127;
+}
+
+# get the numeric value of a digit or letter character
+# ---
+# c:   character to evaluate
+# ret: 0-9 for digits, 10-35 for letters, or -1 if invalid
+pub fun char_digit_val(c: char) i32 {
+    if (c >= '0' && c <= '9') {
+        ret (c - '0')::u32::i32;
+    }
+    val lo: char = char_to_lower(c);
+    if (lo >= 'a' && lo <= 'z') {
+        ret (lo - 'a')::u32::i32 + 10;
+    }
+    ret -1;
+}

@@ -1,0 +1,195 @@
+# saturating (clamping) arithmetic over the seeded vector types
+#
+# there is no lane-wise saturating operator, so each is built from the wrapping
+# lane-wise op plus an overflow mask — the `paddus`/`psubs`-class behavior
+# expressed in portable Mach.
+#
+# unsigned add saturates to all-ones on carry-out; unsigned subtract saturates
+# to zero on borrow. these need no bit reinterpret: the overflow mask is an
+# unsigned comparison in the operand's own type.
+#
+# signed add/sub saturate to the type's [MIN, MAX]. overflow is detected in the
+# mask domain from the operand and result sign bits — a signed compare against
+# zero yields the sign mask — and the saturated lanes are chosen with the
+# `select` blend (whose `:~` reinterpret is the only bitwise touch a signed
+# vector allows). overflow on add needs equal operand signs; on subtract,
+# opposite signs; either way the result sign must differ from the minuend's.
+
+use std.simd.select.select_i16x8;
+use std.simd.select.select_i8x16;
+use std.simd.shuffle.splat_i16x8;
+use std.simd.shuffle.splat_i8x16;
+
+# saturating unsigned add of u8x16 lanes (clamps to 0xFF)
+# ---
+# a:   first operand
+# b:   second operand
+# ret: lane-wise min(a + b, 0xFF)
+pub fun adds_u8x16(a: u8x16, b: u8x16) u8x16 {
+    val sum: u8x16 = a + b;
+    val ovf: u8x16 = sum < a; # wrap-around iff the sum dropped below a
+    ret sum | ovf; # overflowed lanes forced to all-ones
+}
+
+# saturating unsigned subtract of u8x16 lanes (clamps to 0)
+# ---
+# a:   minuend
+# b:   subtrahend
+# ret: lane-wise max(a - b, 0)
+pub fun subs_u8x16(a: u8x16, b: u8x16) u8x16 {
+    val diff: u8x16 = a - b;
+    val und:  u8x16 = a < b; # borrow iff a < b
+    ret diff & ~und; # underflowed lanes forced to zero
+}
+
+# saturating unsigned add of u16x8 lanes (clamps to 0xFFFF)
+# ---
+# a:   first operand
+# b:   second operand
+# ret: lane-wise min(a + b, 0xFFFF)
+pub fun adds_u16x8(a: u16x8, b: u16x8) u16x8 {
+    val sum: u16x8 = a + b;
+    val ovf: u16x8 = sum < a;
+    ret sum | ovf;
+}
+
+# saturating unsigned subtract of u16x8 lanes (clamps to 0)
+# ---
+# a:   minuend
+# b:   subtrahend
+# ret: lane-wise max(a - b, 0)
+pub fun subs_u16x8(a: u16x8, b: u16x8) u16x8 {
+    val diff: u16x8 = a - b;
+    val und:  u16x8 = a < b;
+    ret diff & ~und;
+}
+
+# saturating signed add of i8x16 lanes (clamps to [-128, 127])
+# ---
+# a:   first operand
+# b:   second operand
+# ret: lane-wise clamp(a + b, -128, 127)
+pub fun adds_i8x16(a: i8x16, b: i8x16) i8x16 {
+    val sum: i8x16 = a + b;
+    val z:   i8x16 = splat_i8x16(0);
+    val an:  u8x16 = a < z;
+    val bn:  u8x16 = b < z;
+    val sn:  u8x16 = sum < z;
+    val ovf: u8x16 = (~(an ^ bn)) & (an ^ sn); # equal operand signs, flipped result sign
+    val sat: i8x16 = select_i8x16(an, splat_i8x16(-128), splat_i8x16(127));
+    ret select_i8x16(ovf, sat, sum);
+}
+
+# saturating signed subtract of i8x16 lanes (clamps to [-128, 127])
+# ---
+# a:   minuend
+# b:   subtrahend
+# ret: lane-wise clamp(a - b, -128, 127)
+pub fun subs_i8x16(a: i8x16, b: i8x16) i8x16 {
+    val diff: i8x16 = a - b;
+    val z:    i8x16 = splat_i8x16(0);
+    val an:   u8x16 = a < z;
+    val bn:   u8x16 = b < z;
+    val dn:   u8x16 = diff < z;
+    val ovf:  u8x16 = (an ^ bn) & (an ^ dn); # opposite operand signs, flipped result sign
+    val sat:  i8x16 = select_i8x16(an, splat_i8x16(-128), splat_i8x16(127));
+    ret select_i8x16(ovf, sat, diff);
+}
+
+# saturating signed add of i16x8 lanes (clamps to [-32768, 32767])
+# ---
+# a:   first operand
+# b:   second operand
+# ret: lane-wise clamp(a + b, -32768, 32767)
+pub fun adds_i16x8(a: i16x8, b: i16x8) i16x8 {
+    val sum: i16x8 = a + b;
+    val z:   i16x8 = splat_i16x8(0);
+    val an:  u16x8 = a < z;
+    val bn:  u16x8 = b < z;
+    val sn:  u16x8 = sum < z;
+    val ovf: u16x8 = (~(an ^ bn)) & (an ^ sn);
+    val sat: i16x8 = select_i16x8(an, splat_i16x8(-32768), splat_i16x8(32767));
+    ret select_i16x8(ovf, sat, sum);
+}
+
+# saturating signed subtract of i16x8 lanes (clamps to [-32768, 32767])
+# ---
+# a:   minuend
+# b:   subtrahend
+# ret: lane-wise clamp(a - b, -32768, 32767)
+pub fun subs_i16x8(a: i16x8, b: i16x8) i16x8 {
+    val diff: i16x8 = a - b;
+    val z:    i16x8 = splat_i16x8(0);
+    val an:   u16x8 = a < z;
+    val bn:   u16x8 = b < z;
+    val dn:   u16x8 = diff < z;
+    val ovf:  u16x8 = (an ^ bn) & (an ^ dn);
+    val sat:  i16x8 = select_i16x8(an, splat_i16x8(-32768), splat_i16x8(32767));
+    ret select_i16x8(ovf, sat, diff);
+}
+
+test unsigned__saturates_on_carry_and_borrow_exact_otherwise {
+    val a: u8x16 = u8x16{200, 100, 255, 0, 10, 255, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    val b: u8x16 = u8x16{100, 100, 1, 0, 20, 1, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    val s: u8x16 = adds_u8x16(a, b);
+    if (s[0] != 255) { ret 1; } # 300 -> max
+    if (s[1] != 200) { ret 2; } # exact
+    if (s[2] != 255) { ret 3; } # 256 -> max
+    val d: u8x16 = subs_u8x16(a, b);
+    if (d[4] != 0)   { ret 4; } # 10-20 -> 0
+    if (d[5] != 254) { ret 5; } # exact
+    if (d[6] != 0)   { ret 6; } # 1-2 -> 0
+    val c:  u16x8 = u16x8{0xFFFF, 0x0F0F, 100, 0x00FF, 0x1000, 0, 0, 0};
+    val e:  u16x8 = u16x8{1, 0xF0F1, 200, 0x0100, 0x0FFF, 0, 0, 0};
+    val hs: u16x8 = adds_u16x8(c, e);
+    if (hs[0] != 0xFFFF) { ret 7; } # wrap -> max
+    if (hs[1] != 0xFFFF) { ret 8; } # exactly 0x10000 -> max
+    if (hs[2] != 300)    { ret 9; } # exact
+    val hd: u16x8 = subs_u16x8(c, e);
+    if (hd[3] != 0) { ret 10; } # borrow -> 0
+    if (hd[4] != 1) { ret 11; } # exact
+    ret 0;
+}
+
+test adds_signed__saturates_both_signs_and_straddles_exactly {
+    val a: i8x16 = i8x16{100, -100, 127, -128, 100, -128, 50, -1, 0, 0, 0, 0, 0, 0, 0, 0};
+    val b: i8x16 = i8x16{100, -100, 1, -1, 27, 127, -100, -1, 0, 0, 0, 0, 0, 0, 0, 0};
+    val r: i8x16 = adds_i8x16(a, b);
+    if (r[0] != 127)  { ret 1; } # 200 -> MAX
+    if (r[1] != -128) { ret 2; } # -200 -> MIN
+    if (r[2] != 127)  { ret 3; } # 128 -> MAX
+    if (r[3] != -128) { ret 4; } # -129 -> MIN
+    if (r[4] != 127)  { ret 5; } # 127 exact at the boundary
+    if (r[5] != -1)   { ret 6; } # opposite signs never overflow
+    if (r[6] != -50)  { ret 7; }
+    if (r[7] != -2)   { ret 8; }
+    val c: i16x8 = i16x8{32767, -32768, -32768, 100, 0, 0, 0, 0};
+    val d: i16x8 = i16x8{1, -1, 32767, 200, 0, 0, 0, 0};
+    val h: i16x8 = adds_i16x8(c, d);
+    if (h[0] != 32767)  { ret 9; }
+    if (h[1] != -32768) { ret 10; }
+    if (h[2] != -1)     { ret 11; }
+    if (h[3] != 300)    { ret 12; }
+    ret 0;
+}
+
+test subs_signed__saturates_both_signs_and_straddles_exactly {
+    val a: i8x16 = i8x16{127, -128, 0, -128, 5, 10, -128, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    val b: i8x16 = i8x16{-1, 1, -128, 127, -5, 20, -128, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    val r: i8x16 = subs_i8x16(a, b);
+    if (r[0] != 127)  { ret 1; } # 128 -> MAX
+    if (r[1] != -128) { ret 2; } # -129 -> MIN
+    if (r[2] != 127)  { ret 3; } # 0-(-128) -> MAX
+    if (r[3] != -128) { ret 4; } # -255 -> MIN
+    if (r[4] != 10)   { ret 5; } # opposite signs, no overflow
+    if (r[5] != -10)  { ret 6; }
+    if (r[6] != 0)    { ret 7; } # equal signs never overflow
+    val c: i16x8 = i16x8{32767, -32768, 0, 200, 0, 0, 0, 0};
+    val d: i16x8 = i16x8{-1, 1, -32768, -200, 0, 0, 0, 0};
+    val h: i16x8 = subs_i16x8(c, d);
+    if (h[0] != 32767)  { ret 8; }
+    if (h[1] != -32768) { ret 9; }
+    if (h[2] != 32767)  { ret 10; }
+    if (h[3] != 400)    { ret 11; }
+    ret 0;
+}

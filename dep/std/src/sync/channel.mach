@@ -1,0 +1,731 @@
+# bounded caller-owned multi-producer multi-consumer channel
+
+use std.chrono.time;
+use std.sync.atomic;
+use std.system.capability;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+
+$if (capability.HAS_THREADS) {
+    use std.sync.cancel;
+    use std.sync.condition;
+    use std.sync.mutex;
+    use std.sync.thread;
+    use std.system.os;
+    use std.system.panic;
+}
+$or {
+    $error("std.sync.channel needs the threads capability (std.system.capability.HAS_THREADS)");
+}
+
+# the outcome of a transfer
+# ---
+# invalid:   a nil or destroyed channel, a nil scope, a deadline outside the
+#            target range, or a refused native wait
+# sent:      the value is owned by the channel
+# received:  the value taken from the channel
+# full:      no slot was available (try_send)
+# empty:     no value was queued (try_receive)
+# closed:    the channel is closed (and drained, for receivers)
+# timed_out: the absolute deadline passed first
+# cancelled: the scope was cancelled first
+# aborted:   close_abort transferred every queued value
+pub tag Status[T]: u8 { invalid; sent; received: T; full; empty; closed; timed_out; cancelled; aborted; }
+
+# a refused channel state operation
+# ---
+# invalid:   a nil channel, nil storage, zero capacity, or a channel that was
+#            never made
+# destroyed: the channel has already been destroyed
+# open:      destruction refused while the channel is still open
+# busy:      destruction refused while values, waiters or in-flight callers
+#            remain
+pub tag StateError: u8 { invalid; destroyed; open; busy; }
+
+pub def Operation:  err[StateError];
+pub def Transition: res[bool, StateError];
+
+val GATE_CLOSED: i64 = -1;
+
+pub rec Channel[T] {
+    storage:     *T;
+    capacity:    usize;
+    head:        usize;
+    len:         usize;
+    open:        bool;
+    initialized: bool;
+    gate:        i64;
+    lock:        mutex.Mutex;
+    readable:    condition.Condition;
+    writable:    condition.Condition;
+}
+
+rec CancelWait {
+    condition:    *condition.Condition;
+    lock:         *mutex.Mutex;
+    registration: *cancel.Registration;
+    done:         i64;
+}
+
+fun cancellation_wake(context: ptr, reason: cancel.Reason) {
+    val wait: *CancelWait = context::*CancelWait;
+    mutex.lock(wait.lock);
+    condition.broadcast(wait.condition);
+    mutex.unlock(wait.lock);
+}
+
+fun cancellation_complete(context: ptr, reason: cancel.Reason) {
+    val wait:         *CancelWait          = context::*CancelWait;
+    val lock:         *mutex.Mutex         = wait.lock;
+    val registration: *cancel.Registration = wait.registration;
+    val done:         *i64                 = ?wait.done;
+    mutex.lock(lock);
+    atomic.store(done, 1);
+    os.thread_wake(done);
+    val finished: cancel.Transition = cancel.finish(registration);
+    mutex.unlock(lock);
+    var owned: bool = false;
+    if (sel finished.ok) { owned = finished.ok; }
+    if (!owned)          { panic.panic("std.sync.channel: cancellation completion lost ownership\n"); }
+}
+
+fun cancellation_status[T](reason: cancel.Reason) Status[T] {
+    if (sel reason.timed_out) { ret Status[T].timed_out{}; }
+    if (sel reason.cancelled) { ret Status[T].cancelled{}; }
+    ret Status[T].invalid{};
+}
+
+fun deadline_valid(deadline: time.Instant) bool {
+    ret deadline.sec >= 0 && deadline.nsec >= 0 && deadline.nsec < 1000000000;
+}
+
+# a failed clock leaves the deadline to the native timed wait
+fun deadline_passed(deadline: time.Instant) bool {
+    val now: time.InstantClock = time.instant();
+    ret sel now.ok && !time.instant_before(now.ok, deadline);
+}
+
+# a failed clock leaves the scope's deadline to the native timed wait
+fun drive_deadline(scope: *cancel.Scope) {
+    val now: time.InstantClock = time.instant();
+    if (sel now.ok) { cancel.expire(scope, now.ok); }
+}
+
+fun enter[T](channel: *Channel[T]) bool {
+    if (channel == nil) { ret false; }
+    for (true) {
+        val current: i64 = atomic.load(?channel.gate);
+        if (current == GATE_CLOSED) { ret false; }
+        var expected: i64 = current;
+        if (atomic.cas(?channel.gate, ?expected, current + 1)) { ret true; }
+    }
+    ret false;
+}
+
+fun leave[T](channel: *Channel[T]) {
+    atomic.fetch_sub(?channel.gate, 1);
+}
+
+# channels are unfair, unpoisoned, and own no storage or target handles
+# storage and the channel address remain stable until close and waiter exit
+pub fun make[T](channel: *Channel[T], storage: *T, capacity: usize) Operation {
+    if (channel == nil || storage == nil || capacity == 0) { ret Operation.err{StateError.invalid{}}; }
+    channel.storage     = storage;
+    channel.capacity    = capacity;
+    channel.head        = 0;
+    channel.len         = 0;
+    channel.open        = true;
+    channel.initialized = true;
+    channel.gate        = 0;
+    channel.lock        = mutex.make();
+    channel.readable    = condition.make();
+    channel.writable    = condition.make();
+    ret Operation.ok{};
+}
+
+fun send_locked[T](channel: *Channel[T], value: T) Status[T] {
+    if (!channel.open)                   { ret Status[T].closed{}; }
+    if (channel.len == channel.capacity) { ret Status[T].full{}; }
+    val index: usize = (channel.head + channel.len) % channel.capacity;
+    channel.storage[index] = value;
+    channel.len            = channel.len + 1;
+    condition.signal(?channel.readable);
+    ret Status[T].sent{};
+}
+
+# the caller retains value unless the send succeeds
+pub fun try_send[T](channel: *Channel[T], value: T) Status[T] {
+    if (!enter[T](channel)) { ret Status[T].invalid{}; }
+    mutex.lock(?channel.lock);
+    val status: Status[T] = send_locked[T](channel, value);
+    mutex.unlock(?channel.lock);
+    leave[T](channel);
+    ret status;
+}
+
+# blocking send sleeps until one slot is owned or the channel closes
+pub fun send[T](channel: *Channel[T], value: T) Status[T] {
+    if (!enter[T](channel)) { ret Status[T].invalid{}; }
+    mutex.lock(?channel.lock);
+    for (channel.open && channel.len == channel.capacity) {
+        condition.wait(?channel.writable, ?channel.lock);
+    }
+    val status: Status[T] = send_locked[T](channel, value);
+    mutex.unlock(?channel.lock);
+    leave[T](channel);
+    ret status;
+}
+
+# deadlines are absolute monotonic instants and never fire early
+pub fun send_until[T](channel: *Channel[T], value: T, deadline: time.Instant) Status[T] {
+    if (!deadline_valid(deadline) || !enter[T](channel)) { ret Status[T].invalid{}; }
+    mutex.lock(?channel.lock);
+    var result: Status[T] = Status[T].full{};
+    for (channel.open && channel.len == channel.capacity && sel result.full) {
+        if (deadline_passed(deadline)) {
+            result = Status[T].timed_out{};
+        }
+        or {
+            val waited: condition.WaitStatus = condition.wait_until(?channel.writable, ?channel.lock, deadline);
+            if (sel waited.timed_out) { result = Status[T].timed_out{}; }
+            or (!sel waited.notified) { result = Status[T].invalid{}; }
+        }
+    }
+    val slot_free: bool = sel result.full;
+    if (slot_free) { result = send_locked[T](channel, value); }
+    mutex.unlock(?channel.lock);
+    leave[T](channel);
+    ret result;
+}
+
+fun scope_deadline(scope: *cancel.Scope) opt[cancel.Deadline] {
+    val query: cancel.DeadlineQuery = cancel.get_deadline(scope);
+    if (sel query.ok) { ret query.ok; }
+    ret opt[cancel.Deadline].none{};
+}
+
+# waits for the completion hook when cancellation already claimed the registration
+fun release_registration(registration: *cancel.Registration, wait: *CancelWait) {
+    val detached: cancel.Transition = cancel.unregister(registration);
+    var owned:    bool              = false;
+    if (sel detached.ok) { owned = detached.ok; }
+    if (owned)           { ret; }
+    for (atomic.load(?wait.done) == 0) { os.thread_wait(?wait.done, 0); }
+    mutex.lock(wait.lock);
+    mutex.unlock(wait.lock);
+}
+
+# cancellation owns the registration until unregister or completion returns
+pub fun send_scoped[T](channel: *Channel[T], scope: *cancel.Scope, value: T) Status[T] {
+    if (scope == nil || !enter[T](channel)) { ret Status[T].invalid{}; }
+    drive_deadline(scope);
+    var registration: cancel.Registration;
+    cancel.init_registration(?registration);
+    var wait:     CancelWait    = CancelWait{condition: ?channel.writable, lock: ?channel.lock, registration: ?registration, done: 0};
+    val attached: cancel.Reason = cancel.attach_with_completion(scope, ?registration, cancellation_wake, cancellation_complete, (?wait)::ptr);
+    if (!sel attached.active) {
+        leave[T](channel);
+        ret cancellation_status[T](attached);
+    }
+
+    val deadline: opt[cancel.Deadline] = scope_deadline(scope);
+    var result:   Status[T]            = Status[T].invalid{};
+    var complete: bool                 = false;
+    for (!complete) {
+        drive_deadline(scope);
+        val reason: cancel.Reason = cancel.reason(scope);
+        if (!sel reason.active) {
+            result   = cancellation_status[T](reason);
+            complete = true;
+        }
+        or {
+            mutex.lock(?channel.lock);
+            val locked_reason: cancel.Reason = cancel.reason(scope);
+            if (!sel locked_reason.active) {
+                result = cancellation_status[T](locked_reason);
+            }
+            or {
+                result = send_locked[T](channel, value);
+            }
+            val slot_free: bool = sel result.full;
+            if (!slot_free) {
+                mutex.unlock(?channel.lock);
+                complete = true;
+            }
+            or (sel deadline.some) {
+                val waited: condition.WaitStatus = condition.wait_until(?channel.writable, ?channel.lock, deadline.some.at);
+                mutex.unlock(?channel.lock);
+                if (sel waited.timed_out) {
+                    cancel.timeout(deadline.some.owner);
+                }
+                or (!sel waited.notified) {
+                    result   = Status[T].invalid{};
+                    complete = true;
+                }
+            }
+            or {
+                condition.wait(?channel.writable, ?channel.lock);
+                mutex.unlock(?channel.lock);
+            }
+        }
+    }
+
+    release_registration(?registration, ?wait);
+    leave[T](channel);
+    ret result;
+}
+
+fun receive_locked[T](channel: *Channel[T]) Status[T] {
+    if (channel.len == 0) {
+        if (!channel.open) { ret Status[T].closed{}; }
+        ret Status[T].empty{};
+    }
+    val value: T = channel.storage[channel.head];
+    channel.head = (channel.head + 1) % channel.capacity;
+    channel.len  = channel.len - 1;
+    condition.signal(?channel.writable);
+    ret Status[T].received{value};
+}
+
+# the value is carried on the received case only
+pub fun try_receive[T](channel: *Channel[T]) Status[T] {
+    if (!enter[T](channel)) { ret Status[T].invalid{}; }
+    mutex.lock(?channel.lock);
+    val status: Status[T] = receive_locked[T](channel);
+    mutex.unlock(?channel.lock);
+    leave[T](channel);
+    ret status;
+}
+
+# close drains accepted values before receivers observe closure
+pub fun receive[T](channel: *Channel[T]) Status[T] {
+    if (!enter[T](channel)) { ret Status[T].invalid{}; }
+    mutex.lock(?channel.lock);
+    for (channel.open && channel.len == 0) {
+        condition.wait(?channel.readable, ?channel.lock);
+    }
+    val status: Status[T] = receive_locked[T](channel);
+    mutex.unlock(?channel.lock);
+    leave[T](channel);
+    ret status;
+}
+
+pub fun receive_until[T](channel: *Channel[T], deadline: time.Instant) Status[T] {
+    if (!deadline_valid(deadline) || !enter[T](channel)) { ret Status[T].invalid{}; }
+    mutex.lock(?channel.lock);
+    var result: Status[T] = Status[T].empty{};
+    for (channel.open && channel.len == 0 && sel result.empty) {
+        if (deadline_passed(deadline)) {
+            result = Status[T].timed_out{};
+        }
+        or {
+            val waited: condition.WaitStatus = condition.wait_until(?channel.readable, ?channel.lock, deadline);
+            if (sel waited.timed_out) { result = Status[T].timed_out{}; }
+            or (!sel waited.notified) { result = Status[T].invalid{}; }
+        }
+    }
+    val nothing_queued: bool = sel result.empty;
+    if (nothing_queued) { result = receive_locked[T](channel); }
+    mutex.unlock(?channel.lock);
+    leave[T](channel);
+    ret result;
+}
+
+pub fun receive_scoped[T](channel: *Channel[T], scope: *cancel.Scope) Status[T] {
+    if (scope == nil || !enter[T](channel)) { ret Status[T].invalid{}; }
+    drive_deadline(scope);
+    var registration: cancel.Registration;
+    cancel.init_registration(?registration);
+    var wait:     CancelWait    = CancelWait{condition: ?channel.readable, lock: ?channel.lock, registration: ?registration, done: 0};
+    val attached: cancel.Reason = cancel.attach_with_completion(scope, ?registration, cancellation_wake, cancellation_complete, (?wait)::ptr);
+    if (!sel attached.active) {
+        leave[T](channel);
+        ret cancellation_status[T](attached);
+    }
+
+    val deadline: opt[cancel.Deadline] = scope_deadline(scope);
+    var result:   Status[T]            = Status[T].invalid{};
+    var complete: bool                 = false;
+    for (!complete) {
+        drive_deadline(scope);
+        val reason: cancel.Reason = cancel.reason(scope);
+        if (!sel reason.active) {
+            result   = cancellation_status[T](reason);
+            complete = true;
+        }
+        or {
+            mutex.lock(?channel.lock);
+            val locked_reason: cancel.Reason = cancel.reason(scope);
+            if (!sel locked_reason.active) {
+                result = cancellation_status[T](locked_reason);
+            }
+            or {
+                result = receive_locked[T](channel);
+            }
+            val nothing_queued: bool = sel result.empty;
+            if (!nothing_queued) {
+                mutex.unlock(?channel.lock);
+                complete = true;
+            }
+            or (sel deadline.some) {
+                val waited: condition.WaitStatus = condition.wait_until(?channel.readable, ?channel.lock, deadline.some.at);
+                mutex.unlock(?channel.lock);
+                if (sel waited.timed_out) {
+                    cancel.timeout(deadline.some.owner);
+                }
+                or (!sel waited.notified) {
+                    result   = Status[T].invalid{};
+                    complete = true;
+                }
+            }
+            or {
+                condition.wait(?channel.readable, ?channel.lock);
+                mutex.unlock(?channel.lock);
+            }
+        }
+    }
+
+    release_registration(?registration, ?wait);
+    leave[T](channel);
+    ret result;
+}
+
+# close is idempotent and wakes every blocked sender and receiver
+# ---
+# ret: true when this call closed the channel, false when it already was
+pub fun close[T](channel: *Channel[T]) Transition {
+    if (channel == nil)     { ret Transition.err{StateError.invalid{}}; }
+    if (!enter[T](channel)) { ret Transition.err{StateError.destroyed{}}; }
+    mutex.lock(?channel.lock);
+    if (!channel.open) {
+        mutex.unlock(?channel.lock);
+        leave[T](channel);
+        ret Transition.ok{false};
+    }
+    channel.open = false;
+    condition.broadcast(?channel.readable);
+    condition.broadcast(?channel.writable);
+    mutex.unlock(?channel.lock);
+    leave[T](channel);
+    ret Transition.ok{true};
+}
+
+# abort transfers every queued value to output in fifo order
+pub fun close_abort[T](channel: *Channel[T], output: *T, output_capacity: usize, output_len: *usize) Status[T] {
+    if (output_len == nil || !enter[T](channel)) { ret Status[T].invalid{}; }
+    mutex.lock(?channel.lock);
+    if (channel.len > output_capacity || (channel.len > 0 && output == nil)) {
+        mutex.unlock(?channel.lock);
+        leave[T](channel);
+        ret Status[T].invalid{};
+    }
+    var written: usize = 0;
+    for (written < channel.len) {
+        output[written] = channel.storage[(channel.head + written) % channel.capacity];
+        written         = written + 1;
+    }
+    channel.head = 0;
+    channel.len  = 0;
+    channel.open = false;
+    @output_len  = written;
+    condition.broadcast(?channel.readable);
+    condition.broadcast(?channel.writable);
+    mutex.unlock(?channel.lock);
+    leave[T](channel);
+    ret Status[T].aborted{};
+}
+
+pub fun count[T](channel: *Channel[T]) usize {
+    if (!enter[T](channel)) { ret 0; }
+    mutex.lock(?channel.lock);
+    val result: usize = channel.len;
+    mutex.unlock(?channel.lock);
+    leave[T](channel);
+    ret result;
+}
+
+pub fun is_closed[T](channel: *Channel[T]) bool {
+    if (!enter[T](channel)) { ret true; }
+    mutex.lock(?channel.lock);
+    val result: bool = !channel.open;
+    mutex.unlock(?channel.lock);
+    leave[T](channel);
+    ret result;
+}
+
+# destruction succeeds only after close, drain, and all waiter exit
+# ---
+# ret: ok once destroyed, invalid for a nil or never-made channel, destroyed
+#      when it already was, open while the channel is open, busy while values,
+#      waiters or in-flight callers remain
+pub fun destroy[T](channel: *Channel[T]) Operation {
+    if (channel == nil || !channel.initialized) { ret Operation.err{StateError.invalid{}}; }
+    mutex.lock(?channel.lock);
+    if (channel.open) {
+        mutex.unlock(?channel.lock);
+        ret Operation.err{StateError.open{}};
+    }
+    if (channel.len != 0 || condition.waiter_count(?channel.readable) != 0 || condition.waiter_count(?channel.writable) != 0) {
+        mutex.unlock(?channel.lock);
+        ret Operation.err{StateError.busy{}};
+    }
+    var expected: i64 = 0;
+    if (!atomic.cas(?channel.gate, ?expected, GATE_CLOSED)) {
+        mutex.unlock(?channel.lock);
+        if (expected == GATE_CLOSED) { ret Operation.err{StateError.destroyed{}}; }
+        ret Operation.err{StateError.busy{}};
+    }
+    channel.storage     = nil;
+    channel.capacity    = 0;
+    channel.head        = 0;
+    channel.initialized = false;
+    mutex.unlock(?channel.lock);
+    ret Operation.ok{};
+}
+
+#[testing]
+fun made(r: Operation) bool {
+    ret sel r.ok;
+}
+
+fun sent(s: Status[i64]) bool {
+    ret sel s.sent;
+}
+
+#[testing]
+fun is_full(s: Status[i64]) bool {
+    ret sel s.full;
+}
+
+#[testing]
+fun is_closed_status(s: Status[i64]) bool {
+    ret sel s.closed;
+}
+
+#[testing]
+fun is_timed_out(s: Status[i64]) bool {
+    ret sel s.timed_out;
+}
+
+#[testing]
+fun is_cancelled(s: Status[i64]) bool {
+    ret sel s.cancelled;
+}
+
+#[testing]
+fun is_aborted(s: Status[i64]) bool {
+    ret sel s.aborted;
+}
+
+#[testing]
+fun took(s: Status[i64], out: *i64) bool {
+    if (sel s.received) {
+        @out = s.received;
+        ret true;
+    }
+    ret false;
+}
+
+test channel__immediate_send_receive_close_and_abort_preserve_ownership {
+    var storage: [3]i64;
+    var channel: Channel[i64];
+    if (!made(make[i64](?channel, (?storage)::*i64, 3)))                                                                { ret 1; }
+    if (!sent(try_send[i64](?channel, 10)) || !sent(try_send[i64](?channel, 20)) || !sent(try_send[i64](?channel, 30))) { ret 2; }
+    if (!is_full(try_send[i64](?channel, 40)))                                                                          { ret 3; }
+    var value: i64 = 99;
+    if (!took(try_receive[i64](?channel), ?value) || value != 10) { ret 4; }
+    var rejected:     [3]i64;
+    var rejected_len: usize = 0;
+    if (!is_aborted(close_abort[i64](?channel, (?rejected)::*i64, 3, ?rejected_len)))                    { ret 5; }
+    if (rejected_len != 2 || rejected[0] != 20 || rejected[1] != 30)                                     { ret 6; }
+    if (!is_closed_status(try_send[i64](?channel, 50)) || !is_closed_status(try_receive[i64](?channel))) { ret 7; }
+    if (!made(destroy[i64](?channel)))                                                                   { ret 8; }
+    ret 0;
+}
+
+# make refuses nil storage and zero capacity, close reports its transition
+# once, and destroy refuses an open, a non-empty or an already destroyed channel
+test channel__lifecycle_refusals_and_close_once {
+    var storage:    [2]i64;
+    var channel:    Channel[i64];
+    val no_storage: Operation = make[i64](?channel, nil, 1);
+    if (!sel no_storage.err)         { ret 15; }
+    if (!sel no_storage.err.invalid) { ret 15; }
+    val no_capacity: Operation = make[i64](?channel, (?storage)::*i64, 0);
+    if (!sel no_capacity.err)                            { ret 16; }
+    if (!sel no_capacity.err.invalid)                    { ret 16; }
+    if (!made(make[i64](?channel, (?storage)::*i64, 2))) { ret 1; }
+    val while_open: Operation = destroy[i64](?channel);
+    if (!sel while_open.err)               { ret 2; }
+    if (!sel while_open.err.open)          { ret 3; }
+    if (!sent(try_send[i64](?channel, 7))) { ret 4; }
+    val first: Transition = close[i64](?channel);
+    if (!sel first.ok) { ret 5; }
+    if (!first.ok)     { ret 6; }
+    val second: Transition = close[i64](?channel);
+    if (!sel second.ok) { ret 7; }
+    if (second.ok)      { ret 8; }
+    val queued: Operation = destroy[i64](?channel);
+    if (!sel queued.err)      { ret 9; }
+    if (!sel queued.err.busy) { ret 10; }
+    var value: i64 = 0;
+    if (!took(try_receive[i64](?channel), ?value) || value != 7) { ret 11; }
+    if (!made(destroy[i64](?channel)))                           { ret 12; }
+    val again: Operation = destroy[i64](?channel);
+    if (!sel again.err)         { ret 13; }
+    if (!sel again.err.invalid) { ret 14; }
+    ret 0;
+}
+
+test channel__deadline_and_prior_cancellation_reject_without_transfer {
+    var storage: [1]i64;
+    var channel: Channel[i64];
+    if (!made(make[i64](?channel, (?storage)::*i64, 1))) { ret 1; }
+    if (!sent(try_send[i64](?channel, 1)))               { ret 2; }
+    val started: time.InstantClock = time.instant();
+    if (sel started.err) { ret 3; }
+    val deadline: time.Instant = time.instant_add(started.ok, 1000000);
+    if (!is_timed_out(send_until[i64](?channel, 2, deadline)) || count[i64](?channel) != 1) { ret 4; }
+
+    var scope:      cancel.Scope;
+    val made_scope: cancel.Operation = cancel.make_root(?scope, opt[time.Instant].none{});
+    if (sel made_scope.err) { ret 5; }
+    val cancelled: cancel.Transition = cancel.cancel(?scope);
+    if (sel cancelled.err)                                                                 { ret 6; }
+    if (!is_cancelled(send_scoped[i64](?channel, ?scope, 3)) || count[i64](?channel) != 1) { ret 7; }
+    val destroyed: cancel.Operation = cancel.destroy(?scope);
+    if (sel destroyed.err) { ret 8; }
+    var value: i64;
+    if (!took(try_receive[i64](?channel), ?value) || value != 1) { ret 9; }
+    close[i64](?channel);
+    if (!made(destroy[i64](?channel))) { ret 10; }
+    ret 0;
+}
+
+#[testing]
+rec ScopedSendContext {
+    channel:   *Channel[i64];
+    scope:     *cancel.Scope;
+    entered:   *i64;
+    cancelled: *i64;
+}
+
+#[testing]
+fun scoped_sender(arg: *u8) {
+    val context: *ScopedSendContext = arg::*ScopedSendContext;
+    atomic.store(context.entered, 1);
+    os.thread_wake(context.entered);
+    val status:    Status[i64] = send_scoped[i64](context.channel, context.scope, 2);
+    var cancelled: i64         = 0;
+    if (sel status.cancelled) { cancelled = 1; }
+    atomic.store(context.cancelled, cancelled);
+}
+
+test channel__cancellation_wakes_a_blocked_sender_without_transferring_its_value {
+    var storage: [1]i64;
+    var channel: Channel[i64];
+    if (!made(make[i64](?channel, (?storage)::*i64, 1)) || !sent(try_send[i64](?channel, 1))) { ret 1; }
+    var scope:      cancel.Scope;
+    val made_scope: cancel.Operation = cancel.make_root(?scope, opt[time.Instant].none{});
+    if (sel made_scope.err) { ret 2; }
+    var entered:   i64               = 0;
+    var cancelled: i64               = 0;
+    var context:   ScopedSendContext = ScopedSendContext{channel: ?channel, scope: ?scope, entered: ?entered, cancelled: ?cancelled};
+    var sender:    thread.Thread;
+    thread.spawn_with(scoped_sender, (?context)::*u8, ?sender);
+    if (sender.tid < 0) { ret 3; }
+    for (atomic.load(?entered) == 0) { os.thread_wait(?entered, 0); }
+    cancel.cancel(?scope);
+    thread.join(?sender);
+    if (atomic.load(?cancelled) != 1 || count[i64](?channel) != 1) { ret 4; }
+    val destroyed: cancel.Operation = cancel.destroy(?scope);
+    if (sel destroyed.err) { ret 5; }
+    var value: i64;
+    if (!took(try_receive[i64](?channel), ?value) || value != 1) { ret 6; }
+    close[i64](?channel);
+    if (!made(destroy[i64](?channel))) { ret 7; }
+    ret 0;
+}
+
+#[testing]
+rec ProducerContext {
+    channel: *Channel[i64];
+    first:   i64;
+    count:   usize;
+    failed:  *i64;
+}
+
+#[testing]
+fun producer(arg: *u8) {
+    val context: *ProducerContext = arg::*ProducerContext;
+    var i:       usize            = 0;
+    for (i < context.count) {
+        if (!sent(send[i64](context.channel, context.first + i::i64))) {
+            atomic.store(context.failed, 1);
+            ret;
+        }
+        i = i + 1;
+    }
+}
+
+#[testing]
+rec ConsumerContext {
+    channel:  *Channel[i64];
+    received: *i64;
+    sum:      *i64;
+}
+
+#[testing]
+fun consumer(arg: *u8) {
+    val context: *ConsumerContext = arg::*ConsumerContext;
+    var value:   i64              = 0;
+    for (took(receive[i64](context.channel), ?value)) {
+        atomic.fetch_add(context.received, 1);
+        atomic.fetch_add(context.sum, value);
+    }
+}
+
+test channel__concurrent_producers_and_consumers_lose_no_values_or_wakeups {
+    var storage: [7]i64;
+    var channel: Channel[i64];
+    if (!made(make[i64](?channel, (?storage)::*i64, 7))) { ret 1; }
+    var received:          i64             = 0;
+    var sum:               i64             = 0;
+    var failed:            i64             = 0;
+    var consumer_context:  ConsumerContext = ConsumerContext{channel: ?channel, received: ?received, sum: ?sum};
+    var consumers:         [3]thread.Thread;
+    var producers:         [4]thread.Thread;
+    var producer_contexts: [4]ProducerContext;
+    var i:                 usize           = 0;
+    for (i < 3) {
+        thread.spawn_with(consumer, (?consumer_context)::*u8, ?consumers[i]);
+        if (consumers[i].tid < 0) { ret 2; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < 4) {
+        producer_contexts[i] = ProducerContext{channel: ?channel, first: (i * 200)::i64, count: 200, failed: ?failed};
+        thread.spawn_with(producer, (?producer_contexts[i])::*u8, ?producers[i]);
+        if (producers[i].tid < 0) { ret 3; }
+        i = i + 1;
+    }
+    i = 0;
+    for (i < 4) {
+        thread.join(?producers[i]);
+        i = i + 1;
+    }
+    close[i64](?channel);
+    i = 0;
+    for (i < 3) {
+        thread.join(?consumers[i]);
+        i = i + 1;
+    }
+    if (atomic.load(?failed) != 0 || atomic.load(?received) != 800 || atomic.load(?sum) != 319600) { ret 4; }
+    if (!made(destroy[i64](?channel)))                                                             { ret 5; }
+    ret 0;
+}

@@ -1,0 +1,1974 @@
+# filesystem access over the platform namespace
+#
+# three layers: handle operations on an open File; whole-file convenience
+# composing std.io (a File adapts to a Reader/Writer, so content flows through
+# io.read_all/read_exact/write_all rather than hand-rolled loops); and
+# namespace operations on a Path.
+#
+# outcomes are the canonical tags. a handle operation and a single native
+# namespace effect report io_error.Error; a composite operation reports
+# FsError, which names the step that refused; the existence queries answer
+# res[bool, io_error.Error], where a missing path is a successful false.
+
+use std.chrono.time.Time;
+use std.collections.vector.Vector;
+use identities: std.system.file_identity;
+use std.text.string.str_free;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.path.Path;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.StrError;
+use std.types.string.str;
+use std.types.string.str_copy;
+use std.types.string.str_equals;
+use std.types.string.str_len;
+fwd identities.Identity;
+use std.allocator.fixed;
+use std.chrono.time;
+use std.collections.vector;
+use io_error:  std.io.error;
+use io_handle: std.io.handle;
+use std.memory;
+use std.types.path;
+
+use A: std.allocator;
+
+use m_reader: std.io.reader;
+use std.io.reader.ReadError;
+use m_writer: std.io.writer;
+use std.io.writer.WriteError;
+use std.system.capability;
+
+$if (capability.HAS_FILES) {
+    use alloc_testing: std.allocator.testing;
+    use std.crypto.rand;
+    use fsnative: std.filesystem.native;
+    use std.filesystem.removal;
+    use std.system.os;
+}
+$or {
+    $error("std.filesystem needs the files capability (std.system.capability.HAS_FILES)");
+}
+
+# an open file with a native-width opaque handle
+pub rec File {
+    handle: io_handle.FileHandle;
+}
+
+# why a composite filesystem operation refused
+# ---
+# io:        a native refusal, with its operation and any cleanup failure
+# alloc:     the allocator refused
+# read:      the content read failed; eof is a file shorter than its size said
+# write:     the content write failed; the payload is the persisted prefix
+# removal:   a recursive removal refused, by containment or natively
+# exhausted: every candidate temporary name was taken
+# published: the replacement is visible, but the directory flush after it failed
+pub tag FsError: u8 {
+    io:      io_error.Error;
+    alloc:   A.Error;
+    read:    ReadError;
+    write:   WriteError;
+    removal: removal.Error;
+    exhausted;
+    published: io_error.Error;
+}
+
+fun native(code: i64, operation: io_error.Operation) FsError {
+    ret FsError.io{os.error(code, operation)};
+}
+
+# a request this module refuses on its own, with no native code behind it
+fun refusal(kind: io_error.Kind, operation: io_error.Operation) FsError {
+    ret FsError.io{io_error.make(kind, operation)};
+}
+
+# keep the primary failure and record the first cleanup failure beside it
+fun with_cleanup(primary: io_error.Error, code: i64) io_error.Error {
+    var result: io_error.Error = primary;
+    if (code < 0 && result.cleanup_code == 0) { result.cleanup_code = code; }
+    ret result;
+}
+
+fun cleanup_code(cleaned: err[io_error.Error]) i64 {
+    if (sel cleaned.err) { ret cleaned.err.code; }
+    ret 0;
+}
+
+# what a path resolves to
+pub def Kind: u8;
+pub val KIND_OTHER:   Kind = 0;
+pub val KIND_FILE:    Kind = 1;
+pub val KIND_DIR:     Kind = 2;
+pub val KIND_SYMLINK: Kind = 3;
+
+# portable file metadata
+# ---
+# kind:     file, directory, symlink, or other
+# size:     size in bytes
+# mode:     raw permission/type bits (POSIX; synthesized elsewhere)
+# modified: last modification time
+# accessed: last access time
+# created:  birth time when the platform provides it, else none
+pub rec Metadata {
+    kind:     Kind;
+    size:     usize;
+    mode:     u32;
+    modified: Time;
+    accessed: Time;
+    created:  opt[Time];
+}
+
+# the standard streams, as already-open files
+pub val STDIN:  File = File{handle: io_handle.FileHandle{value: 0}};
+pub val STDOUT: File = File{handle: io_handle.FileHandle{value: 1}};
+pub val STDERR: File = File{handle: io_handle.FileHandle{value: 2}};
+
+# seek anchors for `seek`
+fwd os.SEEK_SET;
+fwd os.SEEK_CUR;
+fwd os.SEEK_END;
+
+# open a file for reading
+# ---
+# p:   file path
+# ret: the open file, or the native refusal
+pub fun open(p: Path) res[File, io_error.Error] {
+    if (p == nil) { ret res[File, io_error.Error].err{io_error.make(io_error.INVALID, io_error.OP_OPEN)}; }
+
+    var raw_handle: usize = os.INVALID_HANDLE;
+    val raw:        i64   = os.open(os.working_dir(), p, os.O_RDONLY, 0, ?raw_handle);
+    if (raw < 0) { ret res[File, io_error.Error].err{os.error(raw, io_error.OP_OPEN)}; }
+
+    ret res[File, io_error.Error].ok{File{handle: io_handle.FileHandle{value: raw_handle}}};
+}
+
+# create or truncate a file for writing
+# ---
+# p:    file path
+# mode: permission bits for a newly created file
+# ret:  the open file, or the native refusal
+pub fun create(p: Path, mode: i32) res[File, io_error.Error] {
+    if (p == nil) { ret res[File, io_error.Error].err{io_error.make(io_error.INVALID, io_error.OP_CREATE)}; }
+
+    val flags:      i32   = os.O_CREAT | os.O_TRUNC | os.O_WRONLY;
+    var raw_handle: usize = os.INVALID_HANDLE;
+    val raw:        i64   = os.open(os.working_dir(), p, flags, mode, ?raw_handle);
+    if (raw < 0) { ret res[File, io_error.Error].err{os.error(raw, io_error.OP_CREATE)}; }
+
+    ret res[File, io_error.Error].ok{File{handle: io_handle.FileHandle{value: raw_handle}}};
+}
+
+# close an open file; the handle is invalid afterwards whatever the outcome
+# ---
+# f:   file to close
+# ret: ok, or the native refusal (a closed handle is EBADF)
+pub fun close(f: *File) err[io_error.Error] {
+    if (f == nil || !io_handle.file_is_valid(f.handle)) {
+        ret err[io_error.Error].err{io_error.make(io_error.CLOSED, io_error.OP_CLOSE)};
+    }
+    val value: usize = f.handle.value;
+    f.handle = io_handle.invalid_file();
+    val raw: i64 = os.close(value);
+    if (raw < 0) { ret err[io_error.Error].err{os.error(raw, io_error.OP_CLOSE)}; }
+
+    ret err[io_error.Error].ok{};
+}
+
+# flush an open file's data and metadata to its backing storage
+# ---
+# f:   file to flush
+# ret: ok, or the native refusal
+pub fun sync(f: File) err[io_error.Error] {
+    val raw: i64 = os.sync_fd(f.handle.value);
+    if (raw < 0) { ret err[io_error.Error].err{os.error(raw, io_error.OP_SYNC)}; }
+
+    ret err[io_error.Error].ok{};
+}
+
+# read up to len bytes into buf
+# ---
+# f:   file to read from
+# buf: destination buffer
+# len: maximum bytes to read
+# ret: bytes read (0 at end of file), or the native refusal
+pub fun read(f: File, buf: *u8, len: usize) res[usize, io_error.Error] {
+    val n: i64 = os.read(f.handle.value, buf, len);
+    if (n < 0) { ret res[usize, io_error.Error].err{os.error(n, io_error.OP_READ)}; }
+
+    ret res[usize, io_error.Error].ok{n::usize};
+}
+
+# write up to len bytes from buf
+# ---
+# f:   file to write to
+# buf: source buffer
+# len: bytes to write
+# ret: bytes written, or the native refusal
+pub fun write(f: File, buf: *u8, len: usize) res[usize, io_error.Error] {
+    val n: i64 = os.write(f.handle.value, buf, len);
+    if (n < 0) { ret res[usize, io_error.Error].err{os.error(n, io_error.OP_WRITE)}; }
+
+    ret res[usize, io_error.Error].ok{n::usize};
+}
+
+# reposition the file offset
+# ---
+# f:      file to seek
+# offset: byte offset relative to whence
+# whence: SEEK_SET, SEEK_CUR, or SEEK_END
+# ret:    the resulting absolute offset, or the native refusal
+pub fun seek(f: File, offset: i64, whence: i32) res[i64, io_error.Error] {
+    val n: i64 = os.seek(f.handle.value, offset, whence);
+    if (n < 0) { ret res[i64, io_error.Error].err{os.error(n, io_error.OP_SEEK)}; }
+
+    ret res[i64, io_error.Error].ok{n};
+}
+
+# io read callback; the file's fd rides in the ctx slot. zero bytes is the end
+# of the stream and the reader classifies it
+fun file_read_cb(ctx: ptr, buf: *u8, len: usize) res[usize, ReadError] {
+    val file:   File                       = File{handle: io_handle.FileHandle{value: ctx::usize}};
+    val result: res[usize, io_error.Error] = read(file, buf, len);
+    if (sel result.err) { ret res[usize, ReadError].err{m_reader.native_failure(0, result.err)}; }
+    ret res[usize, ReadError].ok{result.ok};
+}
+
+# io write callback; the file's fd rides in the ctx slot
+fun file_write_cb(ctx: ptr, buf: *u8, len: usize) res[usize, WriteError] {
+    val file:   File                       = File{handle: io_handle.FileHandle{value: ctx::usize}};
+    val result: res[usize, io_error.Error] = write(file, buf, len);
+    if (sel result.err) { ret res[usize, WriteError].err{m_writer.native_failure(0, result.err)}; }
+    ret res[usize, WriteError].ok{result.ok};
+}
+
+# adapt a file to an io.Reader (the file must outlive the reader)
+# ---
+# f:   file to read from
+# ret: a Reader drawing from f
+pub fun reader(f: File) m_reader.Reader {
+    var r: m_reader.Reader;
+    r.ctx    = f.handle.value::ptr;
+    r.f_read = file_read_cb;
+    ret r;
+}
+
+# adapt a file to an io.Writer (the file must outlive the writer)
+# ---
+# f:   file to write to
+# ret: a Writer feeding f
+pub fun writer(f: File) m_writer.Writer {
+    var w: m_writer.Writer;
+    w.ctx     = f.handle.value::ptr;
+    w.f_write = file_write_cb;
+    ret w;
+}
+
+# read an entire file into an allocated byte buffer
+#
+# composes io.read_all over the file's Reader: grows as it reads, so it needs
+# no size assumption. the caller owns the returned vector; on failure nothing
+# is owned.
+# ---
+# a:   allocator for the result
+# p:   file path
+# ret: the file contents, or why they could not be read
+pub fun read_bytes(a: *A.Allocator, p: Path) res[Vector[u8], FsError] {
+    if (a == nil) { ret res[Vector[u8], FsError].err{refusal(io_error.INVALID, io_error.OP_OPEN)}; }
+    val ro: res[File, io_error.Error] = open(p);
+    if (sel ro.err) { ret res[Vector[u8], FsError].err{FsError.io{ro.err}}; }
+    var f: File = ro.ok;
+
+    var rd:      m_reader.Reader            = reader(f);
+    val content: res[Vector[u8], ReadError] = m_reader.read_all(a, ?rd);
+    val closed:  err[io_error.Error]        = close(?f);
+
+    if (sel content.err) { ret res[Vector[u8], FsError].err{FsError.read{content.err}}; }
+    if (sel closed.err) {
+        var owned: Vector[u8] = content.ok;
+        vector.dnit[u8](?owned);
+        ret res[Vector[u8], FsError].err{FsError.io{closed.err}};
+    }
+    ret res[Vector[u8], FsError].ok{content.ok};
+}
+
+# read an entire file into an allocated, null-terminated string
+#
+# stats the file for its size and composes io.read_exact into an exact buffer,
+# allocating once with no growth. for text; binary content with embedded NUL
+# bytes loses its length to the first NUL when read through str_len. a file
+# that shrinks between the stat and the read is reported as read{eof} with the
+# bytes that were delivered, and nothing stays allocated.
+# ---
+# a:   allocator for the result
+# p:   file path
+# ret: the file contents, or why they could not be read
+pub fun read_string(a: *A.Allocator, p: Path) res[str, FsError] {
+    if (a == nil) { ret res[str, FsError].err{refusal(io_error.INVALID, io_error.OP_OPEN)}; }
+    val ro: res[File, io_error.Error] = open(p);
+    if (sel ro.err) { ret res[str, FsError].err{FsError.io{ro.err}}; }
+    var f: File = ro.ok;
+
+    # size the buffer from the open handle
+    var st: os.stat_t;
+    val sr: i64 = os.stat(f.handle.value, ?st);
+    if (sr < 0) {
+        val closed: err[io_error.Error] = close(?f);
+        ret res[str, FsError].err{FsError.io{with_cleanup(os.error(sr, io_error.OP_OPTION), cleanup_code(closed))}};
+    }
+    if (st.st_size < 0 || st.st_size::u64 >= (-1)::usize::u64) {
+        val closed: err[io_error.Error] = close(?f);
+        ret res[str, FsError].err{FsError.io{with_cleanup(io_error.make(io_error.RANGE, io_error.OP_READ), cleanup_code(closed))}};
+    }
+    val size: usize = st.st_size::usize;
+
+    val ar: res[*u8, A.Error] = A.allocate[u8](a, size + 1);
+    if (sel ar.err) {
+        close(?f);
+        ret res[str, FsError].err{FsError.alloc{ar.err}};
+    }
+    val buf: *u8 = ar.ok;
+
+    var rd:     m_reader.Reader     = reader(f);
+    val e:      err[ReadError]      = m_reader.read_exact(?rd, buf, size);
+    val closed: err[io_error.Error] = close(?f);
+    if (sel e.err) {
+        A.deallocate[u8](a, buf, size + 1);
+        ret res[str, FsError].err{FsError.read{e.err}};
+    }
+    if (sel closed.err) {
+        A.deallocate[u8](a, buf, size + 1);
+        ret res[str, FsError].err{FsError.io{closed.err}};
+    }
+
+    buf[size] = 0;
+    ret res[str, FsError].ok{buf::str};
+}
+
+# welded storage from std.memory.secret needs entropy and pages beside files
+$if (capability.HAS_ENTROPY && capability.HAS_PAGES) {
+    use secret_memory: std.memory.secret;
+
+    # a file's bytes in secret-welded storage
+    # ---
+    # data: allocation from std.memory.secret, nil for an empty file
+    # size: byte count, and the size to release with secret.deallocate
+    pub rec SecretBytes {
+        data: *^u8;
+        size: usize;
+    }
+
+    # read an entire open file straight into secret-welded storage
+    #
+    # stats the handle for its size, allocates welded storage once, and has the
+    # kernel read into it through std.memory.secret.read_at, so the bytes never
+    # pass through public memory. reads are positioned from offset zero, so the
+    # handle's position neither matters nor moves, and the handle stays open
+    # for the caller to close. a caller that checks the file before trusting it
+    # checks and reads this one handle. the caller owns the result and releases
+    # it with std.memory.secret.deallocate(data, size). the file must support
+    # positioned reads. a file that shrinks between the stat and the read is
+    # reported as read{eof} with the bytes that were delivered, and the storage
+    # is wiped and released before any error returns.
+    # ---
+    # f:   open file to read
+    # ret: the file contents in welded storage, or why they could not be read
+    pub fun read_secret_of(f: File) res[SecretBytes, FsError] {
+        var st: os.stat_t;
+        val sr: i64 = os.stat(f.handle.value, ?st);
+        if (sr < 0) { ret res[SecretBytes, FsError].err{FsError.io{os.error(sr, io_error.OP_OPTION)}}; }
+        if (st.st_size < 0 || st.st_size::u64 > (-1)::usize::u64) {
+            ret res[SecretBytes, FsError].err{FsError.io{io_error.make(io_error.RANGE, io_error.OP_READ)}};
+        }
+        val size: usize = st.st_size::usize;
+        if (size == 0) { ret res[SecretBytes, FsError].ok{SecretBytes{data: nil, size: 0}}; }
+
+        val data: *^u8 = secret_memory.allocate(size);
+        if (data == nil) { ret res[SecretBytes, FsError].err{FsError.alloc{A.Error.exhausted{}}}; }
+
+        var total: usize = 0;
+        for (total < size) {
+            val n: res[usize, io_error.Error] = secret_memory.read_at(f.handle.value, ?data[total], size - total, total::u64);
+            if (sel n.err) {
+                secret_memory.deallocate(data, size);
+                ret res[SecretBytes, FsError].err{FsError.read{m_reader.native_failure(total, n.err)}};
+            }
+            if (n.ok == 0) {
+                secret_memory.deallocate(data, size);
+                ret res[SecretBytes, FsError].err{FsError.read{ReadError.eof{total}}};
+            }
+            total = total + n.ok;
+        }
+        ret res[SecretBytes, FsError].ok{SecretBytes{data: data, size: size}};
+    }
+
+    # read an entire file by path straight into secret-welded storage
+    #
+    # opens the path, reads it through read_secret_of and closes it. a native
+    # refusal carries any close failure beside it, and a close failure after a
+    # complete read releases the storage and is reported as io.
+    # ---
+    # p:   file path
+    # ret: the file contents in welded storage, or why they could not be read
+    pub fun read_secret(p: Path) res[SecretBytes, FsError] {
+        val ro: res[File, io_error.Error] = open(p);
+        if (sel ro.err) { ret res[SecretBytes, FsError].err{FsError.io{ro.err}}; }
+        var f: File = ro.ok;
+
+        val read:   res[SecretBytes, FsError] = read_secret_of(f);
+        val closed: err[io_error.Error]       = close(?f);
+        if (sel read.err) {
+            if (sel read.err.io) { ret res[SecretBytes, FsError].err{FsError.io{with_cleanup(read.err.io, cleanup_code(closed))}}; }
+            ret read;
+        }
+        if (sel closed.err) {
+            if (read.ok.data != nil) { secret_memory.deallocate(read.ok.data, read.ok.size); }
+            ret res[SecretBytes, FsError].err{FsError.io{closed.err}};
+        }
+        ret read;
+    }
+}
+
+# write bytes to a file, creating or truncating it
+#
+# composes io.write_all over the file's Writer. a write failure carries the
+# persisted prefix; a close failure after a complete write is reported as io,
+# because the bytes are not known to have reached the file.
+# ---
+# p:    file path
+# data: bytes to write
+# len:  number of bytes
+# mode: permission bits for a newly created file
+# ret:  ok, or why the bytes are not all in the file
+pub fun write_bytes(p: Path, data: *u8, len: usize, mode: i32) err[FsError] {
+    if (data == nil && len > 0) { ret err[FsError].err{refusal(io_error.INVALID, io_error.OP_WRITE)}; }
+    val co: res[File, io_error.Error] = create(p, mode);
+    if (sel co.err) { ret err[FsError].err{FsError.io{co.err}}; }
+    var f: File = co.ok;
+
+    var w:      m_writer.Writer     = writer(f);
+    val e:      err[WriteError]     = m_writer.write_all(?w, data, len);
+    val closed: err[io_error.Error] = close(?f);
+
+    if (sel e.err)      { ret err[FsError].err{FsError.write{e.err}}; }
+    if (sel closed.err) { ret err[FsError].err{FsError.io{closed.err}}; }
+    ret err[FsError].ok{};
+}
+
+# replace a file with complete bytes through a durable sibling temporary
+#
+# missing parent directories are created before the temporary. the temporary is
+# created beside the destination with O_EXCL, flushed, and closed before rename,
+# so readers see either the old file or the complete replacement and a
+# cross-device rename cannot occur. after rename, the parent directory is
+# flushed through the platform durability contract. if that final flush
+# fails, the replacement is already visible: the outcome is `published` with
+# the flush failure, distinct from every refusal before the rename, after
+# which the destination is untouched and the temporary is removed.
+# ---
+# a:         allocator for temporary paths
+# p:         destination path
+# data:      bytes to write
+# len:       number of bytes
+# file_mode: permission bits for the replacement file
+# dir_mode:  permission bits for newly created parent directories
+# ret:       ok, or why the replacement is not complete and durable
+pub fun replace_bytes_atomic(a: *A.Allocator, p: Path, data: *u8, len: usize, file_mode: i32, dir_mode: i32) err[FsError] {
+    if (a == nil)               { ret err[FsError].err{refusal(io_error.INVALID, io_error.OP_CREATE)}; }
+    if (path.is_empty(p))       { ret err[FsError].err{refusal(io_error.INVALID, io_error.OP_CREATE)}; }
+    if (data == nil && len > 0) { ret err[FsError].err{refusal(io_error.INVALID, io_error.OP_WRITE)}; }
+
+    val pr: res[Path, A.Error] = path.parent(a, p);
+    if (sel pr.err) { ret err[FsError].err{FsError.alloc{pr.err}}; }
+    val parent: Path = pr.ok;
+
+    val de: err[FsError] = create_dir_all(a, parent, dir_mode);
+    if (sel de.err) {
+        A.deallocate[u8](a, parent, str_len(parent) + 1);
+        ret de;
+    }
+
+    val tr: res[TempFile, FsError] = sibling_temp_create(a, parent, path.filename(p), file_mode);
+    if (sel tr.err) {
+        A.deallocate[u8](a, parent, str_len(parent) + 1);
+        ret err[FsError].err{tr.err};
+    }
+    var temp: TempFile = tr.ok;
+
+    var w:  m_writer.Writer = writer(temp.file);
+    val we: err[WriteError] = m_writer.write_all(?w, data, len);
+    if (sel we.err) {
+        close(?temp.file);
+        remove_file(temp.path);
+        atomic_paths_free(a, parent, temp.path);
+        ret err[FsError].err{FsError.write{we.err}};
+    }
+
+    val se: err[io_error.Error] = sync(temp.file);
+    if (sel se.err) {
+        val closed:  err[io_error.Error] = close(?temp.file);
+        val removed: err[io_error.Error] = remove_file(temp.path);
+        atomic_paths_free(a, parent, temp.path);
+        ret err[FsError].err{FsError.io{with_cleanup(with_cleanup(se.err, cleanup_code(closed)), cleanup_code(removed))}};
+    }
+
+    val ce: err[io_error.Error] = close(?temp.file);
+    if (sel ce.err) {
+        val removed: err[io_error.Error] = remove_file(temp.path);
+        atomic_paths_free(a, parent, temp.path);
+        ret err[FsError].err{FsError.io{with_cleanup(ce.err, cleanup_code(removed))}};
+    }
+
+    val re: err[io_error.Error] = rename(temp.path, p);
+    if (sel re.err) {
+        val removed: err[io_error.Error] = remove_file(temp.path);
+        atomic_paths_free(a, parent, temp.path);
+        ret err[FsError].err{FsError.io{with_cleanup(re.err, cleanup_code(removed))}};
+    }
+
+    val synced: err[io_error.Error] = sync_directory(parent);
+    atomic_paths_free(a, parent, temp.path);
+    if (sel synced.err) { ret err[FsError].err{FsError.published{synced.err}}; }
+    ret err[FsError].ok{};
+}
+
+# classify a raw stat mode into a Kind
+fun kind_from_mode(mode: u32) Kind {
+    val t: u32 = mode & os.S_IFMT;
+    if (t == os.S_IFDIR) { ret KIND_DIR; }
+    if (t == os.S_IFREG) { ret KIND_FILE; }
+    if (t == os.S_IFLNK) { ret KIND_SYMLINK; }
+
+    ret KIND_OTHER;
+}
+
+# build Metadata from a filled stat buffer
+fun meta_from_stat(st: *os.stat_t) Metadata {
+    ret Metadata{
+        kind:     kind_from_mode(fsnative.stat_mode(st)),
+        size:     st.st_size::usize,
+        mode:     fsnative.stat_mode(st),
+        modified: time.unix(st.st_mtime, st.st_mtime_nsec),
+        accessed: time.unix(st.st_atime, st.st_atime_nsec),
+        created:  opt[Time].none{},
+    };
+}
+
+pub fun identity_equal(a: Identity, b: Identity) bool {
+    ret identities.equal(a, b);
+}
+
+# observations do not retain an object or imply unchanged contents
+pub fun identity_of(f: File) res[Identity, io_error.Error] {
+    var identity: Identity;
+    val observed: i64 = os.file_identity(f.handle.value, ?identity);
+    if (observed < 0) { ret res[Identity, io_error.Error].err{os.error(observed, io_error.OP_OPTION)}; }
+    ret res[Identity, io_error.Error].ok{identity};
+}
+
+# the final symlink itself is observed and unsupported domains remain explicit
+pub fun identity_link(p: Path) res[Identity, io_error.Error] {
+    if (p == nil) { ret res[Identity, io_error.Error].err{io_error.make(io_error.INVALID, io_error.OP_OPTION)}; }
+    var identity: Identity;
+    val observed: i64 = os.identity_at(os.working_dir(), p, ?identity);
+    if (observed < 0) { ret res[Identity, io_error.Error].err{os.error(observed, io_error.OP_OPTION)}; }
+    ret res[Identity, io_error.Error].ok{identity};
+}
+
+# metadata for an open file
+pub fun stat_of(f: File) res[Metadata, io_error.Error] {
+    var st:  os.stat_t;
+    val raw: i64 = os.stat(f.handle.value, ?st);
+    if (raw < 0) { ret res[Metadata, io_error.Error].err{os.error(raw, io_error.OP_OPTION)}; }
+
+    ret res[Metadata, io_error.Error].ok{meta_from_stat(?st)};
+}
+
+# metadata for a path, following a final symbolic link
+# ---
+# p:   path to query
+# ret: the metadata, or the native refusal
+pub fun metadata(p: Path) res[Metadata, io_error.Error] {
+    if (p == nil) { ret res[Metadata, io_error.Error].err{io_error.make(io_error.INVALID, io_error.OP_OPTION)}; }
+
+    var st:  os.stat_t;
+    val raw: i64 = os.stat_path(os.working_dir(), p, ?st, 0);
+    if (raw < 0) { ret res[Metadata, io_error.Error].err{os.error(raw, io_error.OP_OPTION)}; }
+
+    ret res[Metadata, io_error.Error].ok{meta_from_stat(?st)};
+}
+
+# metadata for a path without following a final symbolic link
+# ---
+# p:   path to query
+# ret: the metadata (a symlink reports itself), or the native refusal
+pub fun metadata_link(p: Path) res[Metadata, io_error.Error] {
+    if (p == nil) { ret res[Metadata, io_error.Error].err{io_error.make(io_error.INVALID, io_error.OP_OPTION)}; }
+
+    var st:  os.stat_t;
+    val raw: i64 = os.stat_path(os.working_dir(), p, ?st, os.AT_SYMLINK_NOFOLLOW);
+    if (raw < 0) { ret res[Metadata, io_error.Error].err{os.error(raw, io_error.OP_OPTION)}; }
+
+    ret res[Metadata, io_error.Error].ok{meta_from_stat(?st)};
+}
+
+# check whether metadata describes a directory
+pub fun meta_is_dir(m: *Metadata) bool {
+    ret m.kind == KIND_DIR;
+}
+
+# check whether metadata describes a regular file
+pub fun meta_is_file(m: *Metadata) bool {
+    ret m.kind == KIND_FILE;
+}
+
+# check whether metadata describes a symbolic link
+pub fun meta_is_symlink(m: *Metadata) bool {
+    ret m.kind == KIND_SYMLINK;
+}
+
+# a query's stat outcome: a path that names nothing is a successful absence
+# (not found, or not a directory when a prefix is not one), anything else the
+# native refusal
+fun query(observed: res[Metadata, io_error.Error]) res[opt[Metadata], io_error.Error] {
+    if (sel observed.ok)                                                                        { ret res[opt[Metadata], io_error.Error].ok{opt[Metadata].some{observed.ok}}; }
+    if (observed.err.kind == io_error.NOT_FOUND || observed.err.kind == io_error.NOT_DIRECTORY) { ret res[opt[Metadata], io_error.Error].ok{opt[Metadata].none{}}; }
+    ret res[opt[Metadata], io_error.Error].err{observed.err};
+}
+
+fun query_kind(observed: res[Metadata, io_error.Error], kind: Kind) res[bool, io_error.Error] {
+    val q: res[opt[Metadata], io_error.Error] = query(observed);
+    if (sel q.err)     { ret res[bool, io_error.Error].err{q.err}; }
+    if (sel q.ok.none) { ret res[bool, io_error.Error].ok{false}; }
+    ret res[bool, io_error.Error].ok{q.ok.some.kind == kind};
+}
+
+# check whether a path exists (as any entry, including a broken symlink)
+# ---
+# ret: true or false when the question could be answered, or the native
+#      refusal (permission denied, a symlink loop) when it could not
+pub fun exists(p: Path) res[bool, io_error.Error] {
+    val q: res[opt[Metadata], io_error.Error] = query(metadata_link(p));
+    if (sel q.err) { ret res[bool, io_error.Error].err{q.err}; }
+    ret res[bool, io_error.Error].ok{sel q.ok.some};
+}
+
+# check whether a path is an existing regular file (following symlinks)
+pub fun is_file(p: Path) res[bool, io_error.Error] {
+    ret query_kind(metadata(p), KIND_FILE);
+}
+
+# check whether a path is an existing directory (following symlinks)
+pub fun is_dir(p: Path) res[bool, io_error.Error] {
+    ret query_kind(metadata(p), KIND_DIR);
+}
+
+# check whether a path is a symbolic link (not following it)
+pub fun is_symlink(p: Path) res[bool, io_error.Error] {
+    ret query_kind(metadata_link(p), KIND_SYMLINK);
+}
+
+# create a single directory
+# ---
+# p:    directory path
+# mode: permission bits
+# ret:  ok, or the native refusal
+pub fun create_dir(p: Path, mode: i32) err[io_error.Error] {
+    if (p == nil) { ret err[io_error.Error].err{io_error.make(io_error.INVALID, io_error.OP_CREATE)}; }
+
+    val raw: i64 = os.make_dir(os.working_dir(), p, mode);
+    if (raw < 0) { ret err[io_error.Error].err{os.error(raw, io_error.OP_CREATE)}; }
+
+    ret err[io_error.Error].ok{};
+}
+
+# remove a single file or symbolic link
+# ---
+# p:   path to remove
+# ret: ok, or the native refusal
+pub fun remove_file(p: Path) err[io_error.Error] {
+    if (p == nil) { ret err[io_error.Error].err{io_error.make(io_error.INVALID, io_error.OP_UNKNOWN)}; }
+
+    val raw: i64 = os.unlink(os.working_dir(), p, 0);
+    if (raw < 0) { ret err[io_error.Error].err{os.error(raw, io_error.OP_UNKNOWN)}; }
+
+    ret err[io_error.Error].ok{};
+}
+
+# remove an empty directory
+# ---
+# p:   directory path to remove
+# ret: ok, or the native refusal
+pub fun remove_dir(p: Path) err[io_error.Error] {
+    if (p == nil) { ret err[io_error.Error].err{io_error.make(io_error.INVALID, io_error.OP_UNKNOWN)}; }
+
+    val raw: i64 = os.unlink(os.working_dir(), p, os.AT_REMOVEDIR);
+    if (raw < 0) { ret err[io_error.Error].err{os.error(raw, io_error.OP_UNKNOWN)}; }
+
+    ret err[io_error.Error].ok{};
+}
+
+# rename or move a file or directory
+#
+# An existing destination file is replaced, as POSIX rename does. Replacing an
+# existing *directory* is not portable: POSIX allows it when the destination is
+# an empty directory and windows refuses it outright, so callers should not rely
+# on it.
+# windows retains open destination handles on supporting local filesystems,
+# while smb refuses replacement until destination handles close.
+# ---
+# from: source path
+# to:   destination path
+# ret:  ok, or the native refusal
+pub fun rename(from: Path, to: Path) err[io_error.Error] {
+    if (from == nil || to == nil) { ret err[io_error.Error].err{io_error.make(io_error.INVALID, io_error.OP_UNKNOWN)}; }
+
+    val raw: i64 = os.rename(os.working_dir(), from, os.working_dir(), to);
+    if (raw < 0) { ret err[io_error.Error].err{os.error(raw, io_error.OP_UNKNOWN)}; }
+
+    ret err[io_error.Error].ok{};
+}
+
+# create a symbolic link at linkpath pointing to target
+# ---
+# target:   path the link points to (stored verbatim)
+# linkpath: path of the link to create
+# ret:      ok, or the native refusal
+pub fun symlink(target: Path, linkpath: Path) err[io_error.Error] {
+    if (target == nil || linkpath == nil) { ret err[io_error.Error].err{io_error.make(io_error.INVALID, io_error.OP_CREATE)}; }
+
+    val raw: i64 = os.symlink(target, linkpath);
+    if (raw < 0) { ret err[io_error.Error].err{os.error(raw, io_error.OP_CREATE)}; }
+
+    ret err[io_error.Error].ok{};
+}
+
+val REMOVE_MAX_DEPTH:  usize = 1024;
+val TEMP_MAX_ATTEMPTS: usize = 100;
+val HEX_CHARS:         str   = "0123456789abcdef";
+
+# list the entries of a directory, excluding "." and ".."
+#
+# each name and the vector storage are owned by the caller. free each name
+# with std.text.string.str_free before vector.dnit, or release the whole arena.
+# names are returned in directory order. a failure releases every partial
+# result and reports the first refusal, with a cursor or descriptor cleanup
+# failure kept beside it.
+# ---
+# a:   allocator for the vector and each name
+# p:   directory path
+# ret: the child names, or why they could not be listed
+pub fun read_dir(a: *A.Allocator, p: Path) res[Vector[str], FsError] {
+    if (a == nil || p == nil) { ret res[Vector[str], FsError].err{refusal(io_error.INVALID, io_error.OP_OPEN)}; }
+    var raw_handle: usize = os.INVALID_HANDLE;
+    val raw:        i64   = os.open(os.working_dir(), p, os.O_RDONLY | os.O_DIRECTORY, 0, ?raw_handle);
+    if (raw < 0) { ret res[Vector[str], FsError].err{native(raw, io_error.OP_OPEN)}; }
+    val fd:          usize                  = raw_handle;
+    var cursor:      os.DirectoryCursor     = os.DirectoryCursor{};
+    val initialized: os.DirectoryInitResult = os.directory_init(?cursor, fd);
+    if (initialized.code < 0) {
+        var failure: io_error.Error = os.error(initialized.code, io_error.OP_OPEN);
+        failure.cleanup_code = initialized.cleanup_code;
+        ret res[Vector[str], FsError].err{FsError.io{with_cleanup(failure, os.close(fd))}};
+    }
+    var names:         Vector[str]  = vector.init[str](a);
+    val listed:        err[FsError] = read_directory_names(a, ?cursor, ?names);
+    val cursor_closed: i64          = os.directory_close(?cursor);
+    val fd_closed:     i64          = os.close(fd);
+    val result:        err[FsError] = directory_cleanup_error(directory_cleanup_error(listed, cursor_closed), fd_closed);
+    if (sel result.err) {
+        free_dir_names(?names);
+        ret res[Vector[str], FsError].err{result.err};
+    }
+    ret res[Vector[str], FsError].ok{names};
+}
+
+# a cleanup failure becomes the outcome when nothing else failed, and rides
+# in the native failure's cleanup slot otherwise
+fun directory_cleanup_error(result: err[FsError], code: i64) err[FsError] {
+    if (code >= 0)     { ret result; }
+    if (sel result.ok) { ret err[FsError].err{native(code, io_error.OP_CLOSE)}; }
+    if (sel result.err.io) {
+        ret err[FsError].err{FsError.io{with_cleanup(result.err.io, code)}};
+    }
+    ret result;
+}
+
+fun read_directory_names(a: *A.Allocator, cursor: *os.DirectoryCursor, names: *Vector[str]) err[FsError] {
+    for {
+        var entry: os.DirectoryEntry;
+        val next:  i64 = os.directory_next(cursor, ?entry);
+        if (next < 0)                { ret err[FsError].err{native(next, io_error.OP_READ)}; }
+        if (next == 0)               { ret err[FsError].ok{}; }
+        if (is_dot_name(entry.name)) { cnt; }
+        val copied: res[str, StrError] = str_copy(a, entry.name);
+        if (sel copied.err) { ret err[FsError].err{str_error(copied.err)}; }
+        val owned:  str                 = copied.ok;
+        val pushed: res[usize, A.Error] = vector.push[str](names, owned);
+        if (sel pushed.err) {
+            str_free(a, owned);
+            ret err[FsError].err{FsError.alloc{pushed.err}};
+        }
+    }
+    ret err[FsError].ok{};
+}
+
+# a string copy of a whole string can only fail at the allocator
+fun str_error(e: StrError) FsError {
+    if (sel e.alloc) { ret FsError.alloc{e.alloc}; }
+    ret refusal(io_error.INVALID, io_error.OP_UNKNOWN);
+}
+
+fun free_dir_names(names: *Vector[str]) {
+    var i: usize = 0;
+    for (i < names.len) {
+        str_free(names.a, names.data[i]);
+        i = i + 1;
+    }
+    vector.dnit[str](names);
+}
+
+# check whether a directory entry name is "." or ".."
+fun is_dot_name(name: *u8) bool {
+    if (name[0] != '.')                 { ret false; }
+    if (name[1] == 0)                   { ret true; }
+    if (name[1] == '.' && name[2] == 0) { ret true; }
+
+    ret false;
+}
+
+# create a directory and every missing parent (mkdir -p)
+#
+# a directory that already exists is success. when the final creation fails
+# and the path is still not a directory, the creation's refusal is reported.
+# ---
+# a:    allocator for transient parent paths
+# p:    directory path
+# mode: permission bits for created directories
+# ret:  ok, or why the directory does not exist
+pub fun create_dir_all(a: *A.Allocator, p: Path, mode: i32) err[FsError] {
+    if (a == nil)         { ret err[FsError].err{refusal(io_error.INVALID, io_error.OP_CREATE)}; }
+    if (path.is_empty(p)) { ret err[FsError].err{refusal(io_error.INVALID, io_error.OP_CREATE)}; }
+    if (path.is_root(p))  { ret err[FsError].ok{}; }
+    val existing: res[bool, io_error.Error] = is_dir(p);
+    if (sel existing.err) { ret err[FsError].err{FsError.io{existing.err}}; }
+    if (existing.ok)      { ret err[FsError].ok{}; }
+
+    val first: err[io_error.Error] = create_dir(p, mode);
+    if (sel first.ok) { ret err[FsError].ok{}; }
+
+    val pr: res[Path, A.Error] = path.parent(a, p);
+    if (sel pr.err) { ret err[FsError].err{FsError.alloc{pr.err}}; }
+    val up: Path = pr.ok;
+
+    val made: err[FsError] = create_dir_all(a, up, mode);
+    A.deallocate[u8](a, up, str_len(up) + 1);
+    if (sel made.err) { ret made; }
+
+    val second: err[io_error.Error] = create_dir(p, mode);
+    if (sel second.ok) { ret err[FsError].ok{}; }
+    val now: res[bool, io_error.Error] = is_dir(p);
+    if (sel now.err) { ret err[FsError].err{FsError.io{now.err}}; }
+    if (now.ok)      { ret err[FsError].ok{}; }
+
+    ret err[FsError].err{FsError.io{second.err}};
+}
+
+# recursively remove a file, directory tree, or symbolic link (rm -rf)
+#
+# directories are removed depth-first. symbolic links are removed as links and
+# never followed, so a link pointing outside the tree leaves its target intact.
+# a missing path succeeds, making the operation idempotent.
+# windows force deletion preserves alias attributes and reports unsupported
+# for read-only entries on filesystems without native posix deletion.
+# roots and dot entries are refused before mutation, as a removal containment
+# refusal.
+# ---
+# a:   allocator for the owned input and parent paths
+# p:   path naming the child entry to remove
+# ret: ok, or why the entry may still exist
+pub fun remove_all(a: *A.Allocator, p: Path) err[FsError] {
+    if (a == nil)        { ret err[FsError].err{refusal(io_error.INVALID, io_error.OP_UNKNOWN)}; }
+    if (p == nil)        { ret err[FsError].err{refusal(io_error.INVALID, io_error.OP_UNKNOWN)}; }
+    if (str_len(p) == 0) { ret err[FsError].ok{}; }
+    val owned_r: res[Path, A.Error] = path.clone(a, p);
+    if (sel owned_r.err) { ret err[FsError].err{FsError.alloc{owned_r.err}}; }
+    val owned:  Path  = owned_r.ok;
+    val length: usize = str_len(owned);
+    fin { A.deallocate[u8](a, owned, length + 1); }
+    var end:         usize = length;
+    val root_length: usize = path.root(owned).len;
+    for (end > root_length && path.is_separator(owned[end - 1])) { end = end - 1; }
+    owned[end] = 0;
+    val name: str = path.filename(owned);
+    if (name == nil || name[0] == 0 || str_equals(name, ".") || str_equals(name, "..")) {
+        ret err[FsError].err{FsError.removal{removal.contained()}};
+    }
+    val parent_r: res[Path, A.Error] = path.parent(a, owned);
+    if (sel parent_r.err) { ret err[FsError].err{FsError.alloc{parent_r.err}}; }
+    val parent: Path = parent_r.ok;
+    fin { A.deallocate[u8](a, parent, str_len(parent) + 1); }
+    var raw_handle: usize = os.INVALID_HANDLE;
+    val raw:        i64   = os.open(os.working_dir(), parent, os.O_RDONLY | os.O_DIRECTORY, 0, ?raw_handle);
+    if (os.error_kind(raw) == io_error.NOT_FOUND) { ret err[FsError].ok{}; }
+    if (raw < 0)                                  { ret err[FsError].err{native(raw, io_error.OP_OPEN)}; }
+    val fd:        usize              = raw_handle;
+    var removed:   usize              = 0;
+    val result:    err[removal.Error] = removal.tree(fd, name, ?removed, REMOVE_MAX_DEPTH - 1);
+    val closed:    i64                = os.close(fd);
+    val completed: err[removal.Error] = removal.with_cleanup(result, closed);
+    if (sel completed.err) { ret err[FsError].err{FsError.removal{completed.err}}; }
+    ret err[FsError].ok{};
+}
+
+# a created temporary file and its path
+# ---
+# file: the open handle
+# path: the allocated path (freed with the caller's allocator)
+pub rec TempFile {
+    file: File;
+    path: Path;
+}
+
+# create a uniquely named temporary file under the OS temp directory
+#
+# the file is opened O_CREAT|O_EXCL, so the returned path is exclusively owned.
+# ---
+# a:      allocator for the path
+# prefix: name prefix (e.g. "build" -> "<tmp>/build_<hex>")
+# ret:    the created temporary file, or why none could be created
+pub fun temp_create(a: *A.Allocator, prefix: str) res[TempFile, FsError] {
+    if (a == nil) { ret res[TempFile, FsError].err{refusal(io_error.INVALID, io_error.OP_CREATE)}; }
+
+    var attempt: usize = 0;
+    for (attempt < TEMP_MAX_ATTEMPTS) {
+        var rnd:    [8]u8;
+        val filled: err[io_error.Error] = rand.fill(?rnd[0], 8);
+        if (sel filled.err) { ret res[TempFile, FsError].err{FsError.io{filled.err}}; }
+
+        val built: res[Path, FsError] = temp_build_path(a, prefix, ?rnd[0]);
+        if (sel built.err) { ret res[TempFile, FsError].err{built.err}; }
+        val tp: Path = built.ok;
+
+        val flags:      i32   = os.O_CREAT | os.O_EXCL | os.O_RDWR;
+        var raw_handle: usize = os.INVALID_HANDLE;
+        val raw:        i64   = os.open(os.working_dir(), tp, flags, 0o600, ?raw_handle);
+        if (raw >= 0) {
+            ret res[TempFile, FsError].ok{TempFile{file: File{handle: io_handle.FileHandle{value: raw_handle}}, path: tp}};
+        }
+
+        A.deallocate[u8](a, tp, str_len(tp) + 1);
+        if (os.error_kind(raw) != io_error.EXISTS) { ret res[TempFile, FsError].err{native(raw, io_error.OP_CREATE)}; }
+        attempt = attempt + 1;
+    }
+
+    ret res[TempFile, FsError].err{FsError.exhausted{}};
+}
+
+# the path of a temporary file
+pub fun temp_path(tf: *TempFile) Path {
+    ret tf.path;
+}
+
+# close a temporary file without removing it
+pub fun temp_close(tf: *TempFile) err[io_error.Error] {
+    ret close(?tf.file);
+}
+
+# remove a temporary file from disk
+pub fun temp_remove(tf: *TempFile) err[io_error.Error] {
+    ret remove_file(tf.path);
+}
+
+# close and remove a temporary file; both effects run, and a close failure is
+# reported first with the removal's refusal beside it
+pub fun temp_close_and_remove(tf: *TempFile) err[io_error.Error] {
+    val closed:  err[io_error.Error] = close(?tf.file);
+    val removed: err[io_error.Error] = remove_file(tf.path);
+    if (sel closed.err) { ret err[io_error.Error].err{with_cleanup(closed.err, cleanup_code(removed))}; }
+    ret removed;
+}
+
+# assemble "<tempdir>/<prefix>_<hex>" into a freshly allocated path
+fun temp_build_path(a: *A.Allocator, prefix: str, rnd: *u8) res[Path, FsError] {
+    var buf: [512]u8;
+
+    val dir: i64 = fsnative.temp_dir(?buf[0], 512);
+    if (dir < 0)           { ret res[Path, FsError].err{native(dir, io_error.OP_OPEN)}; }
+    if (dir::usize >= 512) { ret res[Path, FsError].err{refusal(io_error.NAME_TOO_LONG, io_error.OP_CREATE)}; }
+    var off: usize = dir::usize;
+
+    # some temp dirs end with a separator, some do not; insert exactly one
+    if (off == 0 || !path.is_separator(buf[off - 1])) {
+        buf[off] = path.separator();
+        off      = off + 1;
+    }
+
+    var plen: usize = 0;
+    if (prefix != nil) { plen = str_len(prefix); }
+
+    # dir + sep + prefix + '_' + 16 hex digits + NUL
+    if (off + plen + 1 + 16 + 1 > 512) { ret res[Path, FsError].err{refusal(io_error.NAME_TOO_LONG, io_error.OP_CREATE)}; }
+
+    if (prefix != nil) {
+        memory.raw_copy(?buf[off], prefix, plen);
+        off = off + plen;
+    }
+
+    buf[off] = '_';
+    off      = off + 1;
+
+    val hex: *u8   = HEX_CHARS::*u8;
+    var i:   usize = 0;
+    for (i < 8) {
+        buf[off]     = hex[rnd[i]::usize >> 4];
+        buf[off + 1] = hex[rnd[i]::usize & 0x0F];
+        off          = off + 2;
+        i            = i + 1;
+    }
+    buf[off] = 0;
+
+    val copied: res[str, StrError] = str_copy(a, (?buf[0])::str);
+    if (sel copied.err) { ret res[Path, FsError].err{str_error(copied.err)}; }
+    ret res[Path, FsError].ok{copied.ok};
+}
+
+# create an exclusive temporary beside a destination
+fun sibling_temp_create(a: *A.Allocator, parent: Path, name: str, mode: i32) res[TempFile, FsError] {
+    var attempt: usize = 0;
+    for (attempt < TEMP_MAX_ATTEMPTS) {
+        var rnd:    [8]u8;
+        val filled: err[io_error.Error] = rand.fill(?rnd[0], 8);
+        if (sel filled.err) { ret res[TempFile, FsError].err{FsError.io{filled.err}}; }
+
+        val nr: res[Path, A.Error] = sibling_temp_name(a, name, ?rnd[0]);
+        if (sel nr.err) { ret res[TempFile, FsError].err{FsError.alloc{nr.err}}; }
+        val temp_name: Path = nr.ok;
+
+        val jr: res[Path, A.Error] = path.join(a, parent, temp_name);
+        A.deallocate[u8](a, temp_name, str_len(temp_name) + 1);
+        if (sel jr.err) { ret res[TempFile, FsError].err{FsError.alloc{jr.err}}; }
+        val temp_path: Path = jr.ok;
+
+        val flags:      i32   = os.O_CREAT | os.O_EXCL | os.O_WRONLY;
+        var raw_handle: usize = os.INVALID_HANDLE;
+        val raw:        i64   = os.open(os.working_dir(), temp_path, flags, mode, ?raw_handle);
+        if (raw >= 0) {
+            ret res[TempFile, FsError].ok{TempFile{file: File{handle: io_handle.FileHandle{value: raw_handle}}, path: temp_path}};
+        }
+
+        A.deallocate[u8](a, temp_path, str_len(temp_path) + 1);
+        if (os.error_kind(raw) != io_error.EXISTS) { ret res[TempFile, FsError].err{native(raw, io_error.OP_CREATE)}; }
+        attempt = attempt + 1;
+    }
+
+    ret res[TempFile, FsError].err{FsError.exhausted{}};
+}
+
+# assemble ".<name>.tmp-<hex>" into an allocated filename
+fun sibling_temp_name(a: *A.Allocator, name: str, rnd: *u8) res[Path, A.Error] {
+    var name_len: usize = 0;
+    if (name != nil) { name_len = str_len(name); }
+    val len: usize = 1 + name_len + 5 + 16;
+
+    val ar: res[*u8, A.Error] = A.allocate[u8](a, len + 1);
+    if (sel ar.err) { ret res[Path, A.Error].err{ar.err}; }
+    val buf: *u8 = ar.ok;
+
+    var off: usize = 0;
+    buf[off] = '.';
+    off      = off + 1;
+    if (name_len > 0) {
+        memory.raw_copy(?buf[off], name, name_len);
+        off = off + name_len;
+    }
+    memory.raw_copy(?buf[off], ".tmp-", 5);
+    off = off + 5;
+
+    val hex: *u8   = HEX_CHARS::*u8;
+    var i:   usize = 0;
+    for (i < 8) {
+        buf[off]     = hex[rnd[i]::usize >> 4];
+        buf[off + 1] = hex[rnd[i]::usize & 0x0F];
+        off          = off + 2;
+        i            = i + 1;
+    }
+    buf[off] = 0;
+    ret res[Path, A.Error].ok{buf::Path};
+}
+
+# flush a directory; the close failure rides beside a flush failure
+fun sync_directory(p: Path) err[io_error.Error] {
+    var raw_handle: usize = os.INVALID_HANDLE;
+    val raw:        i64   = os.open(os.working_dir(), p, os.O_RDONLY | os.O_DIRECTORY, 0, ?raw_handle);
+    if (raw < 0) { ret err[io_error.Error].err{os.error(raw, io_error.OP_OPEN)}; }
+    var f:  File                = File{handle: io_handle.FileHandle{value: raw_handle}};
+    val se: err[io_error.Error] = sync(f);
+    val ce: err[io_error.Error] = close(?f);
+    if (sel se.err) { ret err[io_error.Error].err{with_cleanup(se.err, cleanup_code(ce))}; }
+    ret ce;
+}
+
+fun atomic_paths_free(a: *A.Allocator, parent: Path, temp: Path) {
+    A.deallocate[u8](a, temp, str_len(temp) + 1);
+    A.deallocate[u8](a, parent, str_len(parent) + 1);
+}
+
+# the tests use distinct relative paths and remove what they create
+
+# sel takes a place, so the yes/no of a call passes through one of these
+#[testing]
+fun refused(r: err[io_error.Error]) bool {
+    ret sel r.err;
+}
+
+#[testing]
+fun refused_fs(r: err[FsError]) bool {
+    ret sel r.err;
+}
+
+#[testing]
+fun answered(r: res[bool, io_error.Error]) bool {
+    ret sel r.ok && r.ok;
+}
+
+#[testing]
+fun metadata_is(r: res[Metadata, io_error.Error], kind: Kind, mode: u32) bool {
+    if (sel r.err) { ret false; }
+    ret r.ok.kind == kind && (r.ok.mode & 0o777) == mode;
+}
+
+# atomic writes create a destination, replace it whole with owner-only modes,
+# on windows a protected owner-only dacl (#703), and leave no sibling
+# temporary behind
+test replace_bytes_atomic__create_replace_and_cleanup {
+    var buf: [32768]u8;
+    var st:  fixed.FixedState;
+    var a:   A.Allocator;
+    fixed.make(?a, ?st, ?buf[0], 32768);
+
+    val d: Path = "mach_std_fs_atomic";
+    val p: Path = "mach_std_fs_atomic/nested/state.dat";
+    remove_all(?a, d);
+    if (refused_fs(replace_bytes_atomic(?a, p, "first", 5, 0o600, 0o700))) {
+        remove_all(?a, d);
+        ret 1;
+    }
+    if (refused_fs(replace_bytes_atomic(?a, p, "second", 6, 0o600, 0o700))) {
+        remove_all(?a, d);
+        ret 2;
+    }
+
+    var bad: i32               = 0;
+    val rr:  res[str, FsError] = read_string(?a, p);
+    if (sel rr.ok) {
+        if (!str_equals(rr.ok, "second")) { bad = 5; }
+    }
+    or { bad = 4; }
+
+    val lr: res[Vector[str], FsError] = read_dir(?a, "mach_std_fs_atomic/nested");
+    if (sel lr.ok) {
+        var names: Vector[str] = lr.ok;
+        if (names.len != 1 || !str_equals(names.data[0], "state.dat")) { bad = 7; }
+        free_dir_names(?names);
+    }
+    or                                                                                    { bad = 6; }
+    if (bad == 0 && !metadata_is(metadata(p), KIND_FILE, 0o600))                          { bad = 8; }
+    or (bad == 0 && !metadata_is(metadata("mach_std_fs_atomic/nested"), KIND_DIR, 0o700)) { bad = 9; }
+
+    remove_all(?a, d);
+    ret bad;
+}
+
+# a failed namespace replacement preserves the destination and removes the
+# completed temporary, and the refusal is the rename's, before publication
+test replace_bytes_atomic__rename_failure_cleans_the_temporary {
+    var buf: [32768]u8;
+    var st:  fixed.FixedState;
+    var a:   A.Allocator;
+    fixed.make(?a, ?st, ?buf[0], 32768);
+
+    val d: Path = "mach_std_fs_atomic_fail";
+    val p: Path = "mach_std_fs_atomic_fail/destination";
+    remove_all(?a, d);
+    if (refused(create_dir(d, 0o700))) { ret 1; }
+    if (refused(create_dir(p, 0o700))) {
+        remove_all(?a, d);
+        ret 2;
+    }
+    val replaced: err[FsError] = replace_bytes_atomic(?a, p, "bytes", 5, 0o600, 0o700);
+    if (sel replaced.ok) {
+        remove_all(?a, d);
+        ret 3;
+    }
+    if (!sel replaced.err.io) {
+        remove_all(?a, d);
+        ret 8;
+    }
+
+    var bad: i32 = 0;
+    if (!answered(is_dir(p))) { bad = 4; }
+    val lr: res[Vector[str], FsError] = read_dir(?a, d);
+    if (sel lr.ok) {
+        var names: Vector[str] = lr.ok;
+        if (names.len != 1 || !str_equals(names.data[0], "destination")) { bad = 6; }
+        free_dir_names(?names);
+    }
+    or { bad = 5; }
+
+    remove_all(?a, d);
+    ret bad;
+}
+
+# a missing path fails open and answers a successful false to every query,
+# and the failures name the missing entry
+test open__a_missing_path_is_not_found_and_false {
+    val p: Path                      = "mach_std_fs_missing";
+    val o: res[File, io_error.Error] = open(p);
+    if (sel o.ok)                                                                { ret 1; }
+    if (o.err.kind != io_error.NOT_FOUND || o.err.operation != io_error.OP_OPEN) { ret 2; }
+    val e: res[bool, io_error.Error] = exists(p);
+    if (sel e.err) { ret 3; }
+    if (e.ok)      { ret 4; }
+    val f: res[bool, io_error.Error] = is_file(p);
+    if (sel f.err) { ret 5; }
+    if (f.ok)      { ret 6; }
+    val d: res[bool, io_error.Error] = is_dir(p);
+    if (sel d.err) { ret 7; }
+    if (d.ok)      { ret 8; }
+    val m: res[Metadata, io_error.Error] = metadata(p);
+    if (sel m.ok)                         { ret 9; }
+    if (m.err.kind != io_error.NOT_FOUND) { ret 10; }
+    ret 0;
+}
+
+# a path through a regular file names nothing: the queries answer false
+# rather than reporting ENOTDIR
+test exists__a_path_through_a_regular_file_is_a_successful_false {
+    val file: Path = "mach_std_fs_query_file";
+    if (refused_fs(write_bytes(file, "x", 1, 0o600))) { ret 1; }
+    fin { remove_file(file); }
+    val through: Path                      = "mach_std_fs_query_file/child";
+    val e:       res[bool, io_error.Error] = exists(through);
+    if (sel e.err) { ret 2; }
+    if (e.ok)      { ret 3; }
+    val d: res[bool, io_error.Error] = is_dir(through);
+    if (sel d.err) { ret 4; }
+    if (d.ok)      { ret 5; }
+    val f: res[bool, io_error.Error] = is_file(through);
+    if (sel f.err)                                                                         { ret 6; }
+    if (f.ok)                                                                              { ret 7; }
+    if (!answered(exists(file)) || !answered(is_file(file)) || answered(is_symlink(file))) { ret 8; }
+    ret 0;
+}
+
+$if ($mach.build.sys != $mach.sys.windows) {
+    # a query that the platform cannot answer is the native refusal, not false:
+    # a symlink loop exists as a link but cannot be followed
+    test is_file__an_unanswerable_query_is_the_native_refusal {
+        val a_link: Path = "mach_std_fs_loop_a";
+        val b_link: Path = "mach_std_fs_loop_b";
+        if (refused(symlink(b_link, a_link))) { ret 1; }
+        fin { remove_file(a_link); }
+        if (refused(symlink(a_link, b_link))) { ret 2; }
+        fin { remove_file(b_link); }
+        val e: res[bool, io_error.Error] = exists(a_link);
+        if (sel e.err)                     { ret 3; }
+        if (!e.ok)                         { ret 4; }
+        if (!answered(is_symlink(a_link))) { ret 5; }
+        val f: res[bool, io_error.Error] = is_file(a_link);
+        if (sel f.ok)                                                                                                          { ret 6; }
+        if (f.err.kind == io_error.NOT_FOUND || f.err.kind == io_error.NOT_DIRECTORY || f.err.operation != io_error.OP_OPTION) { ret 7; }
+        val d: res[bool, io_error.Error] = is_dir(a_link);
+        if (sel d.ok) { ret 8; }
+        ret 0;
+    }
+}
+
+test close__twice_is_the_closed_refusal {
+    val p: Path = "mach_std_fs_close";
+    if (refused_fs(write_bytes(p, "x", 1, 0o600))) { ret 1; }
+    val o: res[File, io_error.Error] = open(p);
+    if (sel o.err) {
+        remove_file(p);
+        ret 1;
+    }
+    var file: File = o.ok;
+    if (refused(close(?file))) {
+        remove_file(p);
+        ret 1;
+    }
+    val second: err[io_error.Error] = close(?file);
+    remove_file(p);
+    if (sel second.ok)                      { ret 1; }
+    if (second.err.kind != io_error.CLOSED) { ret 1; }
+    ret 0;
+}
+
+# create_dir and remove_dir round-trip, with predicates agreeing in between
+test create_dir__exists_refusal_and_remove {
+    val p: Path = "mach_std_fs_dir";
+    if (refused(create_dir(p, 0o755))) { ret 1; }
+
+    var bad: i32 = 0;
+    if (!answered(is_dir(p))) { bad = 1; }
+    if (answered(is_file(p))) { bad = 1; }
+    val again: err[io_error.Error] = create_dir(p, 0o755);
+    if (sel again.ok)                                                                                      { bad = 2; }
+    or (sel again.err && (again.err.kind != io_error.EXISTS || again.err.operation != io_error.OP_CREATE)) { bad = 3; }
+
+    if (refused(remove_dir(p))) { ret 1; }
+    if (answered(exists(p)))    { ret 1; }
+    ret bad;
+}
+
+#[testing]
+fun rename_held_contents(file: File, expected: str) bool {
+    val sought: res[i64, io_error.Error] = seek(file, 0, os.SEEK_SET);
+    if (sel sought.err) { ret false; }
+    var bytes: [3]u8;
+    val got:   res[usize, io_error.Error] = read(file, ?bytes[0], 3);
+    if (sel got.err) { ret false; }
+    if (got.ok != 3) { ret false; }
+    ret bytes[0] == expected[0] && bytes[1] == expected[1] && bytes[2] == expected[2];
+}
+
+#[testing]
+fun rename_held_pair(from: Path, to: Path) i32 {
+    if (refused_fs(write_bytes(from, "new", 3, 0o600))) { ret 1; }
+    fin { remove_file(from); }
+    if (refused_fs(write_bytes(to, "old", 3, 0o600))) { ret 2; }
+    fin { remove_file(to); }
+    val sr: res[File, io_error.Error] = open(from);
+    if (sel sr.err) { ret 3; }
+    var source: File = sr.ok;
+    fin { close(?source); }
+    val dr: res[File, io_error.Error] = open(to);
+    if (sel dr.err) { ret 4; }
+    var destination: File = dr.ok;
+    fin { close(?destination); }
+    if (refused(rename(from, to)))                 { ret 73; }
+    if (answered(exists(from)))                    { ret 6; }
+    if (!rename_held_contents(destination, "old")) { ret 7; }
+    if (!rename_held_contents(source, "new"))      { ret 8; }
+    val nr: res[File, io_error.Error] = open(to);
+    if (sel nr.err) { ret 9; }
+    var next: File = nr.ok;
+    fin { close(?next); }
+    if (!rename_held_contents(next, "new")) { ret 10; }
+    ret 0;
+}
+
+test rename__held_destinations_preserve_old_handles_with_relative_paths {
+    ret rename_held_pair("mach_std_held_é_from", "mach_std_held_é_to");
+}
+
+test rename__held_destinations_preserve_old_handles_with_absolute_paths {
+    var bytes:   [8192]u8;
+    var state:   fixed.FixedState;
+    var alloc:   A.Allocator;
+    val fixed_r: err[A.Error] = fixed.make(?alloc, ?state, ?bytes[0], 8192);
+    if (sel fixed_r.err) { ret 1; }
+    val sr: res[TempFile, FsError] = temp_create(?alloc, "mach_held_source");
+    if (sel sr.err) { ret 2; }
+    var source: TempFile = sr.ok;
+    fin {
+        temp_close_and_remove(?source);
+        A.deallocate[u8](?alloc, source.path, str_len(source.path) + 1);
+    }
+    val dr: res[TempFile, FsError] = temp_create(?alloc, "mach_held_destination");
+    if (sel dr.err) { ret 3; }
+    var destination: TempFile = dr.ok;
+    fin {
+        temp_close_and_remove(?destination);
+        A.deallocate[u8](?alloc, destination.path, str_len(destination.path) + 1);
+    }
+    if (!path.is_abs(source.path) || !path.is_abs(destination.path)) { ret 4; }
+    ret rename_held_pair(source.path, destination.path);
+}
+
+test rename__source_symlinks_move_without_moving_their_targets {
+    val target: str = "mach_std_rename_symlink_target";
+    val from:   str = "mach_std_rename_symlink_from";
+    val to:     str = "mach_std_rename_symlink_to";
+    if (refused_fs(write_bytes(target, "old", 3, 0o600))) { ret 1; }
+    fin { remove_file(target); }
+    if (refused(symlink(target, from))) { ret 2; }
+    fin {
+        remove_file(from);
+        remove_file(to);
+    }
+    if (refused(rename(from, to))) { ret 3; }
+    val moved: res[Metadata, io_error.Error] = metadata_link(to);
+    if (sel moved.err)                                        { ret 4; }
+    if (moved.ok.kind != KIND_SYMLINK)                        { ret 5; }
+    if (!answered(is_file(target)) || answered(exists(from))) { ret 6; }
+    val o: res[File, io_error.Error] = open(to);
+    if (sel o.err) { ret 7; }
+    var file: File = o.ok;
+    fin { close(?file); }
+    if (!rename_held_contents(file, "old")) { ret 8; }
+    ret 0;
+}
+
+#[testing]
+fun rename_type_conflicts(rooted: bool) i32 {
+    var file_path: str = "mach_std_rename_type_file";
+    var dir_path:  str = "mach_std_rename_type_directory";
+    if (rooted) {
+        file_path = "mach_std_rename_rooted_type_file";
+        dir_path  = "mach_std_rename_rooted_type_directory";
+    }
+    if (refused_fs(write_bytes(file_path, "old", 3, 0o600))) { ret 1; }
+    fin {
+        remove_file(file_path);
+        remove_dir(file_path);
+    }
+    if (refused(create_dir(dir_path, 0o700))) { ret 2; }
+    fin {
+        remove_dir(dir_path);
+        remove_file(dir_path);
+    }
+    var dirfd: usize = os.working_dir();
+    if (rooted) {
+        var opened_dir_handle: usize = os.INVALID_HANDLE;
+        val opened_dir:        i64   = os.open(os.working_dir(), ".", os.O_RDONLY | os.O_DIRECTORY, 0, ?opened_dir_handle);
+        if (opened_dir < 0) { ret 9; }
+        dirfd = opened_dir_handle;
+    }
+    fin {
+        if (rooted) { os.close(dirfd); }
+    }
+    if (os.rename(dirfd, file_path, dirfd, dir_path) >= 0)            { ret 3; }
+    if (!answered(is_file(file_path)) || !answered(is_dir(dir_path))) { ret 4; }
+    if (os.rename(dirfd, dir_path, dirfd, file_path) >= 0)            { ret 5; }
+    if (!answered(is_file(file_path)) || !answered(is_dir(dir_path))) { ret 6; }
+    val o: res[File, io_error.Error] = open(file_path);
+    if (sel o.err) { ret 7; }
+    var file: File = o.ok;
+    fin { close(?file); }
+    if (!rename_held_contents(file, "old")) { ret 8; }
+    ret 0;
+}
+
+test rename__type_conflicts_preserve_both_entries {
+    val plain: i32 = rename_type_conflicts(false);
+    if (plain != 0) { ret plain; }
+    val rooted: i32 = rename_type_conflicts(true);
+    if (rooted != 0) { ret 20 + rooted; }
+    ret 0;
+}
+
+#[testing]
+fun rename_directory_symlink(existing: bool) i32 {
+    var target: str = "mach_607_dirlink_absent_target";
+    var from:   str = "mach_607_dirlink_absent_from";
+    var to:     str = "mach_607_dirlink_absent_to";
+    if (existing) {
+        target = "mach_607_dirlink_existing_target";
+        from   = "mach_607_dirlink_existing_from";
+        to     = "mach_607_dirlink_existing_to";
+    }
+    if (refused(create_dir(target, 0o700))) { ret 97; }
+    fin { remove_dir(target); }
+    if (refused(symlink(target, from))) { ret 98; }
+    fin {
+        remove_dir(from);
+        remove_file(from);
+        remove_dir(to);
+        remove_file(to);
+    }
+    val before: res[Metadata, io_error.Error] = metadata_link(from);
+    if (sel before.err)                                           { ret 96; }
+    if (before.ok.kind != KIND_SYMLINK)                           { ret 95; }
+    if (existing && refused_fs(write_bytes(to, "old", 3, 0o600))) { ret 94; }
+    val raw: i64 = os.rename(os.working_dir(), from, os.working_dir(), to);
+    if (raw < 0) { ret (0 - raw)::i32; }
+    val moved: res[Metadata, io_error.Error] = metadata_link(to);
+    if (sel moved.err)                                       { ret 93; }
+    if (moved.ok.kind != KIND_SYMLINK)                       { ret 92; }
+    if (!answered(is_dir(target)) || answered(exists(from))) { ret 91; }
+    ret 0;
+}
+
+test rename__directory_symlink_source_to_absent_and_file_destinations {
+    val absent: i32 = rename_directory_symlink(false);
+    if (absent != 0) { ret absent; }
+    ret rename_directory_symlink(true);
+}
+
+$if ($mach.build.sys == $mach.sys.windows) {
+    test rename__drive_relative_destinations_preserve_held_handles {
+        var bytes:   [8192]u8;
+        var state:   fixed.FixedState;
+        var alloc:   A.Allocator;
+        val fixed_r: err[A.Error] = fixed.make(?alloc, ?state, ?bytes[0], 8192);
+        if (sel fixed_r.err) { ret 1; }
+        val sr: res[TempFile, FsError] = temp_create(?alloc, "mach_held_drive_source");
+        if (sel sr.err) { ret 2; }
+        var source: TempFile = sr.ok;
+        fin {
+            temp_close_and_remove(?source);
+            A.deallocate[u8](?alloc, source.path, str_len(source.path) + 1);
+        }
+        if (source.path[1] != ':') { ret 3; }
+        val leaf:   str               = path.filename(source.path);
+        val length: usize             = str_len(leaf) + 7;
+        val ar:     res[*u8, A.Error] = A.allocate[u8](?alloc, length);
+        if (sel ar.err) { ret 4; }
+        val to: *u8 = ar.ok;
+        fin { A.deallocate[u8](?alloc, to, length); }
+        to[0] = source.path[0];
+        to[1] = ':';
+        memory.raw_copy(?to[2], leaf, length - 7);
+        memory.raw_copy(?to[length - 5], ".dst", 4);
+        to[length - 1] = 0;
+        ret rename_held_pair(source.path, to);
+    }
+}
+
+test remove_all__removes_nested_entries_and_preserves_external_link_targets {
+    var bytes:   [8192]u8;
+    var state:   fixed.FixedState;
+    var alloc:   A.Allocator;
+    val fixed_r: err[A.Error] = fixed.make(?alloc, ?state, ?bytes[0], 8192);
+    if (sel fixed_r.err) { ret 1; }
+    val tree:    str = "mach_613_remove_tree";
+    val outside: str = "mach_613_remove_outside";
+    if (refused(create_dir(tree, 0o700))) { ret 2; }
+    fin { remove_all(?alloc, tree); }
+    if (refused(create_dir(outside, 0o700))) { ret 3; }
+    fin { remove_all(?alloc, outside); }
+    if (refused_fs(write_bytes("mach_613_remove_outside/kept", "kept", 4, 0o600)))             { ret 4; }
+    if (refused(create_dir("mach_613_remove_tree/nested", 0o700)))                             { ret 5; }
+    if (refused_fs(write_bytes("mach_613_remove_tree/nested/empty_mode", "private", 7, 0)))    { ret 6; }
+    if (refused(symlink("../mach_613_remove_outside", "mach_613_remove_tree/directory_link"))) { ret 7; }
+    if (refused(symlink("../mach_613_remove_outside/kept", "mach_613_remove_tree/file_link"))) { ret 8; }
+    if (refused_fs(remove_all(?alloc, tree)))                                                  { ret 9; }
+    if (answered(exists(tree)) || !answered(is_file("mach_613_remove_outside/kept")))          { ret 10; }
+    if (refused_fs(remove_all(?alloc, tree)))                                                  { ret 11; }
+    ret 0;
+}
+
+# a removal that names no child entry is refused as containment before any
+# mutation, an empty path is a successful no-op, and the allocator's refusal
+# at the owned-path copy is reported as such with nothing changed
+test remove_all__refuses_roots_and_dot_entries_and_reports_the_allocator {
+    var tracking:   alloc_testing.Testing;
+    val tracking_r: err[A.Error] = alloc_testing.make(?tracking);
+    if (sel tracking_r.err) { ret 1; }
+    fin { alloc_testing.dnit(?tracking); }
+    val dot: err[FsError] = remove_all(?tracking.a, ".");
+    if (sel dot.ok)                                                               { ret 2; }
+    if (!sel dot.err.removal)                                                     { ret 3; }
+    if (!dot.err.removal.containment || dot.err.removal.kind != io_error.INVALID) { ret 4; }
+    val parent: err[FsError] = remove_all(?tracking.a, "..");
+    if (sel parent.ok)           { ret 5; }
+    if (!sel parent.err.removal) { ret 6; }
+    val root: err[FsError] = remove_all(?tracking.a, "/");
+    if (sel root.ok)           { ret 7; }
+    if (!sel root.err.removal) { ret 8; }
+    val empty: err[FsError] = remove_all(?tracking.a, "");
+    if (sel empty.err)      { ret 9; }
+    if (tracking.live != 0) { ret 10; }
+    val keep: Path = "mach_std_fs_remove_all_kept";
+    if (refused(create_dir(keep, 0o700))) { ret 11; }
+    fin { remove_dir(keep); }
+    tracking.fail_at = tracking.attempts + 1;
+    val refused_copy: err[FsError] = remove_all(?tracking.a, keep);
+    if (sel refused_copy.ok)                           { ret 12; }
+    if (!sel refused_copy.err.alloc)                   { ret 13; }
+    if (!answered(is_dir(keep)) || tracking.live != 0) { ret 14; }
+    ret 0;
+}
+
+# create_dir_all is a successful no-op on an existing directory and reports
+# the creation's own refusal when a file stands where the directory must go
+test create_dir_all__existing_succeeds_and_a_file_in_the_way_refuses {
+    var bytes:   [8192]u8;
+    var state:   fixed.FixedState;
+    var alloc:   A.Allocator;
+    val fixed_r: err[A.Error] = fixed.make(?alloc, ?state, ?bytes[0], 8192);
+    if (sel fixed_r.err) { ret 1; }
+    val d: Path = "mach_std_fs_cda";
+    remove_all(?alloc, d);
+    if (refused_fs(create_dir_all(?alloc, "mach_std_fs_cda/a/b", 0o700))) { ret 2; }
+    fin { remove_all(?alloc, d); }
+    if (refused_fs(create_dir_all(?alloc, "mach_std_fs_cda/a/b", 0o700))) { ret 3; }
+    if (!answered(is_dir("mach_std_fs_cda/a/b")))                         { ret 4; }
+    if (refused_fs(write_bytes("mach_std_fs_cda/a/file", "x", 1, 0o600))) { ret 5; }
+    val blocked: err[FsError] = create_dir_all(?alloc, "mach_std_fs_cda/a/file", 0o700);
+    if (sel blocked.ok)                                                                           { ret 6; }
+    if (!sel blocked.err.io)                                                                      { ret 7; }
+    if (blocked.err.io.kind != io_error.EXISTS || blocked.err.io.operation != io_error.OP_CREATE) { ret 8; }
+    val beneath: err[FsError] = create_dir_all(?alloc, "mach_std_fs_cda/a/file/deeper", 0o700);
+    if (sel beneath.ok)                               { ret 9; }
+    if (!sel beneath.err.io)                          { ret 10; }
+    if (!answered(is_file("mach_std_fs_cda/a/file"))) { ret 11; }
+    ret 0;
+}
+
+# write_bytes refuses a missing parent as the creation's refusal, an empty
+# write creates an empty file, and nil data with a length is invalid use
+test write_bytes__both_cases_and_the_empty_write {
+    val missing: err[FsError] = write_bytes("mach_std_fs_no_such_dir/file", "x", 1, 0o600);
+    if (sel missing.ok)                                                                              { ret 1; }
+    if (!sel missing.err.io)                                                                         { ret 2; }
+    if (missing.err.io.kind != io_error.NOT_FOUND || missing.err.io.operation != io_error.OP_CREATE) { ret 3; }
+    val p: Path = "mach_std_fs_write_empty";
+    if (refused_fs(write_bytes(p, nil, 0, 0o600))) { ret 4; }
+    fin { remove_file(p); }
+    val m: res[Metadata, io_error.Error] = metadata(p);
+    if (sel m.err)                                { ret 5; }
+    if (m.ok.size != 0 || m.ok.kind != KIND_FILE) { ret 6; }
+    val invalid: err[FsError] = write_bytes(p, nil, 1, 0o600);
+    if (sel invalid.ok)                          { ret 7; }
+    if (!sel invalid.err.io)                     { ret 8; }
+    if (invalid.err.io.kind != io_error.INVALID) { ret 9; }
+    ret 0;
+}
+
+# a temporary that is already closed reports the close refusal first and the
+# removal's refusal beside it, and both effects still run
+test temp_close_and_remove__both_refusals_are_retained {
+    var bytes:   [8192]u8;
+    var state:   fixed.FixedState;
+    var alloc:   A.Allocator;
+    val fixed_r: err[A.Error] = fixed.make(?alloc, ?state, ?bytes[0], 8192);
+    if (sel fixed_r.err) { ret 1; }
+    val made: res[TempFile, FsError] = temp_create(?alloc, "mach_std_fs_temp_both");
+    if (sel made.err) { ret 2; }
+    var tf: TempFile = made.ok;
+    fin { A.deallocate[u8](?alloc, tf.path, str_len(tf.path) + 1); }
+    if (refused(temp_close(?tf)))  { ret 3; }
+    if (refused(temp_remove(?tf))) { ret 4; }
+    val both: err[io_error.Error] = temp_close_and_remove(?tf);
+    if (sel both.ok)                                                                 { ret 5; }
+    if (both.err.kind != io_error.CLOSED || both.err.operation != io_error.OP_CLOSE) { ret 6; }
+    if (os.error_kind(both.err.cleanup_code) != io_error.NOT_FOUND)                  { ret 7; }
+    val again: res[TempFile, FsError] = temp_create(?alloc, "mach_std_fs_temp_both");
+    if (sel again.err) { ret 8; }
+    var second: TempFile = again.ok;
+    fin { A.deallocate[u8](?alloc, second.path, str_len(second.path) + 1); }
+    if (refused(temp_close_and_remove(?second))) { ret 9; }
+    if (answered(exists(second.path)))           { ret 10; }
+    ret 0;
+}
+
+$if ($mach.build.sys == $mach.sys.windows) {
+    #[library("kernel32")]
+    ext fun SetFileAttributesW(path: *u16, attributes: u32) i32;
+    #[library("kernel32")]
+    ext fun GetFileAttributesW(path: *u16) u32;
+    #[library("kernel32")]
+    ext fun CreateHardLinkW(path: *u16, existing: *u16, security: ptr) i32;
+
+    #[testing]
+    fun removal_test_wide(name: str, out: *u16) {
+        var i: usize = 0;
+        for (name[i] != 0) {
+            out[i] = name[i]::u16;
+            i      = i + 1;
+        }
+        out[i] = 0;
+    }
+
+    test remove_all__forces_readonly_entries_without_changing_surviving_aliases {
+        var bytes:   [8192]u8;
+        var state:   fixed.FixedState;
+        var alloc:   A.Allocator;
+        val fixed_r: err[A.Error] = fixed.make(?alloc, ?state, ?bytes[0], 8192);
+        if (sel fixed_r.err) { ret 1; }
+        val tree:  str = "mach_613_readonly_tree";
+        val alias: str = "mach_613_readonly_alias";
+        val file:  str = "mach_613_readonly_tree/file";
+        if (refused(create_dir(tree, 0o700))) { ret 2; }
+        fin { remove_all(?alloc, tree); }
+        if (refused_fs(write_bytes(file, "kept", 4, 0o600))) { ret 3; }
+        var wide_file:  [128]u16;
+        var wide_alias: [128]u16;
+        removal_test_wide(file, ?wide_file[0]);
+        removal_test_wide(alias, ?wide_alias[0]);
+        if (CreateHardLinkW(?wide_alias[0], ?wide_file[0], nil) == 0) { ret 4; }
+        fin { remove_all(?alloc, alias); }
+        if (SetFileAttributesW(?wide_file[0], 0x21) == 0) { ret 5; }
+        val before: u32 = GetFileAttributesW(?wide_alias[0]);
+        if (before == 0xffffffff || (before & 1) == 0)                                                           { ret 6; }
+        if (!refused(remove_file(file)))                                                                         { ret 7; }
+        if (!answered(is_file(file)) || GetFileAttributesW(?wide_alias[0]) != before)                            { ret 8; }
+        if (refused(symlink("../mach_613_readonly_alias", "mach_613_readonly_tree/link")))                       { ret 9; }
+        if (refused_fs(remove_all(?alloc, tree)))                                                                { ret 10; }
+        if (answered(exists(tree)) || !answered(is_file(alias)) || GetFileAttributesW(?wide_alias[0]) != before) { ret 11; }
+        val o: res[File, io_error.Error] = open(alias);
+        if (sel o.err) { ret 12; }
+        var held: File = o.ok;
+        fin { close(?held); }
+        if (!rename_held_contents(held, "kept"))                            { ret 13; }
+        if (refused_fs(remove_all(?alloc, alias)))                          { ret 14; }
+        if (answered(exists(alias)) || !rename_held_contents(held, "kept")) { ret 15; }
+        ret 0;
+    }
+}
+
+#[testing]
+rec ReadStringProbe {
+    backing:  *alloc_testing.Testing;
+    path:     Path;
+    truncate: bool;
+    failed:   bool;
+}
+
+#[testing]
+fun read_string_probe_allocate(ctx: ptr, size: usize, align: usize) opt[ptr] {
+    val probe: *ReadStringProbe = ctx::*ReadStringProbe;
+    if (probe.truncate) {
+        var truncated_handle: usize = os.INVALID_HANDLE;
+        val truncated:        i64   = os.open(os.working_dir(), probe.path, os.O_WRONLY | os.O_TRUNC, 0, ?truncated_handle);
+        if (truncated < 0) {
+            probe.failed = true;
+            ret opt[ptr].none{};
+        }
+        if (os.close(truncated_handle) < 0) {
+            probe.failed = true;
+            ret opt[ptr].none{};
+        }
+    }
+    ret probe.backing.a.fn_allocate(probe.backing.a.ctx, size, align);
+}
+
+#[testing]
+fun read_string_probe_deallocate(ctx: ptr, data: ptr, size: usize, align: usize) i64 {
+    val probe: *ReadStringProbe = ctx::*ReadStringProbe;
+    ret probe.backing.a.fn_deallocate(probe.backing.a.ctx, data, size, align);
+}
+
+# a file that shrinks between the stat and the read is read{eof} with the
+# delivered count, the exact allocation is released, an empty file is an
+# empty string, and the allocator's refusal is alloc with nothing retained
+test read_string__truncation_releases_the_exact_allocation_before_returning {
+    val name: Path = "mach_std_read_string_truncation";
+    if (refused_fs(write_bytes(name, "content", 7, 0o600))) { ret 1; }
+    fin { remove_file(name); }
+    var tracking:   alloc_testing.Testing;
+    val tracking_r: err[A.Error] = alloc_testing.make(?tracking);
+    if (sel tracking_r.err) { ret 2; }
+    fin { alloc_testing.dnit(?tracking); }
+    var probe: ReadStringProbe = ReadStringProbe{backing: ?tracking, path: name, truncate: true};
+    var alloc: A.Allocator     = A.Allocator{ctx: (?probe)::ptr,
+        fn_allocate: read_string_probe_allocate, fn_deallocate: read_string_probe_deallocate};
+    val failed: res[str, FsError] = read_string(?alloc, name);
+    if (probe.failed)                                                                                      { ret 3; }
+    if (sel failed.ok)                                                                                     { ret 3; }
+    if (!sel failed.err.read)                                                                              { ret 4; }
+    if (!sel failed.err.read.eof)                                                                          { ret 4; }
+    if (failed.err.read.eof != 0)                                                                          { ret 4; }
+    if (tracking.attempts != 1 || tracking.total != 1 || tracking.live != 0 || tracking.double_frees != 0) { ret 5; }
+    probe.truncate = false;
+    val empty: res[str, FsError] = read_string(?alloc, name);
+    if (sel empty.err) { ret 6; }
+    val data: str = empty.ok;
+    if (data == nil || data[0] != 0 || tracking.live != 1) { ret 7; }
+    val released: err[A.Error] = A.deallocate[u8](?alloc, data, 1);
+    if (sel released.err)                                 { ret 8; }
+    if (tracking.live != 0 || tracking.double_frees != 0) { ret 9; }
+    tracking.fail_at = tracking.attempts + 1;
+    val refused_alloc: res[str, FsError] = read_string(?alloc, name);
+    if (sel refused_alloc.ok)         { ret 10; }
+    if (!sel refused_alloc.err.alloc) { ret 11; }
+    if (tracking.live != 0)           { ret 12; }
+    ret 0;
+}
+
+# read_bytes reports a missing file as the open's refusal and the allocator's
+# refusal through the reader, owning nothing either way
+test read_bytes__refusals_own_nothing {
+    var tracking:   alloc_testing.Testing;
+    val tracking_r: err[A.Error] = alloc_testing.make(?tracking);
+    if (sel tracking_r.err) { ret 1; }
+    fin { alloc_testing.dnit(?tracking); }
+    val missing: res[Vector[u8], FsError] = read_bytes(?tracking.a, "mach_std_fs_bytes_missing");
+    if (sel missing.ok)                                                                            { ret 2; }
+    if (!sel missing.err.io)                                                                       { ret 3; }
+    if (missing.err.io.kind != io_error.NOT_FOUND || missing.err.io.operation != io_error.OP_OPEN) { ret 4; }
+    if (tracking.attempts != 0)                                                                    { ret 5; }
+    val p: Path = "mach_std_fs_bytes_refused";
+    if (refused_fs(write_bytes(p, "abc", 3, 0o600))) { ret 6; }
+    fin { remove_file(p); }
+    tracking.fail_at = tracking.attempts + 1;
+    val refused_alloc: res[Vector[u8], FsError] = read_bytes(?tracking.a, p);
+    if (sel refused_alloc.ok)              { ret 7; }
+    if (!sel refused_alloc.err.read)       { ret 8; }
+    if (!sel refused_alloc.err.read.alloc) { ret 9; }
+    if (tracking.live != 0)                { ret 10; }
+    alloc_testing.clear_failure(?tracking);
+    val whole: res[Vector[u8], FsError] = read_bytes(?tracking.a, p);
+    if (sel whole.err) { ret 11; }
+    var owned: Vector[u8] = whole.ok;
+    if (owned.len != 3 || tracking.live != 1) { ret 12; }
+    vector.dnit[u8](?owned);
+    if (tracking.live != 0) { ret 13; }
+    ret 0;
+}
+
+test read_dir__caller_ownership_and_allocation_failure_cleanup {
+    var scratch: [32768]u8;
+    var state:   fixed.FixedState;
+    var setup:   A.Allocator;
+    val fixed_r: err[A.Error] = fixed.make(?setup, ?state, ?scratch[0], 32768);
+    if (sel fixed_r.err) { ret 1; }
+    val dir: Path = "mach_std_fs_rd_ownership";
+    if (refused_fs(remove_all(?setup, dir))) { ret 2; }
+    if (refused(create_dir(dir, 0o700)))     { ret 3; }
+    fin { remove_all(?setup, dir); }
+    var i: usize = 0;
+    for (i < 10) {
+        var leaf: [2]u8;
+        leaf[0] = 'a' + i::u8;
+        leaf[1] = 0;
+        val joined: res[Path, A.Error] = path.join(?setup, dir, (?leaf[0])::str);
+        if (sel joined.err) { ret 4; }
+        val file:    Path         = joined.ok;
+        val written: err[FsError] = write_bytes(file, "x", 1, 0o600);
+        str_free(?setup, file);
+        if (sel written.err) { ret 5; }
+        i = i + 1;
+    }
+
+    var tracking:   alloc_testing.Testing;
+    val tracking_r: err[A.Error] = alloc_testing.make(?tracking);
+    if (sel tracking_r.err) { ret 6; }
+    fin { alloc_testing.dnit(?tracking); }
+    val listed: res[Vector[str], FsError] = read_dir(?tracking.a, dir);
+    if (sel listed.err) { ret 7; }
+    var names:    Vector[str] = listed.ok;
+    val attempts: usize       = tracking.attempts;
+    if (names.len != 10 || tracking.live != 11 || attempts < 12) { ret 8; }
+    var seen: u32 = 0;
+    i = 0;
+    for (i < names.len) {
+        val name: str = names.data[i];
+        if (str_len(name) != 1 || name[0] < 'a' || name[0] > 'j') { ret 9; }
+        val bit: u32 = 1 << (name[0] - 'a')::u32;
+        if ((seen & bit) != 0) { ret 10; }
+        seen = seen | bit;
+        str_free(?tracking.a, name);
+        i = i + 1;
+    }
+    if (seen != 1023 || tracking.live != 1) { ret 11; }
+    val names_freed: err[A.Error] = vector.dnit[str](?names);
+    if (sel names_freed.err || tracking.live != 0) { ret 12; }
+
+    var ordinal: usize = 1;
+    for (ordinal <= attempts) {
+        val before: usize = tracking.attempts;
+        tracking.fail_at = before + ordinal;
+        val refused_alloc: res[Vector[str], FsError] = read_dir(?tracking.a, dir);
+        if (sel refused_alloc.ok)                                  { ret 13; }
+        if (!sel refused_alloc.err.alloc)                          { ret 17; }
+        if (tracking.attempts != before + ordinal)                 { ret 14; }
+        if (tracking.live != 0)                                    { ret 15; }
+        if (tracking.double_frees != 0 || tracking.exhausted != 0) { ret 16; }
+        ordinal = ordinal + 1;
+    }
+    val missing: res[Vector[str], FsError] = read_dir(?tracking.a, "mach_std_fs_rd_missing");
+    if (sel missing.ok)                                                                            { ret 18; }
+    if (!sel missing.err.io)                                                                       { ret 19; }
+    if (missing.err.io.kind != io_error.NOT_FOUND || missing.err.io.operation != io_error.OP_OPEN) { ret 20; }
+    ret 0;
+}
+
+# replace_bytes_atomic refused at every allocation ordinal leaves the
+# destination as it was, no sibling temporary, and nothing allocated
+test replace_bytes_atomic__every_allocation_refusal_preserves_the_destination {
+    var scratch: [32768]u8;
+    var state:   fixed.FixedState;
+    var setup:   A.Allocator;
+    val fixed_r: err[A.Error] = fixed.make(?setup, ?state, ?scratch[0], 32768);
+    if (sel fixed_r.err) { ret 1; }
+    val d: Path = "mach_std_fs_atomic_alloc";
+    val p: Path = "mach_std_fs_atomic_alloc/state";
+    remove_all(?setup, d);
+    if (refused_fs(replace_bytes_atomic(?setup, p, "kept", 4, 0o600, 0o700))) { ret 2; }
+    fin { remove_all(?setup, d); }
+    var tracking:   alloc_testing.Testing;
+    val tracking_r: err[A.Error] = alloc_testing.make(?tracking);
+    if (sel tracking_r.err) { ret 3; }
+    fin { alloc_testing.dnit(?tracking); }
+    if (refused_fs(replace_bytes_atomic(?tracking.a, p, "next", 4, 0o600, 0o700))) { ret 4; }
+    val attempts: usize = tracking.attempts;
+    if (attempts < 3 || tracking.live != 0)                                   { ret 5; }
+    if (refused_fs(replace_bytes_atomic(?setup, p, "kept", 4, 0o600, 0o700))) { ret 6; }
+    var ordinal: usize = 1;
+    for (ordinal <= attempts) {
+        val before: usize = tracking.attempts;
+        tracking.fail_at = before + ordinal;
+        val refused_alloc: err[FsError] = replace_bytes_atomic(?tracking.a, p, "next", 4, 0o600, 0o700);
+        if (sel refused_alloc.ok)                                        { ret 7; }
+        if (!sel refused_alloc.err.alloc)                                { ret 8; }
+        if (tracking.attempts != before + ordinal || tracking.live != 0) { ret 9; }
+        val current: res[str, FsError] = read_string(?setup, p);
+        if (sel current.err) { ret 10; }
+        val text: str  = current.ok;
+        val same: bool = str_equals(text, "kept");
+        str_free(?setup, text);
+        if (!same) { ret 11; }
+        val listed: res[Vector[str], FsError] = read_dir(?setup, d);
+        if (sel listed.err) { ret 12; }
+        var names: Vector[str] = listed.ok;
+        val count: usize       = names.len;
+        free_dir_names(?names);
+        if (count != 1) { ret 13; }
+        ordinal = ordinal + 1;
+    }
+    ret 0;
+}
+
+$if (capability.HAS_ENTROPY && capability.HAS_PAGES) {
+    fun secret_is_key_material(read: res[SecretBytes, FsError]) bool {
+        if (sel read.err) { ret false; }
+        val bytes: SecretBytes = read.ok;
+        if (bytes.data == nil || bytes.size != 12) { ret false; }
+        val expected: *u8   = "key_material";
+        var same:     bool  = true;
+        var i:        usize = 0;
+        for (i < 12) {
+            if (bytes.data[i]:>u8 != expected[i]) { same = false; }
+            i = i + 1;
+        }
+        val released: err[io_error.Error] = secret_memory.deallocate(bytes.data, bytes.size);
+        if (sel released.err) { ret false; }
+        ret same;
+    }
+
+    # a file's bytes land in welded storage intact, compared through declassify,
+    # from a path or from an open handle whatever its position, which stays
+    # open, and an empty file is the empty owner
+    test read_secret__round_trips_a_file_into_welded_storage {
+        val p: Path = "mach_std_fs_read_secret";
+        if (refused_fs(write_bytes(p, "key_material", 12, 0o600))) { ret 1; }
+        fin { remove_file(p); }
+        if (!secret_is_key_material(read_secret(p))) { ret 2; }
+
+        val ro: res[File, io_error.Error] = open(p);
+        if (sel ro.err) { ret 3; }
+        var f:     File                     = ro.ok;
+        val moved: res[i64, io_error.Error] = seek(f, 4, SEEK_SET);
+        if (sel moved.err || !secret_is_key_material(read_secret_of(f))) {
+            close(?f);
+            ret 4;
+        }
+        val closed: err[io_error.Error] = close(?f);
+        if (sel closed.err) { ret 5; }
+
+        if (refused_fs(write_bytes(p, nil, 0, 0o600))) { ret 6; }
+        val empty: res[SecretBytes, FsError] = read_secret(p);
+        if (sel empty.err)                              { ret 7; }
+        if (empty.ok.data != nil || empty.ok.size != 0) { ret 8; }
+        ret 0;
+    }
+}

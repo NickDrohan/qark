@@ -1,0 +1,126 @@
+# normalized I/O errors with target detail and operation context
+#
+# this module is portable. translating a native code into an Error belongs to
+# the OS layer (std.system.os.error)
+
+use std.types.bool.bool;
+use std.types.string.str;
+use std.types.string.str_equals;
+
+pub def Kind: u8;
+pub val INTERRUPTED:        Kind = 0;
+pub val WOULD_BLOCK:        Kind = 1;
+pub val TIMEOUT:            Kind = 2;
+pub val CANCELLED:          Kind = 3;
+pub val REFUSED:            Kind = 4;
+pub val RESET:              Kind = 5;
+pub val ABORTED:            Kind = 6;
+pub val CLOSED:             Kind = 7;
+pub val ADDRESS_IN_USE:     Kind = 8;
+pub val UNREACHABLE:        Kind = 9;
+pub val PERMISSION:         Kind = 10;
+pub val RESOURCE_EXHAUSTED: Kind = 11;
+pub val INVALID:            Kind = 12;
+pub val UNSUPPORTED:        Kind = 13;
+pub val OTHER:              Kind = 14;
+pub val NOT_FOUND:          Kind = 15;
+pub val EXISTS:             Kind = 16;
+pub val NOT_DIRECTORY:      Kind = 17;
+pub val IS_DIRECTORY:       Kind = 18;
+pub val NOT_EMPTY:          Kind = 19;
+pub val NAME_TOO_LONG:      Kind = 20;
+pub val BUSY:               Kind = 21;
+pub val IO:                 Kind = 22;
+pub val RANGE:              Kind = 23;
+pub val NO_CHILD:           Kind = 24;
+pub val LOOP:               Kind = 25;
+
+pub def Operation: u8;
+pub val OP_UNKNOWN:  Operation = 0;
+pub val OP_OPEN:     Operation = 1;
+pub val OP_CLOSE:    Operation = 2;
+pub val OP_READ:     Operation = 3;
+pub val OP_WRITE:    Operation = 4;
+pub val OP_CREATE:   Operation = 5;
+pub val OP_BIND:     Operation = 6;
+pub val OP_LISTEN:   Operation = 7;
+pub val OP_ACCEPT:   Operation = 8;
+pub val OP_CONNECT:  Operation = 9;
+pub val OP_RECEIVE:  Operation = 10;
+pub val OP_SEND:     Operation = 11;
+pub val OP_SHUTDOWN: Operation = 12;
+pub val OP_OPTION:   Operation = 13;
+pub val OP_SEEK:     Operation = 14;
+pub val OP_SYNC:     Operation = 15;
+pub val OP_SUBMIT:   Operation = 16;
+pub val OP_WAIT:     Operation = 17;
+pub val OP_WAKE:     Operation = 18;
+
+pub rec Error {
+    kind:      Kind;
+    code:      i64;
+    operation: Operation;
+    # first secondary cleanup failure, zero when none was observed
+    cleanup_code: i64;
+}
+
+# an error std raised itself, with no native code behind it
+# ---
+# kind:      the portable classification
+# operation: the operation that failed
+# ret:       the error, with code and cleanup_code 0
+pub fun make(kind: Kind, operation: Operation) Error {
+    ret Error{kind: kind, code: 0, operation: operation, cleanup_code: 0};
+}
+
+# the name of a kind, for messages about an error with no native code
+pub fun kind_name(kind: Kind) str {
+    if (kind == INTERRUPTED)        { ret "interrupted"; }
+    or (kind == WOULD_BLOCK)        { ret "operation would block"; }
+    or (kind == TIMEOUT)            { ret "timed out"; }
+    or (kind == CANCELLED)          { ret "cancelled"; }
+    or (kind == REFUSED)            { ret "connection refused"; }
+    or (kind == RESET)              { ret "connection reset"; }
+    or (kind == ABORTED)            { ret "connection aborted"; }
+    or (kind == CLOSED)             { ret "closed"; }
+    or (kind == ADDRESS_IN_USE)     { ret "address in use"; }
+    or (kind == UNREACHABLE)        { ret "unreachable"; }
+    or (kind == PERMISSION)         { ret "permission denied"; }
+    or (kind == RESOURCE_EXHAUSTED) { ret "resource exhausted"; }
+    or (kind == INVALID)            { ret "invalid argument"; }
+    or (kind == OTHER)              { ret "other error"; }
+    or (kind == UNSUPPORTED)        { ret "not supported"; }
+    or (kind == NOT_FOUND)          { ret "not found"; }
+    or (kind == EXISTS)             { ret "already exists"; }
+    or (kind == NOT_DIRECTORY)      { ret "not a directory"; }
+    or (kind == IS_DIRECTORY)       { ret "is a directory"; }
+    or (kind == NOT_EMPTY)          { ret "directory not empty"; }
+    or (kind == NAME_TOO_LONG)      { ret "name too long"; }
+    or (kind == BUSY)               { ret "busy"; }
+    or (kind == IO)                 { ret "input/output error"; }
+    or (kind == RANGE)              { ret "out of range"; }
+    or (kind == NO_CHILD)           { ret "no child process"; }
+    or (kind == LOOP)               { ret "too many levels of symbolic links"; }
+    ret "error";
+}
+
+pub fun retryable(error: Error) bool {
+    ret error.kind == INTERRUPTED || error.kind == WOULD_BLOCK;
+}
+
+test error__retry_classification_is_stable {
+    if (!retryable(make(INTERRUPTED, OP_READ))) { ret 1; }
+    if (!retryable(make(WOULD_BLOCK, OP_READ))) { ret 2; }
+    if (retryable(make(INVALID, OP_READ)))      { ret 3; }
+    ret 0;
+}
+
+test error__every_kind_has_a_name {
+    var kind: Kind = INTERRUPTED;
+    for (kind <= LOOP) {
+        if (str_equals(kind_name(kind), "error")) { ret 1; }
+        kind = kind + 1;
+    }
+    if (!str_equals(kind_name(LOOP + 1), "error")) { ret 2; }
+    ret 0;
+}

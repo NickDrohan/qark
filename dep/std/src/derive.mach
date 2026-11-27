@@ -1,0 +1,611 @@
+# generic derive helpers over a record's fields
+#
+# these are macro-free, generic functions that walk a record type's fields at
+# comptime with `$each f in $fields(T)` and act on each field through the
+# projection `v.[f]`. one definition serves every record shape: the `$each`
+# unroll is deferred to instantiation, so `T` is a concrete record by the time a
+# field descriptor's type gates fold.
+#
+# the walk descends. a field whose own type is a record is walked in turn, so a
+# derive over `Player { pos: Vec3 { x, y, z } }` reaches the three floats rather
+# than refusing at `pos`, at any nesting depth.
+#
+# ## the classification contract
+#
+# every derive here classifies each field the same way, and `check[T]` is that
+# classification written once. a derive's own walk carries only its leaf action
+# and relies on `check[T]` for every refusal, which is why each walk's trailing
+# `$or { }` is empty rather than defensive: a field that reaches it has already
+# failed the build. `check[T]` recurses alongside the walk it guards, so a nested
+# record is classified at every depth.
+#
+# | field shape        | gate                | what happens                     |
+# |--------------------|---------------------|----------------------------------|
+# | union              | `$is_union`         | refused, with a written message  |
+# | reference          | `$is_pointer`       | detected, never followed         |
+# | record             | `$is_record`        | descended into                   |
+# | scalar numeric     | type comparison     | the derive's leaf action         |
+# | anything else      | the `$or` fallback  | refused, with a written message  |
+#
+# a scalar numeric is a signed or unsigned integer of any width, or a float. a
+# `def` over such a scalar counts (its underlying type is what the gate sees), so
+# `bool` and `char` fields qualify. the fallback catches arrays, vectors, and
+# `^` secrets.
+#
+# adding a derive is the drop-in this shape is for: write the walk with your own
+# leaf action, call `check[T]` first, and every refusal and message comes with
+# it. the leaf action is free to allocate or to fail -- `fmt` already
+# returns a `res` and returns early from any depth -- so a fallible or
+# allocating member takes its extra parameters and its return type as it needs
+# them, without the contract changing.
+#
+# ## the descent is recursion, and it terminates structurally
+#
+# each derive walks one level and re-enters itself at a record field's own type
+# (`eq[f.type](?a.[f], ?b.[f])`). there is no depth limit and none is needed: a
+# descent instantiates at a field's type, a record's fields are finite, and a
+# record cannot contain itself by value -- the compiler refuses that as a
+# recursive type of infinite size. a self-reference has to go through a pointer,
+# which is a different type and which `$is_record` does not select.
+#
+# this replaces a hand-written ladder four levels deep. that bound was never a
+# design choice, only what could be spelled: mach could not re-enter a generic at
+# a field's type until briar-systems/mach#2691.
+#
+# the property does NOT extend to following references. `rec Grow[T] { p:
+# *Grow[*T]; }` is legal and has unboundedly many distinct instances reachable
+# through its pointer, so a reference-following derive needs a termination story
+# this one gets for free. see briar-systems/mach#2693.
+#
+# ## secrets are refused, not skipped
+#
+# none of these helpers is secrecy-aware, and none can be: no comptime surface
+# reports that a field is secret (briar-systems/mach#2694). a secrecy-aware derive
+# -- skip in `fmt`, refuse in `hash`, constant-time compare in `eq` -- waits on
+# that.
+#
+# what makes that safe rather than silent is that **nothing strips `^`**. type
+# comparison never did, and since briar-systems/mach#2692 the shape predicates do
+# not either, so `^u64` fails `f.type == u64` and `^Rec` fails `$is_record`.
+# both fall to the fallback and are refused at comptime, with our message rather
+# than a raw intrinsic error.
+#
+# that is why the leaf is an explicit whitelist and the fallback is an `$error`.
+# under the current predicate rule a walk that ACTED on its fallback would
+# silently skip a secret instead of refusing it, so the refusal is what makes
+# "nothing classifies it" a safe answer rather than a dangerous one. inverting
+# either gate would let secrets through, and `fmt` would print them.
+#
+# ## references are detected, never followed
+#
+# `$is_pointer` sees a reference, and since briar-systems/mach#2693 (mach 4.15.0)
+# `$pointee_of` reaches the pointee's shape, so the walk could follow one. it does
+# not, and that is now a semantic choice rather than a toolchain limit: address
+# semantics versus deep semantics is the caller's to make, and a deep `clone`
+# allocates, which means an allocator argument and a failure mode these signatures
+# do not have. a reference field is refused. note that `str` is `def str: *char`,
+# so a `str` field is a reference field and is refused with the rest.
+#
+# ## value semantics
+#
+# equality and hashing follow IEEE-754 through `!=` and a canonical bit fold:
+# `-0.0` and `+0.0` are equal and hash alike, while a field holding NaN makes a
+# record never equal to itself (NaN compares unequal to everything).
+
+# the walk re-enters itself at a field's type (`eq[f.type](...)`), a spelling mach
+# did not accept before briar-systems/mach#2691. that landed on mach `dev` AFTER
+# 4.13.0 was tagged, so 4.13.0 does not carry it and 4.14.0 is the first release
+# that can build this module. there is no manifest surface that pins a toolchain
+# (`mach.lock` records dependency commits and is generated), so the requirement is
+# stated here.
+#
+# THIS GATE CANNOT FIRE FOR THAT SPELLING. `eq[f.type]` is a PARSE error on an
+# older compiler, and parsing precedes comptime evaluation, so an older toolchain
+# reports "expected a module alias before `.`" against this file rather than the
+# message below. that is not a flaw in the gate, it is the missing capability in
+# briar-systems/mach#2714: a manifest is read before any source is parsed, so a
+# minimum-toolchain key there would diagnose this cleanly, and mach has none.
+#
+# the gate is kept because it states the requirement where `mach doc` finds it and
+# because it would fire for a future requirement that is not a syntax one. until
+# #2714 lands it is not what makes an old toolchain diagnosable -- the CHANGELOG
+# and this comment are.
+$if ($mach.version.major < 4) {
+    $error("std.derive: needs mach 4.14.0 or newer; the walk re-enters itself with `eq[f.type]`, which mach did not accept before briar-systems/mach#2691 -- note 4.13.0 does NOT carry it");
+}
+$or ($mach.version.major == 4 && $mach.version.minor < 14) {
+    $error("std.derive: needs mach 4.14.0 or newer; the walk re-enters itself with `eq[f.type]`, which mach did not accept before briar-systems/mach#2691 -- note 4.13.0 does NOT carry it");
+}
+$or {}
+
+use std.format;
+use io_error: std.io.error;
+use std.io.writer;
+use std.io.writer.WriteError;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+
+# FNV-1a 64-bit offset basis
+val FNV_OFFSET: u64 = 14695981039346656037;
+
+# FNV-1a 64-bit prime
+val FNV_PRIME: u64 = 1099511628211;
+
+# fold the eight bytes of `word` into an FNV-1a accumulator
+# ---
+# h:    running hash accumulator
+# word: the field value packed into a u64
+# ret:  the updated accumulator
+fun fold(h: u64, word: u64) u64 {
+    var x: u64 = h;
+    var w: u64 = word;
+    var i: i64 = 0;
+    for (i < 8) {
+        x = (x ^ (w & 0xff)) * FNV_PRIME;
+        w = w >> 8;
+        i = i + 1;
+    }
+    ret x;
+}
+
+# refuse every field shape the derives here do not walk
+#
+# this is the classification contract in one place. each derive calls it before
+# its own walk, so a rejected record fails the build with a message written
+# against the field shape rather than through whichever intrinsic the leaf action
+# happened to reach first. it is `pub` so a hand-written derive can hold itself
+# to the same rule.
+#
+# the body is entirely comptime: every arm is empty or an `$error`, so an
+# accepted `T` compiles to an empty function. the release pipeline eliminates the
+# call; at `-O0` a derive pays one call into it.
+# ---
+# [T]: the record type to classify
+pub fun check[T]() {
+    $each f in $fields(T) {
+        $if ($is_union(f.type))   { $error("std.derive: a union field cannot be walked -- $fields refuses a union, since its variants overlap in storage and a member walk would report fields that do not all exist. give the union its own operation and call it beside the derive"); }
+        $or ($is_pointer(f.type)) { $error("std.derive: a reference field is detected but not followed -- address semantics versus deep semantics is the caller's choice, and a deep walk allocates, so it needs an allocator and a failure mode this signature does not have. note that str is *char, so a str field lands here"); }
+        $or ($is_record(f.type))  { check[f.type](); }
+        $or (f.type == i8 || f.type == i16 || f.type == i32 || f.type == i64
+            || f.type == u8 || f.type == u16 || f.type == u32 || f.type == u64
+            || f.type == f32 || f.type == f64) {}
+        $or { $error("std.derive: field type is neither a scalar numeric nor a nested record -- an array, a vector, or a ^ secret needs caller-chosen semantics. a ^ field lands here because nothing strips ^: not type comparison, and since briar-systems/mach#2692 not the shape predicates either (briar-systems/mach#2694)"); }
+    }
+}
+
+# structural equality over a record's fields
+#
+# compares `a` and `b` field by field, descending into nested records, and
+# returns false at the first mismatch. a record with no fields compares equal.
+# every field must classify (see `check`); a union, a reference, an array, or a
+# `^` secret is a comptime `$error`.
+# ---
+# [T]: the record type to compare
+# a:   first record
+# b:   second record
+# ret: true when every field, at every depth, compares equal
+pub fun eq[T](a: *T, b: *T) bool {
+    check[T]();
+    $each f in $fields(T) {
+        $if ($is_record(f.type)) {
+            if (!eq[f.type](?a.[f], ?b.[f])) { ret false; }
+        }
+        $or (f.type == i8 || f.type == i16 || f.type == i32 || f.type == i64
+            || f.type == u8 || f.type == u16 || f.type == u32 || f.type == u64
+            || f.type == f32 || f.type == f64) {
+            if (a.[f] != b.[f]) { ret false; }
+        }
+        $or {}
+    }
+    ret true;
+}
+
+# FNV-1a hash over a record's fields
+#
+# folds each field's value into a 64-bit accumulator in declaration order,
+# descending into nested records so a nested field contributes exactly as a
+# flattened one would. two records that compare `eq` hash alike, since both walk
+# the same fields in the same order. eligibility matches `eq`.
+# ---
+# [T]: the record type to hash
+# v:   the record to hash
+# ret: the 64-bit hash
+pub fun hash[T](v: *T) u64 {
+    check[T]();
+    ret fold_fields[T](FNV_OFFSET, v);
+}
+
+# fold `v`'s fields into a running accumulator, descending into nested records
+#
+# the accumulator is threaded through the descent rather than each nested record
+# being hashed on its own and combined, so a nested field contributes exactly the
+# bytes a flattened one would, so the digest is unchanged from the bounded walk
+# this replaced.
+# ---
+# [T]: the record type to fold
+# h0:  the accumulator to fold into
+# v:   the record whose fields are folded
+# ret: the accumulator after every field, at every depth
+fun fold_fields[T](h0: u64, v: *T) u64 {
+    var h: u64 = h0;
+    $each f in $fields(T) {
+        $if ($is_record(f.type)) { h = fold_fields[f.type](h, ?v.[f]); }
+        $or (f.type == i8 || f.type == i16 || f.type == i32 || f.type == i64
+            || f.type == u8 || f.type == u16 || f.type == u32 || f.type == u64) {
+            h = fold(h, (v.[f])::u64);
+        }
+        $or (f.type == f64) { h = fold(h, (v.[f] + 0.0):~u64); }
+        $or (f.type == f32) { h = fold(h, ((v.[f])::f64 + 0.0):~u64); }
+        $or                 {}
+    }
+    ret h;
+}
+
+# copy `src` onto `dst` field by field
+#
+# the value of this over `dst = src` is the refusal, not the copy: a record whose
+# every field classifies has no field a memberwise copy could get wrong, so
+# `clone[T]` compiling is the proof that a structural copy is a whole copy.
+# a field the copy would only shallowly duplicate -- a reference to owned storage
+# -- does not classify, and the build fails rather than handing back a second
+# record aliasing the first's memory.
+#
+# an owning clone, which follows references and therefore allocates and can fail,
+# is a separate member. briar-systems/mach#2693 (mach 4.15.0) supplies the
+# traversal it needs, so what it still waits on is a signature carrying an
+# allocator and an error, not a compiler capability.
+# ---
+# [T]: the record type to copy
+# dst: destination record, overwritten field by field
+# src: source record
+pub fun clone[T](dst: *T, src: *T) {
+    check[T]();
+    $each f in $fields(T) {
+        $if ($is_record(f.type)) { clone[f.type](?dst.[f], ?src.[f]); }
+        $or (f.type == i8 || f.type == i16 || f.type == i32 || f.type == i64
+            || f.type == u8 || f.type == u16 || f.type == u32 || f.type == u64
+            || f.type == f32 || f.type == f64) {
+            dst.[f] = src.[f];
+        }
+        $or {}
+    }
+}
+
+# write a nested record field's label, `[, ]name=`
+#
+# the value that follows is written by `fmt` recursing at the field's type, which
+# supplies the `Type{...}` half.
+# ---
+# w:     target writer
+# first: true when no field has been written at this level yet
+# name:  the field's name
+# ret:   bytes written, or the writer's failure with the persisted prefix
+fun write_label(w: *writer.Writer, first: bool, name: *u8) res[usize, WriteError] {
+    var total: usize = 0;
+    if (!first) {
+        val sep: res[usize, WriteError] = format.write_str(w, ", ");
+        if (sel sep.err) { ret sep; }
+        total = sep.ok;
+    }
+    val nm: res[usize, WriteError] = format.write_str(w, name::str);
+    if (sel nm.err) { ret res[usize, WriteError].err{writer.advance(nm.err, total)}; }
+    total = total + nm.ok;
+    val eq_: res[usize, WriteError] = format.write_byte(w, '=');
+    if (sel eq_.err) { ret res[usize, WriteError].err{writer.advance(eq_.err, total)}; }
+    ret res[usize, WriteError].ok{total + eq_.ok};
+}
+
+# write a record as `Type{field=value, ...}` to a writer
+#
+# renders each field as `name=value` in declaration order, separated by `, `,
+# delegating value formatting to `format.write_value`. a nested record renders
+# as `name=Type{...}`, so `Player{pos=Vec3{x=1, y=2, z=3}, id=7}` is one call.
+# the type spelling comes from `$type_name`, which is sema's own diagnostic
+# authority, so a printed name and an error's name cannot drift.
+#
+# the outcome is the writer's: a failure at any depth returns at once and
+# carries the bytes this call persisted before it.
+#
+# **this formatter prints `^` secret fields as ordinary values, and it is not
+# able to do otherwise.** what saves it today is that a secret field does not
+# classify, so `check[T]` fails the build rather than letting one through -- see
+# the module note on secrets. do not read that as a redaction: nothing here
+# recognizes a secret, and a secrecy-aware `fmt` waits on
+# briar-systems/mach#2694.
+#
+# eligibility matches `eq` and `hash`.
+# ---
+# [T]: the record type to render
+# w:   target writer
+# v:   the record to render
+# ret: total bytes written, or the writer's failure with the persisted prefix
+pub fun fmt[T](w: *writer.Writer, v: *T) res[usize, WriteError] {
+    check[T]();
+    var total: usize = 0;
+
+    val name: res[usize, WriteError] = format.write_str(w, $type_name(T));
+    if (sel name.err) { ret name; }
+    total = total + name.ok;
+
+    val open: res[usize, WriteError] = format.write_byte(w, '{');
+    if (sel open.err) { ret res[usize, WriteError].err{writer.advance(open.err, total)}; }
+    total = total + open.ok;
+
+    var first: bool = true;
+    $each f in $fields(T) {
+        $if ($is_record(f.type)) {
+            # the label, then the field's own rendering. this call writes
+            # `Type{...}`, so the two together give `name=Type{...}`.
+            val lab: res[usize, WriteError] = write_label(w, first, f.name);
+            if (sel lab.err) { ret res[usize, WriteError].err{writer.advance(lab.err, total)}; }
+            total = total + lab.ok;
+            first = false;
+
+            val nested: res[usize, WriteError] = fmt[f.type](w, ?v.[f]);
+            if (sel nested.err) { ret res[usize, WriteError].err{writer.advance(nested.err, total)}; }
+            total = total + nested.ok;
+        }
+        $or (f.type == i8 || f.type == i16 || f.type == i32 || f.type == i64
+            || f.type == u8 || f.type == u16 || f.type == u32 || f.type == u64
+            || f.type == f32 || f.type == f64) {
+            val label: res[usize, WriteError] = write_label(w, first, f.name);
+            if (sel label.err) { ret res[usize, WriteError].err{writer.advance(label.err, total)}; }
+            total = total + label.ok;
+            first = false;
+
+            val leaf: res[usize, WriteError] = format.write_value(w, v.[f]);
+            if (sel leaf.err) { ret res[usize, WriteError].err{writer.advance(leaf.err, total)}; }
+            total = total + leaf.ok;
+        }
+        $or {}
+    }
+
+    val close: res[usize, WriteError] = format.write_byte(w, '}');
+    if (sel close.err) { ret res[usize, WriteError].err{writer.advance(close.err, total)}; }
+    total = total + close.ok;
+
+    ret res[usize, WriteError].ok{total};
+}
+
+use std.memory;
+use std.types.char.char;
+use std.types.string.str_equals;
+
+#[testing]
+rec DV2    { x: i64; y: i64; }
+#[testing]
+rec DMix   { i: i32; u: u16; f: f64; g: f32; }
+#[testing]
+rec DFlags { on: bool; c: char; n: u8; }
+
+#[testing]
+rec DEmpty {}
+
+rec NEmpty {}
+
+#[testing]
+rec NHolder { e: NEmpty; z: i64; }
+
+# six levels deep, so a walk that stops short of a leaf is caught
+rec D6 { a: i64; b: f64; }
+rec D5 { d: D6; k: u16; }
+rec D4 { d: D5; k: u16; }
+rec D3 { d: D4; k: u16; }
+rec D2 { d: D3; n: i32; }
+rec D1 { d: D2; tag: u8; }
+
+#[testing]
+fun d1_fill(v: *D1) {
+    v.d.d.d.d.d.a = 11;
+    v.d.d.d.d.d.b = 2.5;
+    v.d.d.d.d.k   = 22;
+    v.d.d.d.k     = 33;
+    v.d.d.k       = 44;
+    v.d.n         = -55;
+    v.tag         = 66;
+}
+
+# a copy of `v` with the leaf numbered `leaf` changed, leaves counted from the
+# innermost; 7 or more changes nothing
+#[testing]
+fun d1_perturbed(v: *D1, leaf: i32) D1 {
+    var b: D1 = @v;
+    if (leaf == 0) { b.d.d.d.d.d.a = b.d.d.d.d.d.a + 1; }
+    or (leaf == 1) { b.d.d.d.d.d.b = b.d.d.d.d.d.b + 0.25; }
+    or (leaf == 2) { b.d.d.d.d.k = b.d.d.d.d.k + 1; }
+    or (leaf == 3) { b.d.d.d.k = b.d.d.d.k + 1; }
+    or (leaf == 4) { b.d.d.k = b.d.d.k + 1; }
+    or (leaf == 5) { b.d.n = b.d.n + 1; }
+    or (leaf == 6) { b.tag = b.tag + 1; }
+    ret b;
+}
+
+# scalar, float, def-typed and empty records; signed zero is equal and NaN is
+# never equal, as the field's own == says
+test eq__flat_records {
+    var a: DMix = DMix{i: -2, u: 9, f: 1.5, g: 2.5};
+    var b: DMix = DMix{i: -2, u: 9, f: 1.5, g: 2.5};
+    if (!eq[DMix](?a, ?b)) { ret 1; }
+    b.f = 1.6;
+    if (eq[DMix](?a, ?b)) { ret 2; }
+    b.f = 1.5;
+    b.i = -3;
+    if (eq[DMix](?a, ?b)) { ret 3; }
+
+    var fa: DFlags = DFlags{on: true, c: 'z', n: 5};
+    var fb: DFlags = DFlags{on: true, c: 'y', n: 5};
+    if (eq[DFlags](?fa, ?fb)) { ret 4; }
+
+    var ea: DEmpty;
+    var eb: DEmpty;
+    if (!eq[DEmpty](?ea, ?eb)) { ret 5; }
+
+    var negz: u64  = 0x8000000000000000;
+    var z:    DMix = DMix{i: 0, u: 0, f: 0.0, g: 0.0};
+    var nz:   DMix = z;
+    memory.raw_copy(?nz.f, ?negz, 8);
+    if (!eq[DMix](?z, ?nz)) { ret 6; }
+    var nan: u64 = 0x7FF8000000000000;
+    memory.raw_copy(?nz.f, ?nan, 8);
+    if (eq[DMix](?nz, ?nz)) { ret 7; }
+    ret 0;
+}
+
+# a difference in any leaf at any depth is seen, and an empty nested record
+# does not decide equality
+test eq__a_difference_at_every_depth_is_seen {
+    var a: D1;
+    d1_fill(?a);
+    var leaf: i32 = 0;
+    for (leaf < 8) {
+        var b:    D1   = d1_perturbed(?a, leaf);
+        val want: bool = leaf == 7;
+        if (eq[D1](?a, ?b) != want) { ret leaf + 1; }
+        leaf = leaf + 1;
+    }
+
+    var ha: NHolder;
+    ha.z = 1;
+    var hb: NHolder;
+    hb.z = 2;
+    if (eq[NHolder](?ha, ?hb)) { ret 10; }
+    hb.z = 1;
+    if (!eq[NHolder](?ha, ?hb)) { ret 11; }
+    ret 0;
+}
+
+# records that compare eq hash alike (signed zero included), and a difference
+# in any leaf at any depth, or in field order, changes the hash
+test hash__follows_eq_at_every_depth {
+    var a: D1;
+    d1_fill(?a);
+    var leaf: i32 = 0;
+    for (leaf < 8) {
+        var b:    D1   = d1_perturbed(?a, leaf);
+        val same: bool = hash[D1](?a) == hash[D1](?b);
+        if (same != (leaf == 7)) { ret leaf + 1; }
+        leaf = leaf + 1;
+    }
+
+    var xy: DV2 = DV2{x: 1, y: 2};
+    var yx: DV2 = DV2{x: 2, y: 1};
+    if (hash[DV2](?xy) == hash[DV2](?yx)) { ret 10; }
+
+    var negz: u64  = 0x8000000000000000;
+    var z:    DMix = DMix{i: 0, u: 0, f: 0.0, g: 0.0};
+    var nz:   DMix = z;
+    memory.raw_copy(?nz.f, ?negz, 8);
+    if (hash[DMix](?z) != hash[DMix](?nz)) { ret 11; }
+
+    var fa: DFlags = DFlags{on: true, c: 'q', n: 200};
+    var fb: DFlags = DFlags{on: true, c: 'q', n: 200};
+    if (hash[DFlags](?fa) != hash[DFlags](?fb)) { ret 12; }
+    ret 0;
+}
+
+rec DCap { data: *u8; len: usize; cap: usize; }
+
+#[testing]
+fun cap_write(ctx: ptr, p: *u8, len: usize) res[usize, WriteError] {
+    val b: *DCap = ctx::*DCap;
+    var i: usize = 0;
+    for (i < len) {
+        if (b.len >= b.cap) {
+            ret res[usize, WriteError].err{writer.native_failure(i, io_error.make(io_error.RESOURCE_EXHAUSTED, io_error.OP_WRITE))};
+        }
+        b.data[b.len] = p[i];
+        b.len         = b.len + 1;
+        i             = i + 1;
+    }
+    ret res[usize, WriteError].ok{len};
+}
+
+#[testing]
+fun cap_writer(cap: *DCap, data: *u8, size: usize) writer.Writer {
+    cap.data = data;
+    cap.len  = 0;
+    cap.cap  = size;
+    var w: writer.Writer;
+    w.ctx     = cap::ptr;
+    w.f_write = cap_write;
+    ret w;
+}
+
+test fmt__flat_and_empty_records {
+    var scratch: [128]u8;
+    var cap:     DCap;
+    var w:       writer.Writer = cap_writer(?cap, ?scratch[0], 128);
+
+    var v: DV2                    = DV2{x: 1, y: 2};
+    val r: res[usize, WriteError] = fmt[DV2](?w, ?v);
+    if (sel r.err) { ret 1; }
+    scratch[cap.len] = 0;
+    if (!str_equals(?scratch[0], "DV2{x=1, y=2}")) { ret 2; }
+
+    w = cap_writer(?cap, ?scratch[0], 128);
+    var h: NHolder;
+    h.z = 9;
+    val rh: res[usize, WriteError] = fmt[NHolder](?w, ?h);
+    if (sel rh.err) { ret 3; }
+    scratch[cap.len] = 0;
+    if (!str_equals(?scratch[0], "NHolder{e=NEmpty{}, z=9}")) { ret 4; }
+    ret 0;
+}
+
+test fmt__six_levels_render_every_leaf {
+    var scratch: [256]u8;
+    var cap:     DCap;
+    var w:       writer.Writer = cap_writer(?cap, ?scratch[0], 256);
+
+    var v: D1;
+    d1_fill(?v);
+    val r: res[usize, WriteError] = fmt[D1](?w, ?v);
+    if (sel r.err) { ret 1; }
+    scratch[cap.len] = 0;
+    if (!str_equals(?scratch[0], "D1{d=D2{d=D3{d=D4{d=D5{d=D6{a=11, b=2.5}, k=22}, k=33}, k=44}, n=-55}, tag=66}")) { ret 2; }
+    ret 0;
+}
+
+test fmt__a_writer_error_at_depth_propagates {
+    var scratch: [16]u8;
+    var cap:     DCap;
+    var w:       writer.Writer = cap_writer(?cap, ?scratch[0], 8);
+
+    var v: D1;
+    d1_fill(?v);
+    val r: res[usize, WriteError] = fmt[D1](?w, ?v);
+    if (!sel r.err) { ret 1; }
+    # the sink took its 8 bytes before refusing, and the error says so
+    if (!sel r.err.native)            { ret 2; }
+    if (writer.persisted(r.err) != 8) { ret 3; }
+    scratch[cap.len] = 0;
+    if (!str_equals(?scratch[0], "D1{d=D2{")) { ret 4; }
+    ret 0;
+}
+
+test clone__every_leaf_copied_and_independent {
+    var src: D1;
+    d1_fill(?src);
+    var dst: D1;
+    clone[D1](?dst, ?src);
+    # named leaf by leaf, so a walk that drops a level fails here rather than
+    # passing on an eq that dropped the same level
+    if (dst.d.d.d.d.d.a != 11)  { ret 1; }
+    if (dst.d.d.d.d.d.b != 2.5) { ret 2; }
+    if (dst.d.d.d.d.k != 22)    { ret 3; }
+    if (dst.d.d.d.k != 33)      { ret 4; }
+    if (dst.d.d.k != 44)        { ret 5; }
+    if (dst.d.n != -55)         { ret 6; }
+    if (dst.tag != 66)          { ret 7; }
+    src.d.d.d.d.d.a = 99;
+    if (dst.d.d.d.d.d.a != 11) { ret 8; }
+
+    var esrc: DEmpty;
+    var edst: DEmpty;
+    clone[DEmpty](?edst, ?esrc);
+    ret 0;
+}

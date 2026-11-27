@@ -1,0 +1,115 @@
+# The std.system.os contract
+
+`std.system.os` is a small, explicit contract of OS primitives with one implementation per operating system (`std.system.os.linux`, `.darwin`, `.windows`). Everything else in std is built on top of it. This page describes the contract as it stands in std **4.0.0** (epic #697).
+
+## Capability groups
+
+The contract is split into independent groups. `std.system.capability` exports one comptime flag per group. A module gates OS-bound code on a flag with `$if`, and the unselected branch, OS-bound imports included, is discarded before resolution:
+
+```mach
+use std.system.capability;
+
+$if (capability.HAS_FILES) {
+    use std.system.os;
+    # code that needs files
+}
+```
+
+Every group is present on linux, darwin and windows. None is present on any other target, freestanding included. `HOSTED` is the core group, which every other group implies.
+
+A target that claims a group exports every member listed here. `src/system/capability/conformance.mach` names every member of every group that the per-OS module supplies, so a missing member fails the build on any target that claims the group. Members `std.system.os` defines itself (the secret primitives `allocate_secret`, `allocate_secret_typed`, `release_secret`, `release_secret_typed`, `random_fill_secret`, `read_at_secret` and `write_at_secret`, `stdin`, `stdout`, `stderr`, `working_dir`, `exit`, `panic_sink`, and `realtime`, `monotonic`, `error`, `error_message` and `message`) exist wherever the module compiles, so the test doesn't name them. The test also keeps the positioned secret transfers inside the files lane, which `test/secret/verify.sh` enforces.
+
+| flag | group | purpose |
+| --- | --- | --- |
+| `HOSTED` | core | required by every hosted std module: the translation of a native code into an `io.error.Error` (`error`, `error_kind`, `error_message`, `message`), process termination, and the calling thread's stack bounds |
+| `HAS_PAGES` | pages | page allocation, protection, locking and advice, and secret-welded storage |
+| `HAS_CLOCK` | clock | the realtime and monotonic clocks, and sleep |
+| `HAS_ENTROPY` | entropy | cryptographic random fill, public and secret |
+| `HAS_THREADS` | threads | thread spawn and join, futex-shaped wait and wake, the cpu count, and the calling thread's CPU affinity |
+| `HAS_FILES` | files | descriptors, positioned and secret I/O, stat, directories, identity, publication, pipes and the working directory |
+| `HAS_IO_QUEUE` | io queue | the native completion or readiness queue |
+| `HAS_SOCKETS` | sockets | stream, datagram and local sockets, their options and address codecs |
+| `HAS_PROCESS` | process | spawn, wait, status decoding, the environment, signal disposition, and the open-file limit |
+| `HAS_CPU_FEATURES` | cpu | the processor's instruction-set extensions, filled into `std.system.cpu.features.Features` for run-time dispatch |
+
+## Members
+
+### core (`HOSTED`)
+
+`abort`, `error`, `error_kind`, `error_message`, `exit`, `message`, `panic_sink`, `stack_bounds`
+
+`stack_bounds(low: *usize, high: *usize) bool` writes the calling thread's stack, from its lowest address to one past its highest, and returns false where the implementation knows none. It makes no system call: the bounds are read once per thread and kept. `std.runtime.stack.remaining()` is the consumer, which subtracts `low` from the caller's frame on every call. linux reads the main thread's at entry, as the top of its stack mapping less the `RLIMIT_STACK` soft limit, and records a spawned thread's in its block. It knows none under an unlimited soft limit, nor on a thread whose thread pointer std does not own. darwin records libpthread's bounds in the block when it is installed and asks libpthread on a thread std did not create. windows reads `StackBase` and `DeallocationStack` from the TEB, which hold on every thread. `low` is the base of the reservation, so any guard pages the OS keeps there count as stack. A user-supplied implementation may return false.
+
+### pages (`HAS_PAGES`)
+
+`ADVISE_DONT_NEED`, `ADVISE_NORMAL`, `ADVISE_RANDOM`, `ADVISE_SEQUENTIAL`, `ADVISE_WILL_NEED`, `PROT_EXEC`, `PROT_NONE`, `PROT_READ`, `PROT_WRITE`, `advise`, `allocate`, `allocate_secret`, `allocate_secret_typed`, `deallocate`, `heap_region_base`, `heap_region_extend`, `lock`, `page_size`, `protect`, `reallocate`, `release_secret`, `release_secret_typed`, `unlock`
+
+### clock (`HAS_CLOCK`)
+
+`Timespec`, `monotonic`, `realtime`, `sleep`
+
+### entropy (`HAS_ENTROPY`)
+
+`RANDOM_FILL_SECRET_MAX`, `random_fill`, `random_fill_secret`
+
+### threads (`HAS_THREADS`)
+
+`ThreadBlock`, `cpu_count`, `set_thread_affinity`, `thread_affinity`, `thread_block`, `thread_block_enter`, `thread_current_id`, `thread_current_name`, `thread_detach`, `thread_join`, `thread_spawn`, `thread_wait`, `thread_wait_until`, `thread_wake`
+
+`thread_block() *ThreadBlock` returns the calling thread's block without a system call, or nil where none is installed. On linux a thread whose thread pointer a C runtime owns is the exception below. `thread_block_enter(block: *ThreadBlock) i64` installs a block for the calling thread and writes its `self_addr`. `thread_spawn` installs a block it owns on every thread it creates before the thread runs std code. linux holds the block in the thread pointer (`CLONE_SETTLS` at spawn, `arch_prctl(ARCH_SET_FS)` on x86_64, `tpidr_el0` on aarch64, `tp` on riscv64) and keeps a spawned thread's block at the top of its stack.
+
+On linux, whoever starts the process owns the main thread's thread pointer. std makes no link to and no assumption about a C runtime. It relies only on kernel and platform-ABI facts:
+- A static image has no interpreter. The kernel leaves the thread pointer unset, and the runtime installs a static block on the main thread before `main`.
+- A dynamic image names an interpreter, and the interpreter owns the thread pointer. A C runtime's loader sets it to that runtime's thread control block before the entry point. The runtime never writes it then. It tells the two apart by `AT_BASE` in the auxiliary vector, the interpreter's load address, which the kernel sets to 0 when there is none. The entry value of the thread pointer can't decide it: on riscv64 the kernel's `start_thread` leaves `tp` as the `execve` caller had it.
+- On a thread whose thread pointer a C runtime owns, `thread_block` returns what the thread pointer holds, the C runtime's control block. That is the main thread under a loader, or a thread C code created that calls back into mach. std never reads or writes through it, and its address still names the thread. On x86_64 `thread_block` reads `fs:[0]`, which the psABI has point to the control block itself whoever owns it. On aarch64 and riscv64 it reads the register.
+- So `std.sync.thread.current_token` is distinct, stable and free of system calls on every one of those threads. A thread made by a raw `clone` without `CLONE_SETTLS` inherits its parent's thread pointer, and so its parent's token. It must not call into std. Neither may a thread whose thread pointer is 0, which faults on x86_64.
+- An interpreter run by hand (`ld.so ./program`) is loaded as the program itself, so `AT_BASE` is 0 and the runtime installs std's block over the interpreter's. That case is not supported.
+
+darwin's thread register belongs to libpthread, so the block rides a pthread key, and windows's rides a TLS index read straight from the TEB. Neither writes a thread register, so the ownership rule above changes nothing there. The block is not general thread-local storage. It is where per-thread state std owns belongs, such as the stack bounds linux and darwin record in its `stack_low` and `stack_high` (see `stack_bounds`). On linux there is no std block on a thread whose thread pointer a C runtime owns, so such state can't rely on one there. A user-supplied implementation that has no thread pointer may return nil from `thread_block`, and the token then falls back to the thread id.
+
+A thread `thread_spawn` creates faults when it overflows its stack, rather than writing into the memory below it. linux maps a 64 KiB `PROT_NONE` guard (`THREAD_STACK_GUARD`, the largest linux page) below the `stack_reserve` usable bytes, in the same mapping. mach emits no stack probes on linux, so one frame larger than the guard can still step over it. darwin's libpthread puts its own guard below the stack (`guardsize`, one page by default), and a fault there raises SIGBUS or SIGSEGV. windows reserves the stack with a guard page at its committed edge and raises `STATUS_STACK_OVERFLOW` when the reserve runs out. `test/stack-guard` checks all three by overflowing a spawned thread. On linux it maps memory right under the guard, so a missing guard shows up as a normal exit.
+
+`thread_affinity(words: *u64, capacity: usize, out_count: *usize) i64` and `set_thread_affinity(words: *u64, count: usize) i64` act on the calling thread. CPU `i` is bit `i % 64` of `words[i / 64]`, and no set size is fixed: a read whose `capacity` is too small returns a code `error_kind` classifies as `RANGE`, with the words needed in `out_count`. linux reads and sets the kernel's cpumask at whatever size the kernel uses. windows numbers CPUs globally, a processor's index being the active counts of every lower processor group plus its bit within its own group; a thread's affinity is one group's mask, so a set spanning groups is `UNSUPPORTED` rather than truncated. darwin has no hard affinity and returns `UNSUPPORTED` from both. A user-supplied implementation may return `UNSUPPORTED` or its own numbering.
+
+### files (`HAS_FILES`)
+
+`AT_REMOVEDIR`, `AT_SYMLINK_NOFOLLOW`, `DirectoryCursor`, `DirectoryEntry`, `DirectoryInitResult`, `INVALID_HANDLE`, `LOCK_EX`, `LOCK_NB`, `LOCK_SH`, `LOCK_UN`, `O_APPEND`, `O_CREAT`, `O_DIRECTORY`, `O_EXCL`, `O_RDONLY`, `O_RDWR`, `O_TRUNC`, `O_WRONLY`, `PUBLICATION_CLAIMS`, `PUBLICATION_READ_RETAIN_REPLACE`, `PUBLICATION_RETAIN_REPLACE`, `SEEK_CUR`, `SEEK_END`, `SEEK_SET`, `S_IFDIR`, `S_IFLNK`, `S_IFMT`, `S_IFREG`, `access`, `close`, `directory_close`, `directory_init`, `directory_next`, `file_identity`, `getcwd`, `identity_at`, `lock_fd`, `make_dir`, `map_file`, `open`, `pipe`, `publication_capabilities`, `read`, `read_at_secret`, `rename`, `retain_identity_at`, `seek`, `set_mode`, `set_mode_at`, `stat`, `stat_path`, `stat_t`, `stderr`, `stdin`, `stdout`, `symlink`, `sync_fd`, `sync_file`, `unlink`, `working_dir`, `write`, `write_at_secret`
+
+### io queue (`HAS_IO_QUEUE`)
+
+`IoQueue`, `io_queue_close`, `io_queue_create`, `io_queue_wait`, `io_queue_wake`
+
+### sockets (`HAS_SOCKETS`)
+
+`AF_INET`, `AF_INET6`, `DNS_HOSTS_PATH`, `IPPROTO_IP`, `IPPROTO_IPV6`, `IPPROTO_TCP`, `IPV6_TCLASS`, `IPV6_V6ONLY`, `IP_TOS`, `SHUT_RD`, `SHUT_RDWR`, `SHUT_WR`, `SOCKADDR_IN6_SIZE`, `SOCKADDR_IN_SIZE`, `SOCKADDR_STORAGE_SIZE`, `SOCK_DGRAM`, `SOCK_STREAM`, `SOL_SOCKET`, `SO_EXCLUSIVEADDRUSE`, `SO_KEEPALIVE`, `SO_LINGER`, `SO_RCVBUF`, `SO_RCVTIMEO`, `SO_REUSEADDR`, `SO_REUSEPORT`, `SO_SNDBUF`, `SO_UNSUPPORTED`, `TCP_FASTOPEN`, `TCP_KEEPCNT`, `TCP_KEEPIDLE`, `TCP_KEEPINTVL`, `TCP_NODELAY`, `sock_accept`, `sock_accept_flags`, `sock_bind`, `sock_close`, `sock_connect`, `sock_create`, `sock_create_flags`, `sock_getopt`, `sock_inheritable`, `sock_listen`, `sock_local_addr`, `sock_recv`, `sock_recvfrom`, `sock_remote_addr`, `sock_send`, `sock_sendto`, `sock_set_rcvtimeo`, `sock_setopt`, `sock_shutdown`
+
+### process (`HAS_PROCESS`)
+
+`FileLimit`, `LIMIT_UNLIMITED`, `PROCESS_CONTINUED`, `PROCESS_EXITED`, `PROCESS_OP_CLOSE`, `PROCESS_OP_PIPE`, `PROCESS_OP_READ`, `PROCESS_OP_SPAWN`, `PROCESS_OP_STATUS`, `PROCESS_OP_TERMINATE`, `PROCESS_OP_WAIT`, `PROCESS_SIGNALED`, `PROCESS_STOPPED`, `ProcessStatus`, `ProcessWaitError`, `WNOHANG`, `WaitResult`, `environ`, `getenv`, `getpid`, `ignore_sigpipe`, `open_file_limit`, `set_open_file_limit`, `spawn`, `spawn_in`, `spawn_redirected`, `spawn_redirected_in`, `terminate_child`, `wait`, `wait_pid`
+
+### cpu (`HAS_CPU_FEATURES`)
+
+`cpu_dit`, `cpu_features`
+
+`cpu_features(out: *std.system.cpu.features.Features) i64` fills the per-isa record with the extensions the running processor has. The record's fields are the compiler's extension names for the isa (`sha`, `ssse3`, `sse41`, `aes`, `pclmul` on x86_64, `sha2`, `aes`, `pmull` on aarch64, the isa string's letters on riscv), declared in `std.system.cpu.features`, which imports nothing OS-bound so the per-OS modules can name it. On x86_64 every implementation reads cpuid, which needs no OS. On aarch64 the id registers are not readable from user mode, so linux reads `AT_HWCAP` from the auxv (`HWCAP_AES` bit 3, `HWCAP_PMULL` bit 4, `HWCAP_SHA2` bit 6) and darwin asks sysctl (`hw.optional.arm.FEAT_AES`, `FEAT_PMULL`, `FEAT_SHA256`). An extension the processor lacks, or one the OS does not report, reads false and is not an error. `std.system.cpu.features()` is the consumer: it merges this with what the build target selects and caches the answer. A user-supplied implementation for a kernel may read the id registers directly.
+
+`cpu_dit() i64` says whether the processor and kernel provide the aarch64 data-independent-timing mode (FEAT_DIT, PSTATE.DIT): 1 when present, 0 when absent, negative when the answer cannot be read (linux before the runtime captured envp). linux reads HWCAP_DIT (bit 24) from `AT_HWCAP` with the reader `cpu_features` uses, darwin asks sysctl for `hw.optional.arm.FEAT_DIT`, and every other isa returns `UNSUPPORTED`. `std.system.dit` is the consumer: at process start it turns the mode on when the link admits a secret multiply and refuses to start when this returns anything but 1, so an implementation must not report 1 without the mode. A user-supplied implementation for a kernel may read ID_AA64PFR0_EL1.DIT directly.
+
+## Assumptions
+
+The contract is designed so that a user-supplied implementation, for a kernel or UEFI, can provide it without changing any consumer. It holds to these assumptions:
+
+- **A1, codes.** A fallible primitive returns `i64`: `>= 0` is success and `< 0` is an opaque native code. Only the implementation interprets a code. The `E*` constants are not on the portable surface, only in the per-OS modules, and `os.error_kind(code)` is the only portable reading of a code.
+- **A2, handles.** Resources are pointer-width opaque values. Descriptors are `usize` handles. A primitive that creates one returns it through an out parameter with an `i64` status, `INVALID_HANDLE` means none, and the standard handles and the working directory are functions (`stdin()`, `stdout()`, `stderr()`, `working_dir()`). The per-OS modules keep their native `i32` descriptors. Above the contract, `io.handle.SocketHandle` pairs the native value with an opening stamped when std creates the socket, so a `net.async` driver can tell a socket closed outside it from the socket that reuses its value (#716).
+- **A3, no ambient process model.** Nothing assumes environment variables, a working directory, signals, standard streams or a process table unless it belongs to the group that provides them (process, files).
+- **A4, secret shape.** Primitives that touch secret-welded storage take `*^u8` and never downgrade it.
+- **A5, no hidden initialization.** The implementation owns its state. std calls no init hook beyond what `std.runtime` or the embedder already runs.
+- **A6, memory.** Pages come back zeroed and page-aligned. `protect`, `lock` and `advise` may be unsupported, and callers accept that.
+
+## Changes from 3.x
+
+- The errno constants left the portable surface. `os.error(code, op)`, `os.error_kind(code)`, `os.error_message(code)` and `os.message(Error)` form the error part of the core group.
+- Logic built on top of the primitives moved out: secret borrows to `std.memory.secret`, sockaddr codecs to `std.net.ip`, status decoders and `spawn_shell` to `std.process.exec`, `temp_dir`, `unlink_force` and `stat_mode` to `std.filesystem.native`, and the path separator to `std.types.path.separator()`.
+- Descriptors became `usize` handles, `terminate` became `exit(status: u32)`, and `panic_sink` joined the core group.
+
+How a user-supplied implementation is selected is an open design question. The candidates are comptime module selection, link-time symbols, dependency substitution and a runtime function table. Any of them needs the `HAS_*` flags to stay comptime.

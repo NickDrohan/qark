@@ -1,0 +1,131 @@
+# aggregate surface re-exporting every standard library module
+
+fwd std.types.bool;
+fwd std.types.result;
+fwd std.types.option;
+fwd std.types.error;
+fwd std.types.char;
+fwd std.types.size;
+fwd std.types.string;
+fwd std.types.view;
+fwd std.types.path;
+fwd std.types.semver;
+
+fwd std.collections.slice;
+fwd std.collections.vector;
+fwd std.collections.map;
+fwd std.collections.natural;
+fwd std.collections.sort;
+fwd std.collections.set;
+fwd std.collections.bitset;
+fwd std.collections.deque;
+fwd std.collections.heap;
+
+fwd std.allocator;
+fwd std.allocator.arena;
+fwd std.allocator.bump;
+fwd std.allocator.fixed;
+# `heap` is taken by the binary heap in collections
+fwd allocator_heap: std.allocator.heap;
+fwd std.allocator.page;
+fwd std.allocator.testing;
+fwd std.memory;
+fwd memory_table:   std.memory.table;
+fwd memory_buffers: std.memory.buffers;
+fwd std.io.writer;
+fwd std.io.reader;
+fwd std.io.handle;
+fwd io_error: std.io.error;
+fwd std.io.file;
+# keep split file contract tests reachable from dependency test runs
+use file_tests: std.io.file.tests;
+fwd io_runtime:   std.io.runtime;
+fwd io_lifecycle: std.io.lifecycle;
+fwd std.filesystem;
+fwd fs_transaction: std.filesystem.transaction;
+# keep the import-attribution census reachable from dependency test runs
+use os_tests: std.system.os.tests;
+
+fwd std.math;
+fwd std.math.float;
+fwd std.math.bits;
+fwd std.math.bignum;
+fwd std.math.mat4;
+fwd std.math.quat;
+
+fwd std.simd.select;
+fwd std.simd.reduce;
+fwd std.simd.shuffle;
+fwd std.simd.saturate;
+fwd std.simd.gather;
+fwd std.simd.matmul;
+
+fwd std.format;
+fwd std.derive;
+fwd std.print;
+fwd std.input;
+fwd std.terminal;
+fwd std.runtime;
+fwd std.runtime.stack;
+# keep the stack tests reachable from dependency test runs
+use stack_tests: std.runtime.stack.tests;
+fwd std.text.parse;
+fwd std.text.utf8;
+fwd std.chrono.duration;
+fwd std.chrono.time;
+fwd std.chrono.date;
+fwd chrono_format: std.chrono.format;
+
+fwd std.encoding.base64;
+fwd std.encoding.hex;
+fwd std.encoding.leb128;
+fwd std.encoding.binary;
+
+fwd std.crypto.ct;
+fwd std.crypto.hash.sha256;
+fwd std.crypto.hash.sha512;
+fwd std.crypto.hash.keccak;
+fwd std.crypto.hash.sha3_256;
+fwd std.crypto.hash.sha3_512;
+fwd std.crypto.hash.shake128;
+fwd std.crypto.hash.shake256;
+fwd std.crypto.hash.crc32;
+fwd std.crypto.hash.adler32;
+fwd std.crypto.hash.siphash;
+fwd crypto_rand: std.crypto.rand;
+fwd std.rand;
+
+fwd std.process.env;
+fwd std.process.exec;
+fwd std.process.events;
+
+fwd std.net.ip;
+fwd std.net.socket;
+fwd std.net.tcp;
+fwd std.net.udp;
+fwd std.net.dns;
+fwd std.net.resolve;
+fwd std.net.async;
+fwd std.net.local;
+fwd async_local: std.net.async.local;
+
+fwd std.sync.atomic;
+fwd std.sync.cancel;
+fwd std.sync.channel;
+fwd std.sync.condition;
+fwd std.sync.mutex;
+fwd std.sync.once;
+fwd std.sync.semaphore;
+fwd std.sync.thread;
+fwd std.sync.worker_pool;
+
+fwd std.log;
+
+fwd std.data.toml;
+fwd std.data.json;
+
+fwd std.compress.inflate;
+fwd std.compress.zlib;
+fwd std.compress.gzip;
+fwd compress_format: std.compress.format;
+fwd std.compress.deflate;

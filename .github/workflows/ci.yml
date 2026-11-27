@@ -215,7 +215,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          submodules: recursive
           fetch-depth: 0
 
       - uses: actions/setup-node@v4
@@ -226,31 +225,26 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Fetch submodule tags for Mach dependency version verification
-        shell: bash
-        run: |
-          git -C dep/std fetch --tags --force
-
-      - name: Install Mach compiler (v6.10.1) on Linux
+      - name: Install Mach compiler (v7.0.0) on Linux
         if: runner.os == 'Linux'
         shell: bash
         run: |
           set -euo pipefail
-          curl -fsSL https://github.com/briar-systems/mach/releases/download/v6.10.1/mach-6.10.1-x86_64-linux.tar.gz -o /tmp/mach.tar.gz
+          curl -fsSL https://github.com/briar-systems/mach/releases/download/v7.0.0/mach-7.0.0-x86_64-linux.tar.gz -o /tmp/mach.tar.gz
           mkdir -p "$HOME/.local/bin"
           tar -xzf /tmp/mach.tar.gz -C "$HOME/.local/bin"
           chmod +x "$HOME/.local/bin/mach"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           "$HOME/.local/bin/mach" info
 
-      - name: Install Mach compiler (v6.10.1) on Windows
+      - name: Install Mach compiler (v7.0.0) on Windows
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
           $zipPath = Join-Path $env:TEMP "mach.zip"
           $destDir = Join-Path $env:TEMP "mach-bin"
-          Invoke-WebRequest -Uri "https://github.com/briar-systems/mach/releases/download/v6.10.1/mach-6.10.1-x86_64-windows.zip" -OutFile $zipPath
+          Invoke-WebRequest -Uri "https://github.com/briar-systems/mach/releases/download/v7.0.0/mach-7.0.0-x86_64-windows.zip" -OutFile $zipPath
           Expand-Archive -Path $zipPath -DestinationPath $destDir -Force
           $machExe = Get-ChildItem -Path $destDir -Filter "mach.exe" -Recurse | Select-Object -First 1
           if (-not $machExe) { throw "mach.exe not found in archive" }

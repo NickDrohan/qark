@@ -1,0 +1,263 @@
+# line input from stdin
+#
+# the read-side twin of std.print: convenience wrappers that read whole lines
+# from stdin, backed by the filesystem stdin file. this is plain canonical
+# input -- it works on ttys, pipes, and file redirects with no tty required
+# (raw single-key polling is std.terminal's concern).
+#
+# a line read has two failure classes: the reader's own outcome (the end of
+# the stream, a stall, a native failure), which passes through as the ReadError
+# with the bytes buffered so far as its progress, and a line the caller's
+# buffer cannot hold, which is this module's own case.
+
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+
+use std.io.reader;
+use std.io.reader.ReadError;
+
+# every way a line read can fail
+# ---
+# read:     the reader failed; the payload's progress is the bytes buffered
+#           before the outcome, and eof{0} is the end of input with nothing
+#           buffered (a final line without a newline is not an error)
+# too_long: the line does not fit; payload is the bytes buffered. the byte
+#           that overflowed was consumed from the reader and dropped, so the
+#           next call continues after it
+pub tag InputError: u8 {
+    read:     ReadError;
+    too_long: usize;
+}
+
+fun stdin_reader(r: *reader.Reader) {
+    @r = filesystem.reader(filesystem.STDIN);
+}
+
+# read one line from a reader into buf, up to cap bytes including the terminator
+#
+# reads a byte at a time until a newline, EOF, or the buffer fills. strips a
+# trailing "\r\n" or "\n" and null-terminates; the returned length excludes the
+# terminator. a line longer than cap-1 bytes is too_long rather than a silent
+# truncation: the bytes that fit are in buf, the byte that overflowed has been
+# consumed and dropped (a reader has no pushback), and the next call continues
+# with the rest of the line. a read at end of input with no bytes buffered is
+# read{eof{0}} -- distinct from an empty line, which is ok{0}.
+# ---
+# r:   reader to draw from
+# buf: destination buffer
+# cap: buffer capacity in bytes (at least 1 for the terminator; a zero cap
+#      holds no line, so it is too_long{0} before anything is read)
+# ret: line length excluding the terminator, or the failure
+pub fun read_line_from(r: *reader.Reader, buf: *u8, cap: usize) res[usize, InputError] {
+    if (cap == 0) { ret res[usize, InputError].err{InputError.too_long{0}}; }
+
+    var len: usize = 0;
+    for {
+        var b:  u8                    = 0;
+        val rr: res[usize, ReadError] = reader.read(r, ?b, 1);
+        if (sel rr.err) {
+            if (!sel rr.err.eof) {
+                buf[len] = 0;
+                ret res[usize, InputError].err{InputError.read{reader.advance(rr.err, len)}};
+            }
+            if (len == 0) { ret res[usize, InputError].err{InputError.read{rr.err}}; }
+            brk; # a final line with no trailing newline
+        }
+
+        if (b == 10) { brk; } # '\n' ends the line
+
+        # only a content byte needs room; a terminator at len == cap-1 is fine
+        if (len == cap - 1) {
+            buf[len] = 0;
+            ret res[usize, InputError].err{InputError.too_long{len}};
+        }
+
+        buf[len] = b;
+        len      = len + 1;
+    }
+
+    if (len > 0 && buf[len - 1] == 13) { len = len - 1; } # drop a "\r\n" carriage return
+    buf[len] = 0;
+    ret res[usize, InputError].ok{len};
+}
+
+# read one line from stdin into buf, up to cap bytes including the terminator
+#
+# a thin wrapper over read_line_from drawing from the stdin file; see there for
+# the trimming, truncation, and end-of-input semantics.
+# ---
+# buf: destination buffer
+# cap: buffer capacity in bytes (must be at least 1 for the terminator)
+# ret: line length excluding the terminator, or the failure
+pub fun read_line(buf: *u8, cap: usize) res[usize, InputError] {
+    var r: reader.Reader;
+    stdin_reader(?r);
+    ret read_line_from(?r, buf, cap);
+}
+
+use io_error: std.io.error;
+use std.system.capability;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+
+$if (capability.HAS_FILES) {
+    use std.filesystem;
+}
+$or {
+    $error("std.input needs the files capability (std.system.capability.HAS_FILES)");
+}
+
+# a reader over an in-memory byte range, for exercising read_line_from; it can
+# be scripted to fail natively once `fail_at` bytes have been delivered
+rec MemReader {
+    data:    *u8;
+    len:     usize;
+    pos:     usize;
+    fail_at: usize;
+    failing: bool;
+    kind:    io_error.Kind;
+}
+
+#[testing]
+fun mem_read_cb(ctx: ptr, buf: *u8, n: usize) res[usize, ReadError] {
+    val m: *MemReader = (ctx::usize)::*MemReader;
+    if (m.failing && m.pos >= m.fail_at) {
+        ret res[usize, ReadError].err{reader.native_failure(0, io_error.make(m.kind, io_error.OP_READ))};
+    }
+    var i: usize = 0;
+    for (i < n && m.pos < m.len) {
+        buf[i] = m.data[m.pos];
+        m.pos  = m.pos + 1;
+        i      = i + 1;
+    }
+    ret res[usize, ReadError].ok{i};
+}
+
+#[testing]
+fun mem_reader(m: *MemReader) reader.Reader {
+    var r: reader.Reader;
+    r.ctx    = (m::usize)::ptr;
+    r.f_read = mem_read_cb;
+    r.f_read = mem_read_cb;
+    ret r;
+}
+
+#[testing]
+fun mem(data: str, len: usize) MemReader {
+    ret MemReader{data: data, len: len, pos: 0, fail_at: 0, failing: false, kind: io_error.OTHER};
+}
+
+# lf and crlf are both stripped, and a final line needs no terminator
+test read_line_from__line_endings {
+    var buf: [16]u8;
+
+    var lf:  MemReader              = mem("hello\nrest", 10);
+    var rlf: reader.Reader          = mem_reader(?lf);
+    val a:   res[usize, InputError] = read_line_from(?rlf, ?buf[0], 16);
+    if (sel a.err)                                     { ret 1; }
+    if (a.ok != 5)                                     { ret 1; }
+    if (buf[0] != 'h' || buf[4] != 'o' || buf[5] != 0) { ret 2; }
+
+    var crlf:  MemReader              = mem("ab\r\n", 4);
+    var rcrlf: reader.Reader          = mem_reader(?crlf);
+    val b:     res[usize, InputError] = read_line_from(?rcrlf, ?buf[0], 16);
+    if (sel b.err)                { ret 3; }
+    if (b.ok != 2 || buf[2] != 0) { ret 3; }
+
+    var tail:  MemReader              = mem("tail", 4);
+    var rtail: reader.Reader          = mem_reader(?tail);
+    val c:     res[usize, InputError] = read_line_from(?rtail, ?buf[0], 16);
+    if (sel c.err) { ret 4; }
+    if (c.ok != 4) { ret 4; }
+    ret 0;
+}
+
+# an empty line is ok{0}; the end of input with nothing buffered is the
+# reader's eof, distinct from it
+test read_line_from__empty_line_and_end_of_input_are_distinct {
+    var m:   MemReader     = mem("\n", 1);
+    var rd:  reader.Reader = mem_reader(?m);
+    var buf: [16]u8;
+
+    val empty: res[usize, InputError] = read_line_from(?rd, ?buf[0], 16);
+    if (sel empty.err) { ret 1; }
+    if (empty.ok != 0) { ret 2; }
+    if (buf[0] != 0)   { ret 3; }
+
+    val end: res[usize, InputError] = read_line_from(?rd, ?buf[0], 16);
+    if (!sel end.err)          { ret 4; }
+    if (!sel end.err.read)     { ret 5; }
+    if (!sel end.err.read.eof) { ret 6; }
+    if (end.err.read.eof != 0) { ret 7; }
+    ret 0;
+}
+
+# a line of cap-1 bytes fits. a longer one reports the bytes buffered, the byte
+# that overflowed is consumed, and the next call continues with the rest. a zero
+# capacity holds no line and reads nothing
+test read_line_from__capacity_bounds {
+    var buf: [4]u8;
+
+    var fit:  MemReader              = mem("abc\n", 4);
+    var rfit: reader.Reader          = mem_reader(?fit);
+    val f:    res[usize, InputError] = read_line_from(?rfit, ?buf[0], 4);
+    if (sel f.err)                                     { ret 1; }
+    if (f.ok != 3)                                     { ret 1; }
+    if (buf[0] != 'a' || buf[2] != 'c' || buf[3] != 0) { ret 2; }
+
+    var m:  MemReader              = mem("toolong\n", 8);
+    var rd: reader.Reader          = mem_reader(?m);
+    val r:  res[usize, InputError] = read_line_from(?rd, ?buf[0], 4);
+    if (!sel r.err)                                    { ret 3; }
+    if (!sel r.err.too_long)                           { ret 3; }
+    if (r.err.too_long != 3)                           { ret 4; }
+    if (buf[0] != 't' || buf[2] != 'o' || buf[3] != 0) { ret 5; }
+    if (m.pos != 4)                                    { ret 6; }
+
+    val rest: res[usize, InputError] = read_line_from(?rd, ?buf[0], 4);
+    if (sel rest.err)                                  { ret 7; }
+    if (rest.ok != 3)                                  { ret 7; }
+    if (buf[0] != 'o' || buf[2] != 'g' || buf[3] != 0) { ret 8; }
+    if (m.pos != 8)                                    { ret 9; }
+
+    var z:  MemReader              = mem("x\n", 2);
+    var rz: reader.Reader          = mem_reader(?z);
+    val zr: res[usize, InputError] = read_line_from(?rz, ?buf[0], 0);
+    if (!sel zr.err)                        { ret 10; }
+    if (!sel zr.err.too_long)               { ret 10; }
+    if (zr.err.too_long != 0 || z.pos != 0) { ret 11; }
+    ret 0;
+}
+
+# a reader that fails part way through a line reports the failure with the
+# bytes it had delivered into the buffer, and a stall is classified apart
+test read_line_from__reader_failure_carries_the_prefix {
+    var m: MemReader = mem("abcdef\n", 7);
+    m.fail_at = 3;
+    m.failing = true;
+    m.kind    = io_error.IO;
+    var rd:  reader.Reader = mem_reader(?m);
+    var buf: [16]u8;
+
+    val r: res[usize, InputError] = read_line_from(?rd, ?buf[0], 16);
+    if (!sel r.err)                                    { ret 1; }
+    if (!sel r.err.read)                               { ret 2; }
+    if (!sel r.err.read.native)                        { ret 3; }
+    if (r.err.read.native.delivered != 3)              { ret 4; }
+    if (r.err.read.native.error.kind != io_error.IO)   { ret 5; }
+    if (buf[0] != 'a' || buf[2] != 'c' || buf[3] != 0) { ret 6; }
+
+    var n: MemReader = mem("xy\n", 3);
+    n.fail_at = 2;
+    n.failing = true;
+    n.kind    = io_error.WOULD_BLOCK;
+    var rn:      reader.Reader          = mem_reader(?n);
+    val blocked: res[usize, InputError] = read_line_from(?rn, ?buf[0], 16);
+    if (!sel blocked.err)                  { ret 7; }
+    if (!sel blocked.err.read)             { ret 8; }
+    if (!sel blocked.err.read.would_block) { ret 9; }
+    if (blocked.err.read.would_block != 2) { ret 10; }
+    ret 0;
+}

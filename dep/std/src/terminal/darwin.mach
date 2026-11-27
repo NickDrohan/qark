@@ -1,0 +1,98 @@
+# darwin terminal keyboard input through public libsystem termios functions
+#
+# raw-mode state is process-global and is not thread-safe.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.option.opt;
+
+use io_error: std.io.error;
+use terr:     std.terminal.error;
+use std.terminal.key;
+
+$if ($mach.build.sys == $mach.sys.darwin) {
+    use std.system.os;
+    use sys: std.system.os.darwin;
+    use ls:  std.system.os.darwin.libsystem;
+}
+$or {
+    $error("std.terminal.darwin needs the darwin target");
+}
+
+var _saved:      ls.Termios;
+var _raw_active: bool = false;
+
+# drop whatever's sitting unread in the input queue
+# ---
+# ret: ok, or the native refusal
+pub fun flush_input() terr.Operation {
+    val r: i32 = ls.tcflush(sys.STDIN_FD, ls.TCIFLUSH);
+    if (r == -1) { ret terr.Operation.err{terr.TermError.native{os.error(ls.fail_errno(), io_error.OP_OPTION)}}; }
+    ret terr.Operation.ok{};
+}
+
+# whether raw mode is currently active
+pub fun is_raw() bool {
+    ret _raw_active;
+}
+
+# switch stdin into raw mode -- same semantics as terminal.linux.enable_raw:
+# no line buffering, no local echo, non-blocking reads (VMIN=0, VTIME=0).
+# ---
+# ret: ok, or the native refusal (ENOTTY when stdin is not a terminal)
+pub fun enable_raw() terr.Operation {
+    if (_raw_active) { ret terr.Operation.ok{}; }
+
+    val got: i32 = ls.tcgetattr(sys.STDIN_FD, ?_saved);
+    if (got == -1) { ret terr.Operation.err{terr.TermError.native{os.error(ls.fail_errno(), io_error.OP_OPTION)}}; }
+
+    var raw: ls.Termios = _saved;
+    raw.lflag        = raw.lflag & ~(ls.ICANON | ls.ECHO);
+    raw.cc[ls.VMIN]  = 0;
+    raw.cc[ls.VTIME] = 0;
+
+    val set: i32 = ls.tcsetattr(sys.STDIN_FD, ls.TCSAFLUSH, ?raw);
+    if (set == -1) { ret terr.Operation.err{terr.TermError.native{os.error(ls.fail_errno(), io_error.OP_OPTION)}}; }
+
+    _raw_active = true;
+    ret terr.Operation.ok{};
+}
+
+# restore whatever tcgetattr saw before enable_raw ran
+#
+# safe to call even if raw mode isn't active (no-op). pair with
+# `fin { terminal.disable_raw(); }` after a successful enable_raw.
+# ---
+# ret: ok, or the native refusal; raw mode stays active after a refusal
+pub fun disable_raw() terr.Operation {
+    if (!_raw_active) { ret terr.Operation.ok{}; }
+
+    val r: i32 = ls.tcsetattr(sys.STDIN_FD, ls.TCSAFLUSH, ?_saved);
+    if (r == -1) { ret terr.Operation.err{terr.TermError.native{os.error(ls.fail_errno(), io_error.OP_OPTION)}}; }
+
+    _raw_active = false;
+    ret terr.Operation.ok{};
+}
+
+# read one raw byte without blocking
+#
+# requires raw mode; a genuine read failure is the error, distinct from an
+# empty queue (absence).
+# ---
+# ret: some{byte} if one was waiting, none when the queue was empty, or the
+#      native read failure
+pub fun poll_key() terr.Poll {
+    var b: u8  = 0;
+    val n: i64 = sys.read(sys.STDIN_FD, ?b, 1);
+    if (n < 0)  { ret terr.Poll.err{terr.TermError.native{os.error(n, io_error.OP_READ)}}; }
+    if (n == 0) { ret terr.Poll.ok{opt[key.Key].none{}}; }
+    ret terr.Poll.ok{opt[key.Key].some{key.key_byte(b)}};
+}
+
+test termios__lp64_layout {
+    if ($size_of(ls.Termios) != 72 || $align_of(ls.Termios) != 8)                 { ret 1; }
+    if ($offset_of(ls.Termios, cc) != 32 || $offset_of(ls.Termios, ispeed) != 56) { ret 2; }
+    if ($offset_of(ls.Termios, ospeed) != 64)                                     { ret 3; }
+    ret 0;
+}

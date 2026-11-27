@@ -1,0 +1,202 @@
+# windows terminal keyboard input backend (see ../terminal.mach)
+#
+# windows has no termios/ioctl -- console mode is toggled via kernel32's
+# GetConsoleMode/SetConsoleMode, and single keys are polled via
+# GetNumberOfConsoleInputEvents + ReadConsoleInputA, since the console layer
+# delivers structured key-event records, not a raw byte stream. arrows already
+# arrive as a distinct virtual-key code, so this backend decodes them in
+# poll_key and the parent's poll_key_decoded is a passthrough here.
+#
+# raw-mode state is a single process-global toggle and is not thread-safe. this
+# backend cannot be built or tested on a non-windows host.
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.option.opt;
+use std.types.size.isize;
+
+use io_error: std.io.error;
+use terr:     std.terminal.error;
+use std.terminal.key;
+
+$if ($mach.build.sys == $mach.sys.windows) {
+    use std.system.os;
+    use sys: std.system.os.windows;
+}
+$or {
+    $error("std.terminal.windows needs the windows target");
+}
+
+val STD_INPUT_HANDLE: u32 = (0 - 10)::i32::u32;
+
+#[library("kernel32")]
+ext fun GetStdHandle(p0: u32) isize;
+#[library("kernel32")]
+ext fun GetConsoleMode(p0: isize, p1: *u32) i32;
+#[library("kernel32")]
+ext fun SetConsoleMode(p0: isize, p1: u32) i32;
+#[library("kernel32")]
+ext fun GetNumberOfConsoleInputEvents(p0: isize, p1: *u32) i32;
+#[library("kernel32")]
+ext fun ReadConsoleInputA(p0: isize, p1: *InputRecord, p2: u32, p3: *u32) i32;
+
+val ENABLE_LINE_INPUT: u32 = 0x0002;
+val ENABLE_ECHO_INPUT: u32 = 0x0004;
+
+val KEY_EVENT: u16 = 0x0001;
+
+val VK_UP:    u16 = 0x26;
+val VK_LEFT:  u16 = 0x25;
+val VK_RIGHT: u16 = 0x27;
+val VK_DOWN:  u16 = 0x28;
+
+# mirrors Win32's KEY_EVENT_RECORD: 16 bytes, no gaps -- every field already
+# lands on its own natural alignment at these offsets.
+rec KeyEventRecord {
+    key_down:          i32; # BOOL
+    repeat_count:      u16;
+    virtual_key_code:  u16;
+    virtual_scan_code: u16;
+    ascii_char:        u8; # low byte of the AsciiChar/UnicodeChar union
+    _reserved:         u8; # high byte of that union -- unused here
+    control_key_state: u32;
+}
+
+# mirrors Win32's INPUT_RECORD: a 2-byte EventType, 2 bytes of padding to align
+# the union to 4 bytes, then the union sized to its largest member.
+rec InputRecord {
+    event_type: u16;
+    _pad:       u16;
+    key_event:  KeyEventRecord;
+}
+
+var _handle:     isize = 0;
+var _saved_mode: u32   = 0;
+var _raw_active: bool  = false;
+
+fun handle() isize {
+    if (_handle == 0) {
+        _handle = GetStdHandle(STD_INPUT_HANDLE);
+    }
+    ret _handle;
+}
+
+# whether raw mode is currently active
+pub fun is_raw() bool {
+    ret _raw_active;
+}
+
+# no FlushConsoleInputBuffer binding yet -- poll_key already consumes only one
+# event per call, so there is nothing separate to flush for this surface. a
+# real binding would go here if that changes.
+# ---
+# ret: ok (always succeeds)
+pub fun flush_input() terr.Operation {
+    ret terr.Operation.ok{};
+}
+
+# switch stdin into raw mode -- same semantics as terminal.linux.enable_raw:
+# no line buffering, no local echo. windows has no VMIN/VTIME equivalent;
+# non-blocking polling comes from checking GetNumberOfConsoleInputEvents before
+# reading, in poll_key below, rather than from the mode itself.
+# ---
+# ret: ok, or the native refusal (EINVAL when stdin is not a console)
+pub fun enable_raw() terr.Operation {
+    if (_raw_active) { ret terr.Operation.ok{}; }
+
+    val h:   isize = handle();
+    val got: i32   = GetConsoleMode(h, ?_saved_mode);
+    if (got == 0) { ret terr.Operation.err{terr.TermError.native{os.error(sys.last_error(), io_error.OP_OPTION)}}; }
+
+    val raw_mode: u32 = _saved_mode & ~(ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT);
+    val set:      i32 = SetConsoleMode(h, raw_mode);
+    if (set == 0) { ret terr.Operation.err{terr.TermError.native{os.error(sys.last_error(), io_error.OP_OPTION)}}; }
+
+    _raw_active = true;
+    ret terr.Operation.ok{};
+}
+
+# restore whatever GetConsoleMode saw before enable_raw ran
+#
+# safe to call even if raw mode isn't active (no-op). pair with
+# `fin { terminal.disable_raw(); }` after a successful enable_raw.
+# ---
+# ret: ok, or the native refusal; raw mode stays active after a refusal
+pub fun disable_raw() terr.Operation {
+    if (!_raw_active) { ret terr.Operation.ok{}; }
+
+    val set: i32 = SetConsoleMode(handle(), _saved_mode);
+    if (set == 0) { ret terr.Operation.err{terr.TermError.native{os.error(sys.last_error(), io_error.OP_OPTION)}}; }
+
+    _raw_active = false;
+    ret terr.Operation.ok{};
+}
+
+# read one key-event record without blocking
+#
+# unlike linux/darwin's raw byte, this checks GetNumberOfConsoleInputEvents
+# first and reports absence if nothing is queued -- there's no
+# read-returns-0-when-empty convention on the console API. a failed console
+# call is the error, distinct from an empty queue. non-key events (a key-up,
+# resize, or mouse event) are consumed and reported as absence so the next
+# poll sees fresh data rather than piling up.
+# ---
+# ret: some{byte} for an ascii key, some{special} for a decoded arrow, none
+#      when nothing usable was queued, or the native console failure
+pub fun poll_key() terr.Poll {
+    var pending: u32 = 0;
+    val got:     i32 = GetNumberOfConsoleInputEvents(handle(), ?pending);
+    if (got == 0)     { ret terr.Poll.err{terr.TermError.native{os.error(sys.last_error(), io_error.OP_READ)}}; }
+    if (pending == 0) { ret nothing(); }
+
+    var ev:    InputRecord;
+    var nread: u32 = 0;
+    val okr:   i32 = ReadConsoleInputA(handle(), ?ev, 1, ?nread);
+    if (okr == 0)   { ret terr.Poll.err{terr.TermError.native{os.error(sys.last_error(), io_error.OP_READ)}}; }
+    if (nread == 0) { ret nothing(); }
+
+    if (ev.event_type != KEY_EVENT) { ret nothing(); }
+    if (ev.key_event.key_down == 0) { ret nothing(); } # ignore key-up
+
+    if (ev.key_event.ascii_char != 0) { ret waiting(key.key_byte(ev.key_event.ascii_char)); }
+
+    if (ev.key_event.virtual_key_code == VK_UP)    { ret waiting(key.key_special(key.KEY_UP)); }
+    if (ev.key_event.virtual_key_code == VK_DOWN)  { ret waiting(key.key_special(key.KEY_DOWN)); }
+    if (ev.key_event.virtual_key_code == VK_LEFT)  { ret waiting(key.key_special(key.KEY_LEFT)); }
+    if (ev.key_event.virtual_key_code == VK_RIGHT) { ret waiting(key.key_special(key.KEY_RIGHT)); }
+
+    ret nothing();
+}
+
+fun nothing() terr.Poll {
+    ret terr.Poll.ok{opt[key.Key].none{}};
+}
+
+fun waiting(k: key.Key) terr.Poll {
+    ret terr.Poll.ok{opt[key.Key].some{k}};
+}
+
+test input_record__layout {
+    if ($size_of(KeyEventRecord) != 16) { ret 1; }
+    if ($size_of(InputRecord) != 20)    { ret 2; }
+    ret 0;
+}
+
+test enable_raw__refusal_or_round_trip {
+    # without an attached console GetConsoleMode fails, which enable_raw
+    # surfaces as the native refusal rather than crashing on; either way the
+    # plumbing runs.
+    val e: terr.Operation = enable_raw();
+    if (sel e.err) {
+        if (is_raw())                                                               { ret 1; }
+        if (!sel e.err.native)                                                      { ret 2; }
+        if (e.err.native.operation != io_error.OP_OPTION || e.err.native.code >= 0) { ret 3; }
+        ret 0;
+    }
+    if (!is_raw()) { ret 4; }
+    val d: terr.Operation = disable_raw();
+    if (sel d.err) { ret 5; }
+    if (is_raw())  { ret 6; }
+    ret 0;
+}

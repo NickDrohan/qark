@@ -1,0 +1,909 @@
+# thread creation and resource ownership
+#
+# every spawned thread has one private owner record. the public handle may move
+# after spawn because target trampolines refer to that record, never the handle.
+# a joinable thread leaves the record for join. detach transfers it to the
+# exiting thread, which releases it after the user context has been destroyed.
+
+use io_error: std.io.error;
+use std.sync.atomic;
+use std.system.capability;
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.error.err;
+use std.types.option.opt;
+use std.types.result.res;
+use std.types.size.usize;
+use std.types.string.str;
+use std.types.string.str_len;
+
+$if (capability.HAS_PAGES && capability.HAS_THREADS) {
+    use std.system.os;
+}
+$or {
+    $error("std.sync.thread needs the pages and threads capabilities (std.system.capability.HAS_PAGES, HAS_THREADS)");
+}
+
+pub val ERROR_INVALID:     i64 = -22;
+pub val ERROR_NO_MEMORY:   i64 = -12;
+pub val ERROR_UNSUPPORTED: i64 = -95;
+
+# a refused thread operation
+# ---
+# invalid:     a configuration outside the portable policy, or a handle that
+#              is not joinable (never spawned, already joined or detached)
+# exhausted:   the owner record could not be allocated
+# unsupported: the target refused a policy it does not implement (stack commit)
+# native:      the target refused with its negative code, kept whole
+pub tag ThreadError: u8 { invalid; exhausted; unsupported; native: i64; }
+
+pub def Operation: err[ThreadError];
+
+# the portable status code of an error, for diagnostics that keep an i64
+pub fun code(e: ThreadError) i64 {
+    if (sel e.invalid)     { ret ERROR_INVALID; }
+    if (sel e.exhausted)   { ret ERROR_NO_MEMORY; }
+    if (sel e.unsupported) { ret ERROR_UNSUPPORTED; }
+    if (sel e.native)      { ret e.native; }
+    ret ERROR_INVALID;
+}
+
+fun native_error(status: i64) ThreadError {
+    if (status == ERROR_UNSUPPORTED) { ret ThreadError.unsupported{}; }
+    ret ThreadError.native{status};
+}
+
+pub val DEFAULT_STACK_RESERVE: usize = 2097152;
+pub val MIN_STACK_RESERVE:     usize = 65536;
+pub val MAX_NAME_BYTES:        usize = 15;
+
+val OWNER_REGION_SIZE: usize = 4096;
+
+val STATE_RUNNING:  i64 = 0;
+val STATE_FINISHED: i64 = 1;
+val STATE_DETACHED: i64 = 2;
+
+# portable thread creation policy
+# ---
+# stack_reserve: virtual address space reserved for the stack, or 0 for default
+# stack_commit:  initial committed stack bytes, or 0 for the target default
+# name:          nil or a portable ASCII diagnostic name of at most 15 bytes
+pub rec Config {
+    stack_reserve: usize;
+    stack_commit:  usize;
+    name:          str;
+}
+
+# initialize a thread configuration with portable defaults
+pub fun config_default(c: *Config) {
+    c.stack_reserve = DEFAULT_STACK_RESERVE;
+    c.stack_commit  = 0;
+    c.name          = nil;
+}
+
+# handle to a spawned thread
+# ---
+# tid:   stable native diagnostic identifier, or a negative spawn error
+# stack: opaque resource-owner address, retained for source compatibility
+# done:  0 while joinable, 1 after join, -1 after detach
+pub rec Thread {
+    tid:   i64;
+    stack: usize;
+    done:  i64;
+}
+
+rec Owner {
+    entry:       usize;
+    arg:         usize;
+    destroy:     usize;
+    state:       i64;
+    reclaimable: i64;
+    native:      usize;
+    name:        [16]u8;
+}
+
+fun destroy_arg(arg: *u8, destroy_addr: usize) {
+    if (destroy_addr == 0) { ret; }
+    val destroy: fun(*u8) = destroy_addr::fun(*u8);
+    destroy(arg);
+}
+
+# target trampolines call this exactly once after target setup succeeds
+fun owner_entry(arg: *u8) {
+    val o:            *Owner   = arg::*Owner;
+    val entry:        fun(*u8) = o.entry::fun(*u8);
+    val user_arg:     *u8      = o.arg::*u8;
+    val destroy_addr: usize    = o.destroy;
+    entry(user_arg);
+    destroy_arg(user_arg, destroy_addr);
+}
+
+fun initialize_thread(t: *Thread) {
+    t.tid   = ERROR_INVALID;
+    t.stack = 0;
+    t.done  = 0;
+}
+
+fun config_valid(c: *Config) bool {
+    val page:    usize = os.page_size();
+    var reserve: usize = c.stack_reserve;
+    if (reserve == 0) { reserve = DEFAULT_STACK_RESERVE; }
+    if (reserve < MIN_STACK_RESERVE || reserve % page != 0) {
+        ret false;
+    }
+    if (c.stack_commit != 0) {
+        if (c.stack_commit < page || c.stack_commit % page != 0 || c.stack_commit > reserve) {
+            ret false;
+        }
+    }
+
+    if (c.name != nil) {
+        val n: usize = str_len(c.name);
+        if (n == 0 || n > MAX_NAME_BYTES) { ret false; }
+        var i: usize = 0;
+        for (i < n) {
+            val ch: u8 = c.name[i];
+            if (ch < 32 || ch > 126) { ret false; }
+            i = i + 1;
+        }
+    }
+    ret true;
+}
+
+fun copy_name(dst: *u8, name: str) {
+    var i: usize = 0;
+    if (name != nil) {
+        val n: usize = str_len(name);
+        for (i < n) {
+            dst[i] = name[i];
+            i      = i + 1;
+        }
+    }
+    dst[i] = 0;
+}
+
+fun finish_spawn_failure(
+    arg: *u8, destroy_addr: usize, owner_base: ptr, t: *Thread, failure: ThreadError,
+) Operation {
+    destroy_arg(arg, destroy_addr);
+    os.deallocate(owner_base, OWNER_REGION_SIZE);
+    t.tid = code(failure);
+    ret Operation.err{failure};
+}
+
+# the handle's tid carries the failure's code so a moved handle stays diagnosable
+fun spawn_impl(f: fun(*u8), arg: *u8, destroy_addr: usize, c: *Config, t: *Thread) Operation {
+    initialize_thread(t);
+
+    if (!config_valid(c)) {
+        destroy_arg(arg, destroy_addr);
+        t.tid = ERROR_INVALID;
+        ret Operation.err{ThreadError.invalid{}};
+    }
+
+    val owner_base: ptr = os.allocate(OWNER_REGION_SIZE);
+    if (owner_base == nil) {
+        destroy_arg(arg, destroy_addr);
+        t.tid = ERROR_NO_MEMORY;
+        ret Operation.err{ThreadError.exhausted{}};
+    }
+
+    val o: *Owner = owner_base::usize::*Owner;
+    o.entry       = f::usize;
+    o.arg         = arg::usize;
+    o.destroy     = destroy_addr;
+    o.state       = STATE_RUNNING;
+    o.reclaimable = 0;
+    o.native      = 0;
+    copy_name(?o.name[0], c.name);
+
+    var reserve: usize = c.stack_reserve;
+    if (reserve == 0) { reserve = DEFAULT_STACK_RESERVE; }
+
+    atomic.fence();
+    val tid: i64 = os.thread_spawn(
+        owner_entry,
+        owner_base::*u8,
+        ?o.state,
+        ?o.reclaimable,
+        owner_base,
+        OWNER_REGION_SIZE,
+        ?o.name[0],
+        reserve,
+        c.stack_commit,
+        ?o.native,
+    );
+    if (tid < 0) {
+        ret finish_spawn_failure(arg, destroy_addr, owner_base, t, native_error(tid));
+    }
+
+    t.tid   = tid;
+    t.stack = owner_base::usize;
+    ret Operation.ok{};
+}
+
+# spawn with borrowed caller context and explicit configuration
+#
+# arg must remain valid until the entry returns. ownership stays with the caller.
+pub fun spawn_with_config(f: fun(*u8), arg: *u8, c: *Config, t: *Thread) Operation {
+    ret spawn_impl(f, arg, 0, c, t);
+}
+
+# spawn with owned caller context and explicit configuration
+#
+# destroy runs exactly once after the entry returns, including an early return.
+# if spawning fails, destroy runs before this call returns.
+pub fun spawn_owned_with_config(f: fun(*u8), arg: *u8, destroy: fun(*u8), c: *Config, t: *Thread) Operation {
+    ret spawn_impl(f, arg, destroy::usize, c, t);
+}
+
+# spawn with borrowed caller context and default configuration
+pub fun spawn_with(f: fun(*u8), arg: *u8, t: *Thread) Operation {
+    var c: Config;
+    config_default(?c);
+    ret spawn_with_config(f, arg, ?c, t);
+}
+
+# spawn a zero-argument function with explicit configuration
+pub fun spawn_config(f: fun(), c: *Config, t: *Thread) Operation {
+    ret spawn_with_config((f::usize)::fun(*u8), nil, c, t);
+}
+
+# spawn with owned caller context and default configuration
+pub fun spawn_owned(f: fun(*u8), arg: *u8, destroy: fun(*u8), t: *Thread) Operation {
+    var c: Config;
+    config_default(?c);
+    ret spawn_owned_with_config(f, arg, destroy, ?c, t);
+}
+
+# spawn a zero-argument function with default configuration
+pub fun spawn(f: fun(), t: *Thread) Operation {
+    ret spawn_with((f::usize)::fun(*u8), nil, t);
+}
+
+# join and release every library-owned resource
+# ---
+# ret: ok once joined and released, invalid for a handle that is not
+#      joinable, or the target's refusal with the handle still joinable
+pub fun join(t: *Thread) Operation {
+    if (t.stack == 0 || t.done != 0) { ret Operation.err{ThreadError.invalid{}}; }
+    val o: *Owner = t.stack::*Owner;
+    val r: i64    = os.thread_join(o.native, ?o.reclaimable);
+    if (r < 0) { ret Operation.err{native_error(r)}; }
+    os.deallocate(t.stack::ptr, OWNER_REGION_SIZE);
+    t.stack = 0;
+    t.done  = 1;
+    ret Operation.ok{};
+}
+
+# transfer ownership to the running or completed thread
+# ---
+# ret: ok once the thread owns its record, invalid for a handle that is not
+#      joinable, or the target's refusal with the handle still joinable
+pub fun detach(t: *Thread) Operation {
+    if (t.stack == 0 || t.done != 0) { ret Operation.err{ThreadError.invalid{}}; }
+    val o: *Owner = t.stack::*Owner;
+    val r: i64    = os.thread_detach(o.native);
+    if (r < 0) { ret Operation.err{native_error(r)}; }
+
+    var expected: i64 = STATE_RUNNING;
+    if (!atomic.cas(?o.state, ?expected, STATE_DETACHED)) {
+        if (expected != STATE_FINISHED) { ret Operation.err{ThreadError.invalid{}}; }
+        for (atomic.load(?o.reclaimable) == 0) {
+            atomic.spin_hint();
+        }
+        os.deallocate(t.stack::ptr, OWNER_REGION_SIZE);
+    }
+
+    t.stack = 0;
+    t.done  = -1;
+    ret Operation.ok{};
+}
+
+# check whether a joinable thread body has finished
+pub fun is_done(t: *Thread) bool {
+    if (t.done == 1)  { ret true; }
+    if (t.stack == 0) { ret false; }
+    val o: *Owner = t.stack::*Owner;
+    ret atomic.load(?o.state) == STATE_FINISHED;
+}
+
+# return the stable native diagnostic identifier captured at spawn
+pub fun diagnostic_id(t: *Thread) i64 {
+    ret t.tid;
+}
+
+# the calling thread's identity, as current_token returns it
+#
+# a token is positive and never 0, so a caller may keep 0 for "no thread". two
+# live threads never share one, and one thread reads the same token for its
+# whole life. a thread that has ended may leave its token to a later thread.
+pub def Token: i64;
+
+# bit 62 marks a token taken from the thread id. no user-space address reaches
+# it on any supported target, so it never equals a block's address
+val TOKEN_FROM_ID: i64 = 1 << 62;
+
+# the calling thread's identity, read without a system call
+#
+# the token is the address os.thread_block reads. on linux that is the thread
+# pointer, whoever owns it: std's block on the main thread of a static image and
+# on every thread std spawns, and the C runtime's on the main thread under a
+# loader and on a thread C code created. each thread has its own, so the token
+# is distinct and costs no system call on all of them. a raw clone without
+# CLONE_SETTLS inherits its parent's thread pointer and so its parent's token,
+# and must not call into std. on darwin and windows a thread std did not create
+# has no block, and its token falls back to its thread id. no freestanding
+# target has threads, so this is not built there.
+pub fun current_token() Token {
+    val block: *os.ThreadBlock = os.thread_block();
+    if (block != nil) { ret block::usize::i64; }
+    ret TOKEN_FROM_ID | os.thread_current_id();
+}
+
+# a set of CPUs over words the caller owns
+#
+# CPU i is bit i % 64 of words[i / 64]. count is how many leading words are
+# meaningful, capacity how many the caller provided. nothing is allocated.
+# ---
+# words:    the mask words
+# capacity: words available at words
+# count:    words in use, never more than capacity
+pub rec CpuSet {
+    words:    *u64;
+    capacity: usize;
+    count:    usize;
+}
+
+# an empty CPU set over caller-provided words
+# ---
+# words:    storage for the mask words
+# capacity: number of words at words
+# ret:      the set, with every word cleared
+pub fun cpu_set(words: *u64, capacity: usize) CpuSet {
+    var set: CpuSet = CpuSet{words: words, capacity: capacity, count: 0};
+    cpu_set_clear(?set);
+    ret set;
+}
+
+# remove every CPU from the set
+pub fun cpu_set_clear(set: *CpuSet) {
+    var i: usize = 0;
+    for (i < set.capacity) {
+        set.words[i] = 0;
+        i            = i + 1;
+    }
+    set.count = 0;
+}
+
+# add a CPU to the set
+# ---
+# ret: false when the CPU does not fit the set's words
+pub fun cpu_set_add(set: *CpuSet, cpu: usize) bool {
+    val word: usize = cpu / 64;
+    if (word >= set.capacity) { ret false; }
+    var i: usize = set.count;
+    for (i <= word) {
+        set.words[i] = 0;
+        i            = i + 1;
+    }
+    if (word >= set.count) { set.count = word + 1; }
+    set.words[word] = set.words[word] | (1::u64 << (cpu % 64)::u64);
+    ret true;
+}
+
+# whether a CPU is in the set
+pub fun cpu_set_contains(set: *CpuSet, cpu: usize) bool {
+    val word: usize = cpu / 64;
+    if (word >= set.count) { ret false; }
+    ret ((set.words[word] >> (cpu % 64)::u64) & 1) != 0;
+}
+
+# the number of CPUs in the set
+pub fun cpu_set_size(set: *CpuSet) usize {
+    var total: usize = 0;
+    var i:     usize = 0;
+    for (i < set.count) {
+        var w: u64 = set.words[i];
+        for (w != 0) {
+            w     = w & (w - 1);
+            total = total + 1;
+        }
+        i = i + 1;
+    }
+    ret total;
+}
+
+# the n-th CPU in the set, counting from zero in ascending index order
+# ---
+# ret: the CPU index, or none when the set holds n CPUs or fewer
+pub fun cpu_set_nth(set: *CpuSet, n: usize) opt[usize] {
+    var seen: usize = 0;
+    var i:    usize = 0;
+    for (i < set.count) {
+        val w:   u64   = set.words[i];
+        var bit: usize = 0;
+        for (w != 0 && bit < 64) {
+            if (((w >> bit::u64) & 1) != 0) {
+                if (seen == n) { ret opt[usize].some{i * 64 + bit}; }
+                seen = seen + 1;
+            }
+            bit = bit + 1;
+        }
+        i = i + 1;
+    }
+    ret opt[usize].none{};
+}
+
+# read the calling thread's CPU affinity into set
+#
+# a set too small for the platform's mask is refused with RANGE; size it with
+# affinity_words first. darwin has no CPU affinity and refuses with UNSUPPORTED.
+# ---
+# ret: ok with set.count updated, or the refusal
+pub fun current_affinity(set: *CpuSet) err[io_error.Error] {
+    var used: usize = 0;
+    val code: i64   = os.thread_affinity(set.words, set.capacity, ?used);
+    if (code < 0) { ret err[io_error.Error].err{os.error(code, io_error.OP_READ)}; }
+    set.count = used;
+    ret err[io_error.Error].ok{};
+}
+
+# the number of words a CPU set needs to hold the calling thread's affinity
+# ---
+# ret: the word count, or the refusal
+pub fun affinity_words() res[usize, io_error.Error] {
+    var needed: usize = 0;
+    val code:   i64   = os.thread_affinity(nil, 0, ?needed);
+    if (code < 0 && os.error_kind(code) != io_error.RANGE) {
+        ret res[usize, io_error.Error].err{os.error(code, io_error.OP_READ)};
+    }
+    ret res[usize, io_error.Error].ok{needed};
+}
+
+# pin the calling thread to the CPUs in set
+# ---
+# ret: ok, INVALID for an empty set or CPUs the process may not use,
+#      UNSUPPORTED where the platform cannot express the set, or the refusal
+pub fun set_current_affinity(set: *CpuSet) err[io_error.Error] {
+    if (set.count == 0) { ret err[io_error.Error].err{io_error.make(io_error.INVALID, io_error.OP_OPTION)}; }
+    val code: i64 = os.set_thread_affinity(set.words, set.count);
+    if (code < 0) { ret err[io_error.Error].err{os.error(code, io_error.OP_OPTION)}; }
+    ret err[io_error.Error].ok{};
+}
+
+# pin the calling thread to one CPU
+# ---
+# cpu: global CPU index, as allowed_cpus reports it
+# ret: ok, INVALID for a CPU the process may not use, or the refusal
+pub fun pin_current_to(cpu: usize) err[io_error.Error] {
+    val words: usize = cpu / 64 + 1;
+    val bytes: usize = words * 8;
+    val store: ptr   = os.allocate(bytes);
+    if (store == nil) { ret err[io_error.Error].err{io_error.make(io_error.RESOURCE_EXHAUSTED, io_error.OP_OPTION)}; }
+    var set: CpuSet = cpu_set(store::*u64, words);
+    cpu_set_add(?set, cpu);
+    val applied: err[io_error.Error] = set_current_affinity(?set);
+    os.deallocate(store, bytes);
+    ret applied;
+}
+
+# list the CPUs the calling thread may run on, in ascending index order
+#
+# a consumer that runs one worker per CPU pins worker i to out[i].
+# ---
+# out:       destination for global CPU indices
+# capacity:  entries available at out
+# out_count: CPUs listed, or CPUs available when capacity is too small
+# ret:       ok, RANGE when capacity is too small, or the refusal
+pub fun allowed_cpus(out: *usize, capacity: usize, out_count: *usize) err[io_error.Error] {
+    @out_count = 0;
+    val sized: res[usize, io_error.Error] = affinity_words();
+    if (sel sized.err) { ret err[io_error.Error].err{sized.err}; }
+    val words: usize = sized.ok;
+    if (words == 0) { ret err[io_error.Error].ok{}; }
+    val bytes: usize = words * 8;
+    val store: ptr   = os.allocate(bytes);
+    if (store == nil) { ret err[io_error.Error].err{io_error.make(io_error.RESOURCE_EXHAUSTED, io_error.OP_READ)}; }
+    var set:  CpuSet              = cpu_set(store::*u64, words);
+    val read: err[io_error.Error] = current_affinity(?set);
+    if (sel read.err) {
+        os.deallocate(store, bytes);
+        ret read;
+    }
+    val total: usize = cpu_set_size(?set);
+    @out_count = total;
+    if (total > capacity) {
+        os.deallocate(store, bytes);
+        ret err[io_error.Error].err{io_error.make(io_error.RANGE, io_error.OP_READ)};
+    }
+    var n: usize = 0;
+    var i: usize = 0;
+    for (i < set.count) {
+        val w:   u64   = set.words[i];
+        var bit: usize = 0;
+        for (w != 0 && bit < 64) {
+            if (((w >> bit::u64) & 1) != 0) {
+                out[n] = i * 64 + bit;
+                n      = n + 1;
+            }
+            bit = bit + 1;
+        }
+        i = i + 1;
+    }
+    os.deallocate(store, bytes);
+    ret err[io_error.Error].ok{};
+}
+
+#[testing]
+var test_flag:      i64 = 0;
+#[testing]
+var test_destroyed: i64 = 0;
+
+#[testing]
+rec DiagnosticCapture {
+    id:          i64;
+    name_result: i64;
+    name:        [16]u8;
+}
+
+#[testing]
+fun test_worker() {
+    atomic.store(?test_flag, 1);
+}
+
+#[testing]
+fun ud_worker(arg: *u8) {
+    val slot: *i64 = arg::*i64;
+    @slot = @slot + 100;
+}
+
+#[testing]
+fun owned_worker(arg: *u8) {
+    val slot: *i64 = arg::*i64;
+    atomic.store(slot, atomic.load(slot) + 1);
+}
+
+#[testing]
+fun owned_early_return(arg: *u8) {
+    val slot: *i64 = arg::*i64;
+    atomic.store(slot, atomic.load(slot) + 1);
+    ret;
+}
+
+#[testing]
+fun owned_destroy(arg: *u8) {
+    val slot: *i64 = arg::*i64;
+    atomic.store(slot, atomic.load(slot) + 1);
+    atomic.fetch_add(?test_destroyed, 1);
+}
+
+#[testing]
+fun diagnostic_worker(arg: *u8) {
+    val capture: *DiagnosticCapture = arg::*DiagnosticCapture;
+    capture.id          = os.thread_current_id();
+    capture.name_result = os.thread_current_name(?capture.name[0], 16);
+}
+
+#[testing]
+rec TokenProbe {
+    token:   i64;
+    stable:  i64;
+    arrived: *i64;
+    release: *i64;
+}
+
+# read the token repeatedly, publish it, and stay live until released
+#[testing]
+fun token_worker(arg: *u8) {
+    val probe: *TokenProbe = arg::*TokenProbe;
+    val first: Token       = current_token();
+    var same:  i64         = 1;
+    var i:     usize       = 0;
+    for (i < 1000) {
+        if (current_token() != first) { same = 0; }
+        i = i + 1;
+    }
+    probe.token  = first;
+    probe.stable = same;
+    atomic.fetch_add(probe.arrived, 1);
+    for (atomic.load(probe.release) == 0) { atomic.spin_hint(); }
+}
+
+fun done(r: Operation) bool {
+    ret sel r.ok;
+}
+
+# a handle may move after spawn and still joins, and a second join is refused
+test thread__spawn_and_join_through_a_moved_handle {
+    atomic.store(?test_flag, 0);
+    var original: Thread;
+    spawn(test_worker, ?original);
+    if (original.tid < 0 || diagnostic_id(?original) != original.tid) { ret 1; }
+    var t: Thread = original;
+    original.stack = 0;
+    if (!done(join(?t)))                              { ret 1; }
+    if (atomic.load(?test_flag) != 1 || !is_done(?t)) { ret 1; }
+    val again: Operation = join(?t);
+    if (!sel again.err)         { ret 2; }
+    if (!sel again.err.invalid) { ret 3; }
+    ret 0;
+}
+
+test thread__spawn_with_delivers_distinct_userdata {
+    var vals:    [4]i64;
+    var threads: [4]Thread;
+    var i:       usize = 0;
+    for (i < 4) {
+        vals[i] = i::i64;
+        spawn_with(ud_worker, (?vals[i])::*u8, ?threads[i]);
+        i = i + 1;
+    }
+    i = 0;
+    for (i < 4) {
+        if (threads[i].tid < 0 || !done(join(?threads[i]))) { ret 1; }
+        if (vals[i] != i::i64 + 100)                        { ret 1; }
+        i = i + 1;
+    }
+    ret 0;
+}
+
+test thread__owned_context_is_destroyed_once_after_return {
+    atomic.store(?test_destroyed, 0);
+    var value: i64 = 0;
+    var t:     Thread;
+    if (!done(spawn_owned(owned_early_return, (?value)::*u8, owned_destroy, ?t))) { ret 1; }
+    if (!done(join(?t)))                                                          { ret 1; }
+    if (atomic.load(?value) != 2 || atomic.load(?test_destroyed) != 1)            { ret 1; }
+    ret 0;
+}
+
+# a config the target refuses, an invalid reserve or an explicit commit,
+# destroys the owned context once and leaves no thread behind
+test thread__refused_config_destroys_owned_context_once {
+    atomic.store(?test_destroyed, 0);
+    var value: i64 = 0;
+    var c:     Config;
+    config_default(?c);
+    c.stack_reserve = 1;
+    var t: Thread;
+    val r: Operation = spawn_owned_with_config(owned_worker, (?value)::*u8, owned_destroy, ?c, ?t);
+    if (!sel r.err)                                                    { ret 1; }
+    if (!sel r.err.invalid || t.tid != ERROR_INVALID || t.stack != 0)  { ret 2; }
+    if (atomic.load(?value) != 1 || atomic.load(?test_destroyed) != 1) { ret 3; }
+
+    config_default(?c);
+    c.stack_commit = 65536;
+    val u: Operation = spawn_owned_with_config(owned_worker, (?value)::*u8, owned_destroy, ?c, ?t);
+    if (!sel u.err)                                                    { ret 4; }
+    if (!sel u.err.unsupported)                                        { ret 5; }
+    if (t.tid != ERROR_UNSUPPORTED || t.stack != 0)                    { ret 5; }
+    if (atomic.load(?value) != 2 || atomic.load(?test_destroyed) != 2) { ret 6; }
+    ret 0;
+}
+
+test thread__target_spawn_failure_destroys_owned_context_once {
+    atomic.store(?test_destroyed, 0);
+    var value: i64 = 0;
+    var c:     Config;
+    config_default(?c);
+    c.stack_reserve = 1::usize << 63;
+    var t: Thread;
+    val r: Operation = spawn_owned_with_config(owned_worker, (?value)::*u8, owned_destroy, ?c, ?t);
+    if (!sel r.err)                                                    { ret 1; }
+    if (code(r.err) >= 0 || t.tid != code(r.err) || t.stack != 0)      { ret 2; }
+    if (atomic.load(?value) != 1 || atomic.load(?test_destroyed) != 1) { ret 3; }
+    ret 0;
+}
+
+test thread__injected_failure_after_owner_acquisition_destroys_context_once {
+    atomic.store(?test_destroyed, 0);
+    var value: i64 = 0;
+    val owner: ptr = os.allocate(OWNER_REGION_SIZE);
+    if (owner == nil) { ret 1; }
+    var t: Thread;
+    initialize_thread(?t);
+    val injected: ThreadError = ThreadError.native{-125};
+    val r:        Operation   = finish_spawn_failure(
+        (?value)::*u8, owned_destroy::usize, owner, ?t, injected,
+    );
+    if (!sel r.err)                                                    { ret 1; }
+    if (!sel r.err.native)                                             { ret 2; }
+    if (r.err.native != -125 || t.tid != -125 || t.stack != 0)         { ret 3; }
+    if (atomic.load(?value) != 1 || atomic.load(?test_destroyed) != 1) { ret 1; }
+    ret 0;
+}
+
+test thread__custom_reserve_and_portable_name {
+    var capture: DiagnosticCapture;
+    capture.id          = 0;
+    capture.name_result = 0;
+    var c: Config;
+    config_default(?c);
+    c.stack_reserve = 1048576;
+    c.name          = "mach-diag";
+    var t: Thread;
+    if (!done(spawn_with_config(diagnostic_worker, (?capture)::*u8, ?c, ?t))) { ret 1; }
+    val diagnostic_id: i64 = t.tid;
+    if (!done(join(?t)))                                         { ret 1; }
+    if (capture.id != diagnostic_id || capture.name_result != 9) { ret 1; }
+    val expected: str   = "mach-diag";
+    var i:        usize = 0;
+    for (i < 9) {
+        if (capture.name[i] != expected[i]) { ret 1; }
+        i = i + 1;
+    }
+    if (capture.name[9] != 0) { ret 1; }
+    ret 0;
+}
+
+test thread__detach_transfers_resource_ownership {
+    atomic.store(?test_destroyed, 0);
+    var value: i64 = 0;
+    var t:     Thread;
+    if (!done(spawn_owned(owned_worker, (?value)::*u8, owned_destroy, ?t))) { ret 1; }
+    if (!done(detach(?t)) || t.stack != 0 || t.done != -1)                  { ret 1; }
+    val again: Operation = detach(?t);
+    if (!sel again.err)         { ret 2; }
+    if (!sel again.err.invalid) { ret 3; }
+    for (atomic.load(?test_destroyed) != 1) { atomic.spin_hint(); }
+    if (atomic.load(?value) != 2) { ret 1; }
+    ret 0;
+}
+
+test thread__tokens_are_distinct_across_live_threads_and_stable_within_one {
+    # the main thread's block was installed at entry, so its token is its address
+    val main_block: *os.ThreadBlock = os.thread_block();
+    if (main_block == nil || main_block.self_addr != main_block::usize) { ret 1; }
+    val main_token: Token = current_token();
+    if (main_token != main_block::usize::i64 || main_token <= 0) { ret 2; }
+
+    var arrived: i64   = 0;
+    var release: i64   = 0;
+    var probes:  [8]TokenProbe;
+    var threads: [8]Thread;
+    var i:       usize = 0;
+    for (i < 8) {
+        probes[i] = TokenProbe{token: 0, stable: 0, arrived: ?arrived, release: ?release};
+        if (!done(spawn_with(token_worker, (?probes[i])::*u8, ?threads[i]))) { ret 3; }
+        i = i + 1;
+    }
+    for (atomic.load(?arrived) != 8) { atomic.spin_hint(); }
+
+    var failure: i32 = 0;
+    i = 0;
+    for (i < 8) {
+        if (probes[i].stable != 1)                                          { failure = 4; }
+        if (probes[i].token <= 0 || (probes[i].token & TOKEN_FROM_ID) != 0) { failure = 5; }
+        if (probes[i].token == main_token)                                  { failure = 6; }
+        var j: usize = i + 1;
+        for (j < 8) {
+            if (probes[i].token == probes[j].token) { failure = 7; }
+            j = j + 1;
+        }
+        i = i + 1;
+    }
+    atomic.store(?release, 1);
+    i = 0;
+    for (i < 8) {
+        if (!done(join(?threads[i]))) { ret 8; }
+        i = i + 1;
+    }
+    if (current_token() != main_token) { ret 9; }
+    ret failure;
+}
+
+test thread__a_cpu_set_adds_finds_and_counts_cpus_in_index_order {
+    var words: [4]u64;
+    var set:   CpuSet = cpu_set(?words[0], 4);
+    if (cpu_set_size(?set) != 0 || cpu_set_contains(?set, 3))                       { ret 1; }
+    if (!cpu_set_add(?set, 130) || !cpu_set_add(?set, 3) || !cpu_set_add(?set, 64)) { ret 2; }
+    if (cpu_set_add(?set, 256))                                                     { ret 3; }
+    if (set.count != 3 || cpu_set_size(?set) != 3)                                  { ret 4; }
+    if (!cpu_set_contains(?set, 64) || cpu_set_contains(?set, 65))                  { ret 5; }
+    val first:  opt[usize] = cpu_set_nth(?set, 0);
+    val second: opt[usize] = cpu_set_nth(?set, 1);
+    val third:  opt[usize] = cpu_set_nth(?set, 2);
+    val fourth: opt[usize] = cpu_set_nth(?set, 3);
+    if (!(sel first.some && first.some == 3))    { ret 6; }
+    if (!(sel second.some && second.some == 64)) { ret 7; }
+    if (!(sel third.some && third.some == 130))  { ret 8; }
+    if (!(sel fourth.none))                      { ret 9; }
+    ret 0;
+}
+
+$if ($mach.build.sys == $mach.sys.darwin) {
+    test thread__darwin_has_no_cpu_affinity {
+        var words: [4]u64;
+        var set:   CpuSet              = cpu_set(?words[0], 4);
+        val read:  err[io_error.Error] = current_affinity(?set);
+        if (!(sel read.err && read.err.kind == io_error.UNSUPPORTED)) { ret 1; }
+        val pinned: err[io_error.Error] = pin_current_to(0);
+        if (!(sel pinned.err && pinned.err.kind == io_error.UNSUPPORTED)) { ret 2; }
+        var cpus:   [8]usize;
+        var count:  usize               = 0;
+        val listed: err[io_error.Error] = allowed_cpus(?cpus[0], 8, ?count);
+        if (!(sel listed.err && listed.err.kind == io_error.UNSUPPORTED)) { ret 3; }
+        ret 0;
+    }
+}
+$or {
+    # read the calling thread's affinity into caller storage sized for it
+    #[testing]
+    fun affinity_snapshot(set: *CpuSet, store: *u64, capacity: usize) bool {
+        @set = cpu_set(store, capacity);
+        val read: err[io_error.Error] = current_affinity(set);
+        ret sel read.ok;
+    }
+
+    test thread__allowed_cpus_match_the_affinity_mask_and_each_can_be_pinned {
+        val sized: res[usize, io_error.Error] = affinity_words();
+        if (sel sized.err) { ret 1; }
+        val words: usize = sized.ok;
+        if (words == 0 || words > 256) { ret 1; }
+        var store:    [256]u64;
+        var original: CpuSet;
+        if (!affinity_snapshot(?original, ?store[0], words)) { ret 2; }
+
+        var cpus:   [1024]usize;
+        var count:  usize               = 0;
+        val listed: err[io_error.Error] = allowed_cpus(?cpus[0], 1024, ?count);
+        if (sel listed.err || count == 0 || count != cpu_set_size(?original)) { ret 3; }
+        var i: usize = 0;
+        for (i < count) {
+            if (!cpu_set_contains(?original, cpus[i])) { ret 4; }
+            if (i > 0 && cpus[i] <= cpus[i - 1])       { ret 5; }
+            val nth: opt[usize] = cpu_set_nth(?original, i);
+            if (!(sel nth.some && nth.some == cpus[i])) { ret 6; }
+            i = i + 1;
+        }
+
+        var pinned: bool = true;
+        i = 0;
+        for (i < count && i < 4) {
+            val pin: err[io_error.Error] = pin_current_to(cpus[i]);
+            if (sel pin.err) { pinned = false; }
+            var now_store: [256]u64;
+            var now:       CpuSet;
+            if (!affinity_snapshot(?now, ?now_store[0], words))              { pinned = false; }
+            if (cpu_set_size(?now) != 1 || !cpu_set_contains(?now, cpus[i])) { pinned = false; }
+            i = i + 1;
+        }
+        val restored: err[io_error.Error] = set_current_affinity(?original);
+        if (!pinned)          { ret 7; }
+        if (sel restored.err) { ret 8; }
+        ret 0;
+    }
+
+    test thread__a_short_affinity_buffer_reports_range_with_the_size_it_needs {
+        var one:    [1]u64;
+        var needed: usize = 0;
+        val code:   i64   = os.thread_affinity(?one[0], 0, ?needed);
+        if (os.error_kind(code) != io_error.RANGE || needed == 0) { ret 1; }
+        var cpus:   [1]usize;
+        var count:  usize               = 0;
+        val listed: err[io_error.Error] = allowed_cpus(?cpus[0], 0, ?count);
+        if (!(sel listed.err && listed.err.kind == io_error.RANGE) || count == 0) { ret 2; }
+        ret 0;
+    }
+
+    test thread__pinning_to_a_cpu_the_process_cannot_use_is_invalid {
+        val sized: res[usize, io_error.Error] = affinity_words();
+        if (sel sized.err) { ret 1; }
+        val words: usize = sized.ok;
+        if (words > 256) { ret 1; }
+        var store:    [256]u64;
+        var original: CpuSet;
+        if (!affinity_snapshot(?original, ?store[0], words)) { ret 2; }
+        val pin:      err[io_error.Error] = pin_current_to(16000);
+        val restored: err[io_error.Error] = set_current_affinity(?original);
+        if (!(sel pin.err && pin.err.kind == io_error.INVALID)) { ret 3; }
+        if (sel restored.err)                                   { ret 4; }
+        var empty_words: [1]u64;
+        var empty:       CpuSet              = cpu_set(?empty_words[0], 1);
+        val none:        err[io_error.Error] = set_current_affinity(?empty);
+        if (!(sel none.err && none.err.kind == io_error.INVALID)) { ret 5; }
+        ret 0;
+    }
+}

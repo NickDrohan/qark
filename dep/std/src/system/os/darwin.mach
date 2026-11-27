@@ -1,0 +1,304 @@
+# darwin OS interface with ISA dispatch
+#
+# forwards the complete surface from the selected ISA backend.
+# consumers who need darwin-specific functionality import this module
+# directly rather than going through std.system.os.
+
+$if ($mach.build.sys != $mach.sys.darwin) {
+    $error("std.system.os.darwin: requires darwin target");
+}
+
+$if ($mach.build.arch == $mach.arch.aarch64) {
+    use impl: std.system.os.darwin.aarch64;
+}
+$or ($mach.build.arch == $mach.arch.x86_64) {
+    use impl: std.system.os.darwin.x86_64;
+}
+$or {
+    $error("std.system.os.darwin: unsupported architecture");
+}
+
+use platform: std.system.os.darwin.shared;
+use std.system.os.errors;
+
+# kernel ABI types
+fwd impl.stat_t;
+fwd impl.timespec;
+fwd impl.DirectoryCursor;
+fwd impl.DirectoryEntry;
+fwd impl.DirectoryInitResult;
+
+# path
+fwd impl.separator;
+
+# constants
+fwd impl.STDIN_FD;
+fwd impl.STDOUT_FD;
+fwd impl.STDERR_FD;
+
+fwd impl.O_RDONLY;
+fwd impl.O_WRONLY;
+fwd impl.O_RDWR;
+fwd impl.O_CREAT;
+fwd impl.O_EXCL;
+fwd impl.O_TRUNC;
+fwd impl.O_APPEND;
+fwd impl.O_NONBLOCK;
+fwd impl.O_DIRECTORY;
+fwd impl.O_NOFOLLOW;
+
+fwd impl.AT_FDCWD;
+fwd impl.AT_SYMLINK_NOFOLLOW;
+fwd impl.AT_REMOVEDIR;
+
+# advisory file-lock operations
+fwd impl.LOCK_SH;
+fwd impl.LOCK_EX;
+fwd impl.LOCK_NB;
+fwd impl.LOCK_UN;
+
+fwd impl.S_IFMT;
+fwd impl.S_IFDIR;
+fwd impl.S_IFREG;
+fwd impl.S_IFLNK;
+
+fwd impl.WNOHANG;
+fwd impl.WUNTRACED;
+fwd impl.WCONTINUED;
+
+fwd impl.CLOCK_REALTIME;
+fwd impl.CLOCK_MONOTONIC;
+
+fwd impl.EPERM;
+fwd impl.ENOENT;
+fwd impl.ESRCH;
+fwd impl.EINTR;
+fwd impl.EIO;
+fwd impl.ENXIO;
+fwd impl.E2BIG;
+fwd impl.EBADF;
+fwd impl.ECHILD;
+fwd impl.EAGAIN;
+fwd impl.ENOMEM;
+fwd impl.EACCES;
+fwd impl.EFAULT;
+fwd impl.EBUSY;
+fwd impl.EEXIST;
+fwd impl.ENODEV;
+fwd impl.ENOTDIR;
+fwd impl.EISDIR;
+fwd impl.EINVAL;
+fwd impl.ENFILE;
+fwd impl.EMFILE;
+fwd impl.ETXTBSY;
+fwd impl.ENOSPC;
+fwd impl.EROFS;
+fwd impl.EPIPE;
+fwd impl.ELOOP;
+fwd impl.ENAMETOOLONG;
+fwd impl.ERANGE;
+fwd impl.ENOTEMPTY;
+fwd impl.ENOTSUP;
+fwd platform.EADDRINUSE;
+fwd platform.ENETUNREACH;
+fwd platform.ECONNABORTED;
+fwd platform.ECONNRESET;
+fwd platform.ENOTCONN;
+fwd platform.ETIMEDOUT;
+fwd platform.ECONNREFUSED;
+fwd platform.EHOSTUNREACH;
+fwd platform.ECANCELED;
+
+fwd impl.EINTR_MAX_RETRIES;
+
+# memory
+fwd impl.allocate;
+fwd impl.deallocate;
+fwd impl.reallocate;
+fwd impl.heap_region_base;
+fwd impl.heap_region_extend;
+fwd impl.protect;
+fwd impl.lock;
+fwd impl.unlock;
+fwd impl.advise;
+fwd impl.page_size;
+fwd impl.map_file;
+fwd impl.sync_file;
+
+# filesystem
+fwd impl.read;
+fwd impl.write;
+fwd impl.read_at;
+fwd impl.write_at;
+fwd impl.open;
+fwd impl.close;
+fwd impl.sync_fd;
+fwd impl.stat;
+fwd impl.set_mode;
+fwd impl.set_mode_at;
+fwd impl.file_identity;
+fwd impl.identity_at;
+fwd impl.retain_identity_at;
+fwd impl.publication_capabilities;
+fwd impl.stat_path;
+fwd impl.stat_mode;
+fwd impl.unlink;
+fwd impl.rename;
+fwd impl.symlink;
+fwd impl.make_dir;
+fwd impl.directory_init;
+fwd impl.directory_next;
+fwd impl.directory_close;
+fwd impl.access;
+fwd impl.seek;
+fwd impl.lock_fd;
+
+# process
+fwd impl.terminate;
+fwd impl.abort;
+fwd impl.terminate_child;
+fwd impl.setpgid;
+fwd impl.getpgid;
+fwd impl.terminate_group;
+fwd impl.spawn;
+fwd impl.spawn_grouped;
+fwd impl.spawn_in;
+fwd impl.spawn_redirected;
+fwd impl.spawn_redirected_grouped;
+fwd impl.spawn_redirected_in;
+fwd impl.spawn_redirected_in_grouped;
+fwd impl.getpid;
+fwd impl.pipe;
+fwd impl.ignore_sigpipe;
+fwd impl.sleep;
+fwd impl.cpu_count;
+fwd impl.cpu_features;
+fwd impl.cpu_dit;
+fwd impl.thread_affinity;
+fwd impl.set_thread_affinity;
+fwd impl.getcwd;
+fwd impl.getenv;
+fwd impl.environ;
+fwd impl.fork;
+fwd impl.vfork;
+fwd impl.exec;
+fwd impl.wait;
+fwd impl.wait_pid;
+fwd impl.ProcessStatus;
+fwd impl.FileLimit;
+fwd impl.LIMIT_UNLIMITED;
+fwd impl.open_file_limit;
+fwd impl.set_open_file_limit;
+fwd impl.ProcessWaitError;
+fwd impl.WaitResult;
+fwd impl.PROCESS_OP_WAIT;
+fwd impl.PROCESS_OP_STATUS;
+fwd impl.PROCESS_OP_CLOSE;
+fwd impl.PROCESS_OP_SPAWN;
+fwd impl.PROCESS_OP_READ;
+fwd impl.PROCESS_OP_PIPE;
+fwd impl.PROCESS_OP_TERMINATE;
+fwd impl.PROCESS_EXITED;
+fwd impl.PROCESS_SIGNALED;
+fwd impl.PROCESS_STOPPED;
+fwd impl.PROCESS_CONTINUED;
+
+# sockets
+fwd impl.AF_INET;
+fwd platform.AF_INET6;
+fwd impl.SOCK_STREAM;
+fwd impl.SOCK_DGRAM;
+fwd impl.SOL_SOCKET;
+fwd impl.SO_UNSUPPORTED;
+fwd impl.SO_REUSEADDR;
+fwd impl.SO_REUSEPORT;
+fwd impl.SO_EXCLUSIVEADDRUSE;
+fwd impl.SO_KEEPALIVE;
+fwd impl.SO_SNDBUF;
+fwd impl.SO_RCVBUF;
+fwd impl.SO_LINGER;
+fwd impl.SO_RCVTIMEO;
+fwd impl.IPPROTO_IP;
+fwd impl.IPPROTO_TCP;
+fwd impl.IPPROTO_IPV6;
+fwd impl.IP_TOS;
+fwd impl.IPV6_V6ONLY;
+fwd impl.IPV6_TCLASS;
+fwd impl.TCP_NODELAY;
+fwd impl.TCP_KEEPIDLE;
+fwd impl.TCP_KEEPINTVL;
+fwd impl.TCP_KEEPCNT;
+fwd impl.TCP_FASTOPEN;
+fwd impl.SHUT_RD;
+fwd impl.SHUT_WR;
+fwd impl.SHUT_RDWR;
+fwd impl.SOCKADDR_IN_SIZE;
+fwd platform.SOCKADDR_IN6_SIZE;
+fwd platform.SOCKADDR_STORAGE_SIZE;
+fwd impl.sock_send;
+fwd impl.sock_recv;
+fwd platform.local_stream_recv;
+fwd impl.IoVector;
+fwd impl.sock_write_vector;
+fwd impl.sock_send_message;
+fwd impl.sock_receive_message;
+fwd impl.sock_connect_status;
+fwd impl.sock_close;
+fwd impl.sock_create;
+fwd impl.sock_create_flags;
+fwd impl.sock_bind;
+fwd impl.sock_listen;
+fwd impl.sock_accept;
+fwd impl.sock_accept_flags;
+fwd impl.sock_connect;
+fwd impl.sock_sendto;
+fwd impl.sock_recvfrom;
+fwd impl.sock_peek_readable;
+fwd impl.sock_shutdown;
+fwd impl.sock_setopt;
+fwd impl.sock_getopt;
+fwd impl.sock_local_addr;
+fwd impl.sock_remote_addr;
+fwd impl.sock_inheritable;
+fwd impl.IoCompletion;
+fwd impl.IO_EVENT_READ;
+fwd impl.IO_EVENT_WRITE;
+fwd impl.IO_EVENT_ERROR;
+fwd impl.IO_EVENT_HANGUP;
+fwd impl.IO_EVENT_WAKE;
+fwd impl.io_queue_create;
+fwd impl.io_queue_wait;
+fwd impl.io_queue_watch;
+fwd impl.io_queue_rearm;
+fwd impl.duplicate_to;
+fwd impl.io_queue_unwatch;
+fwd impl.io_queue_poll;
+fwd impl.io_queue_wake;
+fwd impl.io_queue_close;
+fwd impl.sock_set_rcvtimeo;
+
+# dns
+fwd impl.DNS_HOSTS_PATH;
+
+# random
+fwd impl.random_fill;
+
+# threads
+fwd impl.thread_spawn;
+fwd impl.thread_join;
+fwd impl.thread_detach;
+fwd impl.thread_current_id;
+fwd impl.thread_current_name;
+fwd impl.thread_wait;
+fwd impl.thread_wait_until;
+fwd impl.thread_wake;
+fwd impl.thread_block;
+fwd impl.thread_block_enter;
+fwd impl.stack_bounds;
+
+# time
+fwd impl.clock_gettime;
+
+# errno
+fwd errors.error_kind;
+fwd impl.error_message;

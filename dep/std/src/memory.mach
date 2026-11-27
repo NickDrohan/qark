@@ -1,0 +1,669 @@
+# low-level memory operations for raw and typed buffers
+
+use std.types.bool.bool;
+use std.types.bool.false;
+use std.types.bool.true;
+use std.types.size.usize;
+
+# validate a public byte range without forming an exclusive end
+pub fun range_valid(data: *u8, len: usize) bool {
+    if (len == 0)    { ret true; }
+    if (data == nil) { ret false; }
+    ret len - 1 <= ~(0::usize) - data::usize;
+}
+
+# calculate a byte count without multiplication overflow
+pub fun range_scaled(count: usize, item_size: usize, output: *usize) bool {
+    if (!range_valid(output::*u8, $size_of(usize)) ||
+        (count != 0 && item_size > ~(0::usize) / count)) { ret false; }
+    @output = count * item_size;
+    ret true;
+}
+
+# conservatively reject malformed ranges and compare inclusive ends
+pub fun ranges_overlap(first: *u8, first_len: usize, second: *u8,
+    second_len: usize) bool {
+    if (first_len == 0 || second_len == 0) { ret false; }
+    if (!range_valid(first, first_len) ||
+        !range_valid(second, second_len)) { ret true; }
+    val first_start:  usize = first::usize;
+    val second_start: usize = second::usize;
+    ret first_start <= second_start + (second_len - 1) &&
+        second_start <= first_start + (first_len - 1);
+}
+
+# fill a block of raw memory with a byte value
+#
+# byte-fills a head prologue to word alignment, stores the value splatted
+# across whole machine words through the aligned body, then byte-fills the
+# tail. word size is derived from usize, so the path adapts to 32/64-bit.
+# ---
+# p:     pointer to the start of the memory block
+# value: byte value to fill with
+# size:  number of bytes to fill
+pub fun raw_fill(p: ptr, value: u8, size: usize) {
+    if (p == nil || size == 0) {
+        ret;
+    }
+
+    val bytes: *u8   = p::*u8;
+    val step:  usize = $size_of(usize);
+
+    var i: usize = 0;
+
+    # head bytes until the cursor reaches word alignment
+    for (i < size && ((bytes::usize + i) & (step - 1)) != 0) {
+        bytes[i] = value;
+        i        = i + 1;
+    }
+
+    # aligned word stores: replicate the byte across a full word
+    val w: usize = (~(0::usize) / 0xFF) * value::usize;
+    for (size - i >= step) {
+        ((bytes::usize + i)::*usize)[0] = w;
+        i                               = i + step;
+    }
+
+    # tail bytes
+    for (i < size) {
+        bytes[i] = value;
+        i        = i + 1;
+    }
+}
+
+# the bulk copy kernels behind raw_copy and raw_move
+#
+# where the isa loads and stores 16 bytes unaligned in one instruction (x86_64
+# movups, aarch64 ldr/str q), a copy moves 16-byte vectors whatever the two
+# alignments are. a copy of at most 32 bytes loads its first and last chunks
+# before storing either, so it is overlap-safe in both directions without a
+# loop. a longer copy loads the first and last 16 bytes up front, walks the
+# destination-aligned body in 64-byte steps (all loads of a step before its
+# stores), and stores the two end chunks last. forward is safe when dst is
+# below src and backward when dst is above it, because every store lands
+# behind every load still to come.
+#
+# elsewhere (riscv64, which has no packed 16-byte move and may trap or emulate
+# a misaligned word) the kernels move machine words when src and dst share an
+# alignment offset, and bytes otherwise.
+$if ($mach.build.arch == $mach.arch.x86_64 || $mach.build.arch == $mach.arch.aarch64) {
+    # at most 32 bytes: every load happens before any store
+    fun copy_short(d: usize, s: usize, n: usize) {
+        if (n >= 16) {
+            val first: u8x16 = ((s)::*u8x16)[0];
+            val last:  u8x16 = ((s + n - 16)::*u8x16)[0];
+            ((d)::*u8x16)[0]          = first;
+            ((d + n - 16)::*u8x16)[0] = last;
+            ret;
+        }
+        if (n >= 8) {
+            val first: u64 = ((s)::*u64)[0];
+            val last:  u64 = ((s + n - 8)::*u64)[0];
+            ((d)::*u64)[0]         = first;
+            ((d + n - 8)::*u64)[0] = last;
+            ret;
+        }
+        if (n >= 4) {
+            val first: u32 = ((s)::*u32)[0];
+            val last:  u32 = ((s + n - 4)::*u32)[0];
+            ((d)::*u32)[0]         = first;
+            ((d + n - 4)::*u32)[0] = last;
+            ret;
+        }
+        if (n >= 2) {
+            val first: u16 = ((s)::*u16)[0];
+            val last:  u16 = ((s + n - 2)::*u16)[0];
+            ((d)::*u16)[0]         = first;
+            ((d + n - 2)::*u16)[0] = last;
+            ret;
+        }
+        if (n == 1) { ((d)::*u8)[0] = ((s)::*u8)[0]; }
+    }
+
+    # ascending order, safe when dst is at or below src
+    fun copy_forward(d: usize, s: usize, n: usize) {
+        if (n <= 32) {
+            copy_short(d, s, n);
+            ret;
+        }
+        val first: u8x16 = ((s)::*u8x16)[0];
+        val last:  u8x16 = ((s + n - 16)::*u8x16)[0];
+        # the body starts at dst's next 16-byte boundary and stops short of the last chunk
+        var i:   usize = 16 - (d & 15);
+        val end: usize = n - 16;
+        for (i + 64 <= end) {
+            val a: u8x16 = ((s + i)::*u8x16)[0];
+            val b: u8x16 = ((s + i + 16)::*u8x16)[0];
+            val c: u8x16 = ((s + i + 32)::*u8x16)[0];
+            val e: u8x16 = ((s + i + 48)::*u8x16)[0];
+            ((d + i)::*u8x16)[0]      = a;
+            ((d + i + 16)::*u8x16)[0] = b;
+            ((d + i + 32)::*u8x16)[0] = c;
+            ((d + i + 48)::*u8x16)[0] = e;
+            i                         = i + 64;
+        }
+        for (i < end) {
+            ((d + i)::*u8x16)[0] = ((s + i)::*u8x16)[0];
+            i                    = i + 16;
+        }
+        ((d + n - 16)::*u8x16)[0] = last;
+        ((d)::*u8x16)[0]          = first;
+    }
+
+    # descending order, safe when dst is above src
+    fun copy_backward(d: usize, s: usize, n: usize) {
+        if (n <= 32) {
+            copy_short(d, s, n);
+            ret;
+        }
+        val first: u8x16 = ((s)::*u8x16)[0];
+        val last:  u8x16 = ((s + n - 16)::*u8x16)[0];
+        # the body ends at dst's last 16-byte boundary and stops short of the first chunk
+        var e: usize = n - ((d + n) & 15);
+        for (e >= 80) {
+            e = e - 64;
+            val a: u8x16 = ((s + e + 48)::*u8x16)[0];
+            val b: u8x16 = ((s + e + 32)::*u8x16)[0];
+            val c: u8x16 = ((s + e + 16)::*u8x16)[0];
+            val f: u8x16 = ((s + e)::*u8x16)[0];
+            ((d + e + 48)::*u8x16)[0] = a;
+            ((d + e + 32)::*u8x16)[0] = b;
+            ((d + e + 16)::*u8x16)[0] = c;
+            ((d + e)::*u8x16)[0]      = f;
+        }
+        for (e > 16) {
+            e                    = e - 16;
+            ((d + e)::*u8x16)[0] = ((s + e)::*u8x16)[0];
+        }
+        ((d)::*u8x16)[0]          = first;
+        ((d + n - 16)::*u8x16)[0] = last;
+    }
+}
+$or {
+    # ascending order, safe when dst is at or below src
+    fun copy_forward(d: usize, s: usize, n: usize) {
+        val step: usize = $size_of(usize);
+        var i:    usize = 0;
+        if (((d ^ s) & (step - 1)) == 0) {
+            for (i < n && ((d + i) & (step - 1)) != 0) {
+                ((d + i)::*u8)[0] = ((s + i)::*u8)[0];
+                i                 = i + 1;
+            }
+            for (n - i >= step) {
+                ((d + i)::*usize)[0] = ((s + i)::*usize)[0];
+                i                    = i + step;
+            }
+        }
+        for (i < n) {
+            ((d + i)::*u8)[0] = ((s + i)::*u8)[0];
+            i                 = i + 1;
+        }
+    }
+
+    # descending order, safe when dst is above src
+    fun copy_backward(d: usize, s: usize, n: usize) {
+        val step: usize = $size_of(usize);
+        var e:    usize = n;
+        if (((d ^ s) & (step - 1)) == 0) {
+            for (e > 0 && ((d + e) & (step - 1)) != 0) {
+                e                 = e - 1;
+                ((d + e)::*u8)[0] = ((s + e)::*u8)[0];
+            }
+            for (e >= step) {
+                e                    = e - step;
+                ((d + e)::*usize)[0] = ((s + e)::*usize)[0];
+            }
+        }
+        for (e > 0) {
+            e                 = e - 1;
+            ((d + e)::*u8)[0] = ((s + e)::*u8)[0];
+        }
+    }
+}
+
+# copy a block of raw memory from source to destination
+#
+# the regions must not overlap; raw_move is the overlap-safe copy. see the
+# kernels above for how the bytes are moved.
+# ---
+# dst:  pointer to the destination memory block
+# src:  pointer to the source memory block
+# size: number of bytes to copy
+pub fun raw_copy(dst: ptr, src: ptr, size: usize) {
+    if (dst == nil || src == nil || size == 0) {
+        ret;
+    }
+    copy_forward(dst::usize, src::usize, size);
+}
+
+# copy a block of raw memory, correctly handling overlapping regions
+#
+# copies backward when dst lies inside the source range, forward otherwise, so
+# every source byte is read before it is overwritten. for non-overlapping
+# regions, raw_copy is preferred.
+# ---
+# dst:  pointer to the destination memory block
+# src:  pointer to the source memory block
+# size: number of bytes to copy
+pub fun raw_move(dst: ptr, src: ptr, size: usize) {
+    if (dst == nil || src == nil || size == 0 || dst == src) { ret; }
+    val d: usize = dst::usize;
+    val s: usize = src::usize;
+    # wraps to a large value when dst is below src
+    if (d - s < size) {
+        copy_backward(d, s, size);
+        ret;
+    }
+    copy_forward(d, s, size);
+}
+
+# zero out a block of raw memory
+# ---
+# p:    pointer to the start of the memory block
+# size: number of bytes to zero out
+pub fun raw_zero(p: ptr, size: usize) {
+    raw_fill(p, 0, size);
+}
+
+# fill a block of memory with a value for type T
+# ---
+# p:     pointer to the start of the memory block
+# value: value to fill with
+# count: number of elements to fill
+pub fun fill[T](p: *T, value: T, count: usize) {
+    if (p == nil || count == 0) {
+        ret;
+    }
+
+    var i: usize = 0;
+    for (i < count) {
+        p[i] = value;
+        i    = i + 1;
+    }
+}
+
+# copy a block of memory from a source to a destination
+# ---
+# dst:   pointer to the destination memory block
+# src:   pointer to the source memory block
+# count: number of elements to copy
+pub fun copy[T](dst: *T, src: *T, count: usize) {
+    if (dst == nil || src == nil || count == 0) {
+        ret;
+    }
+
+    var i: usize = 0;
+    for (i < count) {
+        dst[i] = src[i];
+        i      = i + 1;
+    }
+}
+
+# copy a typed block of memory, correctly handling overlapping regions
+#
+# delegates to raw_move for the actual byte-level overlapping copy.
+# for non-overlapping regions, copy[T] is preferred.
+# ---
+# dst:   pointer to the destination memory block
+# src:   pointer to the source memory block
+# count: number of elements to copy
+pub fun move[T](dst: *T, src: *T, count: usize) {
+    if (dst == nil || src == nil || count == 0) {
+        ret;
+    }
+    if (count > ~(0::usize) / $size_of(T)) { ret; }
+
+    raw_move(dst::ptr, src::ptr, $size_of(T) * count);
+}
+
+# zero out a block of memory for a number of elements of type T
+# ---
+# p:     pointer to the start of the memory block
+# count: number of elements to zero out
+pub fun zero[T](p: *T, count: usize) {
+    if (p == nil || count == 0)            { ret; }
+    if (count > ~(0::usize) / $size_of(T)) { ret; }
+    raw_zero(p::ptr, $size_of(T) * count);
+}
+
+# compare two blocks of raw memory byte-wise
+#
+# when a and b are co-aligned modulo the word size, a byte head reaches
+# alignment, whole words are compared through the body, then a byte tail;
+# mismatched alignment falls back to a plain byte loop. word size is derived
+# from usize (32/64-bit adaptive).
+#
+# nil contract: n==0 is vacuously true regardless of pointer values.
+# equal pointers (including nil==nil) are trivially true without dereference.
+# if exactly one pointer is nil and n>0, the result is false.
+# ---
+# a:   pointer to the first memory block
+# b:   pointer to the second memory block
+# n:   number of bytes to compare
+# ret: true if the first n bytes of a and b are identical
+pub fun raw_equal(a: ptr, b: ptr, n: usize) bool {
+    if (n == 0)               { ret true; }
+    if (a == b)               { ret true; }
+    if (a == nil || b == nil) { ret false; }
+
+    val ab:   *u8   = a::*u8;
+    val bb:   *u8   = b::*u8;
+    val step: usize = $size_of(usize);
+
+    var i: usize = 0;
+
+    # word path only when a and b are co-aligned modulo the word size
+    if ((a::usize & (step - 1)) == (b::usize & (step - 1))) {
+        # head bytes until both cursors reach word alignment
+        for (i < n && ((a::usize + i) & (step - 1)) != 0) {
+            if (ab[i] != bb[i]) { ret false; }
+            i = i + 1;
+        }
+
+        # aligned word compares through the body
+        for (n - i >= step) {
+            if (((a::usize + i)::*usize)[0] != ((b::usize + i)::*usize)[0]) { ret false; }
+            i = i + step;
+        }
+    }
+
+    # tail bytes, or the whole range when not co-aligned
+    for (i < n) {
+        if (ab[i] != bb[i]) { ret false; }
+        i = i + 1;
+    }
+
+    ret true;
+}
+
+# compare n typed elements at a and b for byte-wise equality
+#
+# delegates to raw_equal; see raw_equal for nil handling.
+# returns false if the byte count would overflow usize.
+# ---
+# a:   pointer to the first element
+# b:   pointer to the second element
+# n:   number of elements to compare
+# ret: true if the first n elements of a and b are byte-identical
+pub fun equal[T](a: *T, b: *T, n: usize) bool {
+    if (n > ~(0::usize) / $size_of(T)) { ret false; }
+    ret raw_equal(a::ptr, b::ptr, $size_of(T) * n);
+}
+
+# a sub-word fill touches only head and tail bytes, an interior fill runs the
+# head prologue, the word body and the byte tail, and guard bytes on both sides
+# catch an over- or under-run. a zero size or nil pointer writes nothing
+test raw_fill__head_body_tail_and_guards {
+    var buf: [64]u8;
+    var z:   usize = 0;
+    for (z < 64) {
+        buf[z] = 0;
+        z      = z + 1;
+    }
+
+    raw_fill(?buf[1], 0xCD, 40);
+    if (buf[0] != 0) { ret 1; }
+    var i: usize = 1;
+    for (i < 41) {
+        if (buf[i] != 0xCD) { ret 2; }
+        i = i + 1;
+    }
+    if (buf[41] != 0 || buf[63] != 0) { ret 3; }
+
+    raw_fill(?buf[48], 0x11, 3);
+    if (buf[47] != 0 || buf[48] != 0x11 || buf[50] != 0x11 || buf[51] != 0) { ret 4; }
+
+    raw_fill(?buf[0], 0xFF, 0);
+    if (buf[0] != 0) { ret 5; }
+    raw_fill(nil, 0xFF, 100);
+    ret 0;
+}
+
+# a zero size or a nil source or destination is a no-op for copy and move
+test raw_copy__nil_and_zero_are_noops {
+    var src: [2]u8 = [2]u8{1, 2};
+    var dst: [2]u8 = [2]u8{9, 9};
+    raw_copy(?dst[0], ?src[0], 0);
+    raw_copy(?dst[0], nil, 2);
+    raw_move(?dst[0], ?src[0], 0);
+    raw_move(?dst[0], nil, 2);
+    if (dst[0] != 9 || dst[1] != 9) { ret 1; }
+    raw_copy(nil, ?src[0], 2);
+    raw_move(nil, ?src[0], 2);
+    ret 0;
+}
+
+val SWEEP_SPAN: usize = 12544;
+#[testing]
+val SWEEP_BASE: usize = 4208;
+
+rec Sweep {
+    actual:   [SWEEP_SPAN]u8;
+    expected: [SWEEP_SPAN]u8;
+    staged:   [4096]u8;
+    seed:     u64;
+}
+
+# refill [from, to) of both buffers with the same fresh bytes
+#[testing]
+fun sweep_fill(sweep: *Sweep, from: usize, to: usize) {
+    var i: usize = from;
+    for (i < to) {
+        var x: u64 = sweep.seed;
+        x                 = x ^ (x << 13);
+        x                 = x ^ (x >> 7);
+        x                 = x ^ (x << 17);
+        sweep.seed        = x;
+        sweep.actual[i]   = (x >> 24)::u8;
+        sweep.expected[i] = (x >> 24)::u8;
+        i                 = i + 1;
+    }
+}
+
+# one copy of n bytes from src to dst (buffer indices): the reference stages the
+# source bytes before writing any, the copy under test runs in place, and the
+# window around both ranges must then match byte for byte
+#[testing]
+fun sweep_case(sweep: *Sweep, dst: usize, src: usize, n: usize, moving: bool) bool {
+    var low: usize = dst;
+    if (src < low) { low = src; }
+    var high: usize = dst + n;
+    if (src + n > high) { high = src + n; }
+    low  = low - 32;
+    high = high + 32;
+    sweep_fill(sweep, low, high);
+    var i: usize = 0;
+    for (i < n) {
+        sweep.staged[i] = sweep.expected[src + i];
+        i               = i + 1;
+    }
+    i = 0;
+    for (i < n) {
+        sweep.expected[dst + i] = sweep.staged[i];
+        i                       = i + 1;
+    }
+    if (moving) { raw_move((?sweep.actual[dst])::ptr, (?sweep.actual[src])::ptr, n); }
+    or          { raw_copy((?sweep.actual[dst])::ptr, (?sweep.actual[src])::ptr, n); }
+    i = low;
+    for (i < high) {
+        if (sweep.actual[i] != sweep.expected[i]) { ret false; }
+        i = i + 1;
+    }
+    ret true;
+}
+
+#[testing]
+val SWEEP_SHIFTS: [18]usize = [18]usize{1, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63, 64, 65,
+    100, 127, 128, 129, 1000};
+
+# every length to 64, then a stride to 4 KiB with each power of two and its
+# neighbours
+#[testing]
+fun sweep_length(index: usize) usize {
+    if (index <= 64) { ret index; }
+    val k: usize = index - 65;
+    if (k < 110) { ret 65 + k * 37; }
+    val p: usize = (k - 110) / 3;
+    ret (128::usize << p) + (k - 110) % 3 - 1;
+}
+
+#[testing]
+val SWEEP_LENGTHS: usize    = 65 + 110 + 3 * 5 + 2;
+#[testing]
+val SWEEP_PHASES:  [4]usize = [4]usize{0, 1, 8, 15};
+
+# dst below, equal to and above src, overlapping by every shift and disjoint on
+# either side, from every source phase of a 16-byte chunk, at lengths 0 to 4 KiB
+#[testing]
+fun sweep_run(moving: bool) i32 {
+    var pages: [1]Sweep;
+    val sweep: *Sweep = ?pages[0];
+    sweep.seed = 0x9e3779b97f4a7c15;
+    sweep_fill(sweep, 0, SWEEP_SPAN);
+    var li: usize = 0;
+    for (li < SWEEP_LENGTHS) {
+        var n: usize = sweep_length(li);
+        if (n > 4096) { n = 4096; }
+        var phases: usize = 16;
+        if (n > 64) { phases = 4; }
+        var phase: usize = 0;
+        for (phase < phases) {
+            var sa: usize = phase;
+            if (phases == 4) { sa = SWEEP_PHASES[phase]; }
+            val src: usize = SWEEP_BASE + sa;
+            # disjoint below and above, touching and 33 bytes apart
+            if (!sweep_case(sweep, src - n - 33, src, n, moving)) { ret 1; }
+            if (!sweep_case(sweep, src - n, src, n, moving))      { ret 2; }
+            if (!sweep_case(sweep, src + n, src, n, moving))      { ret 3; }
+            if (!sweep_case(sweep, src + n + 33, src, n, moving)) { ret 4; }
+            if (moving) {
+                if (!sweep_case(sweep, src, src, n, true)) { ret 5; }
+                var j: usize = 0;
+                for (j < 18) {
+                    val shift: usize = SWEEP_SHIFTS[j];
+                    if (shift < n) {
+                        if (!sweep_case(sweep, src - shift, src, n, true)) { ret 6; }
+                        if (!sweep_case(sweep, src + shift, src, n, true)) { ret 7; }
+                    }
+                    j = j + 1;
+                }
+            }
+            phase = phase + 1;
+        }
+        li = li + 1;
+    }
+    ret 0;
+}
+
+# raw_move is byte-exact in both overlap directions and when disjoint, from
+# every alignment, at lengths 0 to 4 KiB, and writes nothing outside dst
+test raw_move__byte_exact_sweep {
+    ret sweep_run(true);
+}
+
+# raw_copy is byte-exact for disjoint ranges from every alignment, at lengths 0
+# to 4 KiB, and writes nothing outside dst
+test raw_copy__byte_exact_sweep {
+    ret sweep_run(false);
+}
+
+# the typed wrappers scale the count by the element size: move keeps overlap
+# semantics, zero clears every element, equal compares every element
+test typed__scale_by_element_size {
+    var arr: [5]i64 = [5]i64{10, 20, 30, 40, 50};
+    move[i64](?arr[1], ?arr[0], 4);
+    if (arr[0] != 10 || arr[1] != 10 || arr[2] != 20 || arr[4] != 40) { ret 1; }
+
+    var a: [3]i64 = [3]i64{1, 2, 3};
+    var c: [3]i64 = [3]i64{1, 2, 4};
+    if (equal[i64](?a[0], ?c[0], 3))  { ret 2; }
+    if (!equal[i64](?a[0], ?c[0], 2)) { ret 3; }
+
+    zero[i64](?a[0], 3);
+    if (a[0] != 0 || a[1] != 0 || a[2] != 0) { ret 4; }
+    ret 0;
+}
+
+# n == 0 is vacuously true even for nil pointers; exactly one nil with n > 0
+# is false
+test raw_equal__nil_and_zero {
+    var a: [2]u8 = [2]u8{1, 2};
+    var b: [2]u8 = [2]u8{9, 9};
+    if (!raw_equal(?a[0], ?b[0], 0)) { ret 1; }
+    if (!raw_equal(nil, nil, 0))     { ret 1; }
+    if (raw_equal(nil, ?a[0], 2))    { ret 1; }
+    if (raw_equal(?a[0], nil, 2))    { ret 1; }
+    ret 0;
+}
+
+# co-aligned compare (offset diff a whole word multiple) reports equal blocks
+# true and catches a mismatch in each phase: head, word body, and tail
+test raw_equal__coaligned_mismatch_phases {
+    var buf: [128]u8;
+    var i:   usize = 0;
+    for (i < 128) {
+        buf[i] = 0;
+        i      = i + 1;
+    }
+
+    i = 0;
+    for (i < 40) {
+        buf[1 + i]  = (i + 7)::u8;
+        buf[65 + i] = (i + 7)::u8;
+        i           = i + 1;
+    }
+
+    if (!raw_equal(?buf[1], ?buf[65], 40)) { ret 1; }
+
+    # mismatch at the span head
+    buf[65] = 0xEE;
+    if (raw_equal(?buf[1], ?buf[65], 40)) { ret 1; }
+    buf[65] = 7;
+
+    # mismatch inside the word body
+    buf[77] = 0xEE;
+    if (raw_equal(?buf[1], ?buf[65], 40)) { ret 1; }
+    buf[77] = 19;
+
+    # mismatch in the byte tail
+    buf[104] = 0xEE;
+    if (raw_equal(?buf[1], ?buf[65], 40)) { ret 1; }
+    ret 0;
+}
+
+# a misaligned pair (offset diff not a word multiple) compares byte-wise and
+# still reports equality and a mismatch correctly
+test raw_equal__misaligned {
+    var buf: [128]u8;
+    var i:   usize = 0;
+    for (i < 128) {
+        buf[i] = 0;
+        i      = i + 1;
+    }
+
+    i = 0;
+    for (i < 40) {
+        buf[i]      = (i + 3)::u8;
+        buf[63 + i] = (i + 3)::u8;
+        i           = i + 1;
+    }
+
+    if (!raw_equal(?buf[0], ?buf[63], 40)) { ret 1; }
+
+    buf[83] = 0xEE;
+    if (raw_equal(?buf[0], ?buf[63], 40)) { ret 1; }
+    ret 0;
+}
+
+test ranges__inclusive_endpoints {
+    val maximum: usize = ~(0::usize);
+    if (!range_valid(1::*u8, maximum) ||
+        !ranges_overlap(1::*u8, maximum, maximum::*u8, 1) ||
+        ranges_overlap(1::*u8, 1, maximum::*u8, 1) ||
+        range_valid(maximum::*u8, 2)) { ret 1; }
+    var bytes: usize = 0;
+    if (range_scaled(maximum, 2, ?bytes) ||
+        !range_scaled(maximum, 1, ?bytes) || bytes != maximum ||
+        range_scaled(1, 1, (maximum - 1)::*usize)) { ret 2; }
+    ret 0;
+}
